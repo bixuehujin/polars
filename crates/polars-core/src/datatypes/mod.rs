@@ -185,6 +185,7 @@ unsafe impl PolarsDataType for FixedSizeListType {
     }
 }
 #[cfg(feature = "dtype-decimal")]
+#[derive(Clone)]
 pub struct Int128Type {}
 #[cfg(feature = "dtype-decimal")]
 unsafe impl PolarsDataType for Int128Type {
