@@ -2,9 +2,10 @@ use std::path::Path;
 
 use crossbeam_channel::bounded;
 use polars_core::prelude::*;
-use polars_io::csv::CsvWriter;
+use polars_io::cloud::CloudOptions;
+use polars_io::csv::write::{CsvWriter, CsvWriterOptions};
+use polars_io::utils::file::try_get_writeable;
 use polars_io::SerWriter;
-use polars_plan::prelude::CsvWriterOptions;
 
 use crate::executors::sinks::output::file_sink::{init_writer_thread, FilesSink, SinkWriter};
 use crate::pipeline::morsels_per_sink;
@@ -12,9 +13,13 @@ use crate::pipeline::morsels_per_sink;
 pub struct CsvSink {}
 impl CsvSink {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(path: &Path, options: CsvWriterOptions, schema: &Schema) -> PolarsResult<FilesSink> {
-        let file = std::fs::File::create(path)?;
-        let writer = CsvWriter::new(file)
+    pub fn new(
+        path: &Path,
+        options: CsvWriterOptions,
+        schema: &Schema,
+        cloud_options: Option<&CloudOptions>,
+    ) -> PolarsResult<FilesSink> {
+        let writer = CsvWriter::new(try_get_writeable(path.to_str().unwrap(), cloud_options)?)
             .include_bom(options.include_bom)
             .include_header(options.include_header)
             .with_separator(options.serialize_options.separator)
@@ -24,13 +29,14 @@ impl CsvSink {
             .with_datetime_format(options.serialize_options.datetime_format)
             .with_date_format(options.serialize_options.date_format)
             .with_time_format(options.serialize_options.time_format)
+            .with_float_scientific(options.serialize_options.float_scientific)
             .with_float_precision(options.serialize_options.float_precision)
             .with_null_value(options.serialize_options.null)
             .with_quote_style(options.serialize_options.quote_style)
             .n_threads(1)
             .batched(schema)?;
 
-        let writer = Box::new(writer) as Box<dyn SinkWriter + Send + Sync>;
+        let writer = Box::new(writer) as Box<dyn SinkWriter + Send>;
 
         let morsels_per_sink = morsels_per_sink();
         let backpressure = morsels_per_sink * 2;
@@ -50,7 +56,7 @@ impl CsvSink {
     }
 }
 
-impl SinkWriter for polars_io::csv::BatchedWriter<std::fs::File> {
+impl<W: std::io::Write> SinkWriter for polars_io::csv::write::BatchedWriter<W> {
     fn _write_batch(&mut self, df: &DataFrame) -> PolarsResult<()> {
         self.write_batch(df)
     }

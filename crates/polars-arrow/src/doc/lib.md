@@ -1,12 +1,11 @@
 Welcome to polars_arrow's documentation. Thanks for checking it out!
 
 This is a library for efficient in-memory data operations with
-[Arrow in-memory format](https://arrow.apache.org/docs/format/Columnar.html).
-It is a re-write from the bottom up of the official `arrow` crate with soundness
-and type safety in mind.
+[Arrow in-memory format](https://arrow.apache.org/docs/format/Columnar.html). It is a re-write from
+the bottom up of the official `arrow` crate with soundness and type safety in mind.
 
-Check out [the guide](https://jorgecarleitao.github.io/polars_arrow/main/guide/) for an introduction.
-Below is an example of some of the things you can do with it:
+Check out [the guide](https://jorgecarleitao.github.io/polars_arrow/main/guide/) for an
+introduction. Below is an example of some of the things you can do with it:
 
 ```rust
 use std::sync::Arc;
@@ -42,7 +41,7 @@ fn main() -> Result<()> {
         write_statistics: true,
         compression: CompressionOptions::Snappy,
         version: Version::V1,
-        data_pagesize_limit: None,
+        data_page_size: None,
     };
 
     let row_groups = RowGroupIterator::try_new(
@@ -68,20 +67,14 @@ fn main() -> Result<()> {
 
 ## Cargo features
 
-This crate has a significant number of cargo features to reduce compilation
-time and number of dependencies. The feature `"full"` activates most
-functionality, such as:
+This crate has a significant number of cargo features to reduce compilation time and number of
+dependencies. The feature `"full"` activates most functionality, such as:
 
 - `io_ipc`: to interact with the Arrow IPC format
 - `io_ipc_compression`: to read and write compressed Arrow IPC (v2)
-- `io_csv` to read and write CSV
-- `io_json` to read and write JSON
 - `io_flight` to read and write to Arrow's Flight protocol
-- `io_parquet` to read and write parquet
-- `io_parquet_compression` to read and write compressed parquet
-- `io_print` to write batches to formatted ASCII tables
 - `compute` to operate on arrays (addition, sum, sort, etc.)
 
-The feature `simd` (not part of `full`) produces more explicit SIMD instructions
-via [`std::simd`](https://doc.rust-lang.org/nightly/std/simd/index.html), but requires the
-nightly channel.
+The feature `simd` (not part of `full`) produces more explicit SIMD instructions via
+[`std::simd`](https://doc.rust-lang.org/nightly/std/simd/index.html), but requires the nightly
+channel.

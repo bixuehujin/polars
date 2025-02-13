@@ -1,15 +1,13 @@
-use super::{new_empty_array, new_null_array, Array};
+use super::{new_empty_array, new_null_array, Array, Splitable};
 use crate::bitmap::Bitmap;
 use crate::datatypes::{ArrowDataType, Field};
 
-#[cfg(feature = "arrow_rs")]
-mod data;
 mod ffi;
 pub(super) mod fmt;
 mod iterator;
-mod mutable;
-pub use mutable::*;
-use polars_error::{polars_bail, PolarsResult};
+use polars_error::{polars_bail, polars_ensure, PolarsResult};
+
+use crate::compute::utils::combine_validities_and;
 
 /// A [`StructArray`] is a nested [`Array`] with an optional validity representing
 /// multiple [`Array`] with the same number of rows.
@@ -21,16 +19,19 @@ use polars_error::{polars_bail, PolarsResult};
 /// let int = Int32Array::from_slice(&[42, 28, 19, 31]).boxed();
 ///
 /// let fields = vec![
-///     Field::new("b", ArrowDataType::Boolean, false),
-///     Field::new("c", ArrowDataType::Int32, false),
+///     Field::new("b".into(), ArrowDataType::Boolean, false),
+///     Field::new("c".into(), ArrowDataType::Int32, false),
 /// ];
 ///
-/// let array = StructArray::new(ArrowDataType::Struct(fields), vec![boolean, int], None);
+/// let array = StructArray::new(ArrowDataType::Struct(fields), 4, vec![boolean, int], None);
 /// ```
 #[derive(Clone)]
 pub struct StructArray {
-    data_type: ArrowDataType,
+    dtype: ArrowDataType,
+    // invariant: each array has the same length
     values: Vec<Box<dyn Array>>,
+    // invariant: for each v in values: length == v.len()
+    length: usize,
     validity: Option<Bitmap>,
 }
 
@@ -38,49 +39,49 @@ impl StructArray {
     /// Returns a new [`StructArray`].
     /// # Errors
     /// This function errors iff:
-    /// * `data_type`'s physical type is not [`crate::datatypes::PhysicalType::Struct`].
-    /// * the children of `data_type` are empty
+    /// * `dtype`'s physical type is not [`crate::datatypes::PhysicalType::Struct`].
+    /// * the children of `dtype` are empty
     /// * the values's len is different from children's length
     /// * any of the values's data type is different from its corresponding children' data type
     /// * any element of values has a different length than the first element
     /// * the validity's length is not equal to the length of the first element
     pub fn try_new(
-        data_type: ArrowDataType,
+        dtype: ArrowDataType,
+        length: usize,
         values: Vec<Box<dyn Array>>,
         validity: Option<Bitmap>,
     ) -> PolarsResult<Self> {
-        let fields = Self::try_get_fields(&data_type)?;
-        if fields.is_empty() {
-            polars_bail!(ComputeError: "a StructArray must contain at least one field")
-        }
-        if fields.len() != values.len() {
-            polars_bail!(ComputeError:"a StructArray must have a number of fields in its DataType equal to the number of child values")
-        }
+        let fields = Self::try_get_fields(&dtype)?;
+
+        polars_ensure!(
+            fields.len() == values.len(),
+            ComputeError:
+                "a StructArray must have a number of fields in its DataType equal to the number of child values"
+        );
 
         fields
-            .iter().map(|a| &a.data_type)
-            .zip(values.iter().map(|a| a.data_type()))
+            .iter().map(|a| &a.dtype)
+            .zip(values.iter().map(|a| a.dtype()))
             .enumerate()
-            .try_for_each(|(index, (data_type, child))| {
-                if data_type != child {
+            .try_for_each(|(index, (dtype, child))| {
+                if dtype != child {
                     polars_bail!(ComputeError:
                         "The children DataTypes of a StructArray must equal the children data types.
-                         However, the field {index} has data type {data_type:?} but the value has data type {child:?}"
+                         However, the field {index} has data type {dtype:?} but the value has data type {child:?}"
                     )
                 } else {
                     Ok(())
                 }
             })?;
 
-        let len = values[0].len();
         values
             .iter()
-            .map(|a| a.len())
+            .map(|f| f.len())
             .enumerate()
-            .try_for_each(|(index, a_len)| {
-                if a_len != len {
-                    polars_bail!(ComputeError: "The children must have an equal number of values.
-                         However, the values at index {index} have a length of {a_len}, which is different from values at index 0, {len}.")
+            .try_for_each(|(index, f_length)| {
+                if f_length != length {
+                    polars_bail!(ComputeError: "The children must have the given number of values.
+                         However, the values at index {index} have a length of {f_length}, which is different from given length {length}.")
                 } else {
                     Ok(())
                 }
@@ -88,13 +89,14 @@ impl StructArray {
 
         if validity
             .as_ref()
-            .map_or(false, |validity| validity.len() != len)
+            .is_some_and(|validity| validity.len() != length)
         {
             polars_bail!(ComputeError:"The validity length of a StructArray must match its number of elements")
         }
 
         Ok(Self {
-            data_type,
+            dtype,
+            length,
             values,
             validity,
         })
@@ -103,41 +105,42 @@ impl StructArray {
     /// Returns a new [`StructArray`]
     /// # Panics
     /// This function panics iff:
-    /// * `data_type`'s physical type is not [`crate::datatypes::PhysicalType::Struct`].
-    /// * the children of `data_type` are empty
+    /// * `dtype`'s physical type is not [`crate::datatypes::PhysicalType::Struct`].
+    /// * the children of `dtype` are empty
     /// * the values's len is different from children's length
     /// * any of the values's data type is different from its corresponding children' data type
     /// * any element of values has a different length than the first element
     /// * the validity's length is not equal to the length of the first element
     pub fn new(
-        data_type: ArrowDataType,
+        dtype: ArrowDataType,
+        length: usize,
         values: Vec<Box<dyn Array>>,
         validity: Option<Bitmap>,
     ) -> Self {
-        Self::try_new(data_type, values, validity).unwrap()
+        Self::try_new(dtype, length, values, validity).unwrap()
     }
 
     /// Creates an empty [`StructArray`].
-    pub fn new_empty(data_type: ArrowDataType) -> Self {
-        if let ArrowDataType::Struct(fields) = &data_type.to_logical_type() {
+    pub fn new_empty(dtype: ArrowDataType) -> Self {
+        if let ArrowDataType::Struct(fields) = &dtype.to_logical_type() {
             let values = fields
                 .iter()
-                .map(|field| new_empty_array(field.data_type().clone()))
+                .map(|field| new_empty_array(field.dtype().clone()))
                 .collect();
-            Self::new(data_type, values, None)
+            Self::new(dtype, 0, values, None)
         } else {
             panic!("StructArray must be initialized with DataType::Struct");
         }
     }
 
     /// Creates a null [`StructArray`] of length `length`.
-    pub fn new_null(data_type: ArrowDataType, length: usize) -> Self {
-        if let ArrowDataType::Struct(fields) = &data_type {
+    pub fn new_null(dtype: ArrowDataType, length: usize) -> Self {
+        if let ArrowDataType::Struct(fields) = &dtype {
             let values = fields
                 .iter()
-                .map(|field| new_null_array(field.data_type().clone(), length))
+                .map(|field| new_null_array(field.dtype().clone(), length))
                 .collect();
-            Self::new(data_type, values, Some(Bitmap::new_zeroed(length)))
+            Self::new(dtype, length, values, Some(Bitmap::new_zeroed(length)))
         } else {
             panic!("StructArray must be initialized with DataType::Struct");
         }
@@ -148,18 +151,19 @@ impl StructArray {
 impl StructArray {
     /// Deconstructs the [`StructArray`] into its individual components.
     #[must_use]
-    pub fn into_data(self) -> (Vec<Field>, Vec<Box<dyn Array>>, Option<Bitmap>) {
+    pub fn into_data(self) -> (Vec<Field>, usize, Vec<Box<dyn Array>>, Option<Bitmap>) {
         let Self {
-            data_type,
+            dtype,
+            length,
             values,
             validity,
         } = self;
-        let fields = if let ArrowDataType::Struct(fields) = data_type {
+        let fields = if let ArrowDataType::Struct(fields) = dtype {
             fields
         } else {
             unreachable!()
         };
-        (fields, values, validity)
+        (fields, length, values, validity)
     }
 
     /// Slices this [`StructArray`].
@@ -190,6 +194,22 @@ impl StructArray {
         self.values
             .iter_mut()
             .for_each(|x| x.slice_unchecked(offset, length));
+        self.length = length;
+    }
+
+    /// Set the outer nulls into the inner arrays.
+    pub fn propagate_nulls(&self) -> StructArray {
+        let has_nulls = self.null_count() > 0;
+        let mut out = self.clone();
+        if !has_nulls {
+            return out;
+        };
+
+        for value_arr in &mut out.values {
+            let new_validity = combine_validities_and(self.validity(), value_arr.validity());
+            *value_arr = value_arr.with_validity(new_validity);
+        }
+        out
     }
 
     impl_sliced!();
@@ -203,7 +223,17 @@ impl StructArray {
 impl StructArray {
     #[inline]
     fn len(&self) -> usize {
-        self.values[0].len()
+        if cfg!(debug_assertions) {
+            for arr in self.values.iter() {
+                assert_eq!(
+                    arr.len(),
+                    self.length,
+                    "StructArray invariant: each array has same length"
+                );
+            }
+        }
+
+        self.length
     }
 
     /// The optional validity.
@@ -219,14 +249,16 @@ impl StructArray {
 
     /// Returns the fields of this [`StructArray`].
     pub fn fields(&self) -> &[Field] {
-        Self::get_fields(&self.data_type)
+        let fields = Self::get_fields(&self.dtype);
+        debug_assert_eq!(self.values().len(), fields.len());
+        fields
     }
 }
 
 impl StructArray {
     /// Returns the fields the `DataType::Struct`.
-    pub(crate) fn try_get_fields(data_type: &ArrowDataType) -> PolarsResult<&[Field]> {
-        match data_type.to_logical_type() {
+    pub(crate) fn try_get_fields(dtype: &ArrowDataType) -> PolarsResult<&[Field]> {
+        match dtype.to_logical_type() {
             ArrowDataType::Struct(fields) => Ok(fields),
             _ => {
                 polars_bail!(ComputeError: "Struct array must be created with a DataType whose physical type is Struct")
@@ -235,8 +267,8 @@ impl StructArray {
     }
 
     /// Returns the fields the `DataType::Struct`.
-    pub fn get_fields(data_type: &ArrowDataType) -> &[Field] {
-        Self::try_get_fields(data_type).unwrap()
+    pub fn get_fields(dtype: &ArrowDataType) -> &[Field] {
+        Self::try_get_fields(dtype).unwrap()
     }
 }
 
@@ -250,5 +282,39 @@ impl Array for StructArray {
     #[inline]
     fn with_validity(&self, validity: Option<Bitmap>) -> Box<dyn Array> {
         Box::new(self.clone().with_validity(validity))
+    }
+}
+
+impl Splitable for StructArray {
+    fn check_bound(&self, offset: usize) -> bool {
+        offset <= self.len()
+    }
+
+    unsafe fn _split_at_unchecked(&self, offset: usize) -> (Self, Self) {
+        let (lhs_validity, rhs_validity) = unsafe { self.validity.split_at_unchecked(offset) };
+
+        let mut lhs_values = Vec::with_capacity(self.values.len());
+        let mut rhs_values = Vec::with_capacity(self.values.len());
+
+        for v in self.values.iter() {
+            let (lhs, rhs) = unsafe { v.split_at_boxed_unchecked(offset) };
+            lhs_values.push(lhs);
+            rhs_values.push(rhs);
+        }
+
+        (
+            Self {
+                dtype: self.dtype.clone(),
+                length: offset,
+                values: lhs_values,
+                validity: lhs_validity,
+            },
+            Self {
+                dtype: self.dtype.clone(),
+                length: self.length - offset,
+                values: rhs_values,
+                validity: rhs_validity,
+            },
+        )
     }
 }

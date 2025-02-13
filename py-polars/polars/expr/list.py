@@ -1,26 +1,25 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+import warnings
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Callable
 
 import polars._reexport as pl
 from polars import functions as F
-from polars._utils.deprecation import (
-    deprecate_renamed_function,
-    deprecate_renamed_parameter,
-)
-from polars._utils.parse_expr_input import parse_as_expression
+from polars._utils.parse import parse_into_expression
+from polars._utils.various import find_stacklevel
 from polars._utils.wrap import wrap_expr
 
 if TYPE_CHECKING:
     from datetime import date, datetime, time
 
     from polars import Expr, Series
-    from polars.type_aliases import (
+    from polars._typing import (
         IntoExpr,
         IntoExprColumn,
+        ListToStructWidthStrategy,
         NullBehavior,
-        ToStructStrategy,
     )
 
 
@@ -29,7 +28,7 @@ class ExprListNameSpace:
 
     _accessor = "list"
 
-    def __init__(self, expr: Expr):
+    def __init__(self, expr: Expr) -> None:
         self._pyexpr = expr._pyexpr
 
     def __getitem__(self, item: int) -> Expr:
@@ -183,7 +182,7 @@ class ExprListNameSpace:
             raise ValueError(msg)
 
         if fraction is not None:
-            fraction = parse_as_expression(fraction)
+            fraction = parse_into_expression(fraction)
             return wrap_expr(
                 self._pyexpr.list_sample_fraction(
                     fraction, with_replacement, shuffle, seed
@@ -192,7 +191,7 @@ class ExprListNameSpace:
 
         if n is None:
             n = 1
-        n = parse_as_expression(n)
+        n = parse_into_expression(n)
         return wrap_expr(self._pyexpr.list_sample_n(n, with_replacement, shuffle, seed))
 
     def sum(self) -> Expr:
@@ -509,7 +508,7 @@ class ExprListNameSpace:
         self,
         index: int | Expr | str,
         *,
-        null_on_oob: bool = True,
+        null_on_oob: bool = False,
     ) -> Expr:
         """
         Get the value by index in the sublists.
@@ -530,7 +529,7 @@ class ExprListNameSpace:
         Examples
         --------
         >>> df = pl.DataFrame({"a": [[3, 2, 1], [], [1, 2]]})
-        >>> df.with_columns(get=pl.col("a").list.get(0))
+        >>> df.with_columns(get=pl.col("a").list.get(0, null_on_oob=True))
         shape: (3, 2)
         ┌───────────┬──────┐
         │ a         ┆ get  │
@@ -542,7 +541,7 @@ class ExprListNameSpace:
         │ [1, 2]    ┆ 1    │
         └───────────┴──────┘
         """
-        index = parse_as_expression(index)
+        index = parse_into_expression(index)
         return wrap_expr(self._pyexpr.list_get(index, null_on_oob))
 
     def gather(
@@ -584,7 +583,7 @@ class ExprListNameSpace:
         """
         if isinstance(indices, list):
             indices = pl.Series(indices)
-        indices = parse_as_expression(indices)
+        indices = parse_into_expression(indices)
         return wrap_expr(self._pyexpr.list_gather(indices, null_on_oob))
 
     def gather_every(
@@ -627,8 +626,8 @@ class ExprListNameSpace:
         │ [9, 10, … 12] ┆ 3   ┆ 0      ┆ [9, 12]      │
         └───────────────┴─────┴────────┴──────────────┘
         """
-        n = parse_as_expression(n)
-        offset = parse_as_expression(offset)
+        n = parse_into_expression(n)
+        offset = parse_into_expression(offset)
         return wrap_expr(self._pyexpr.list_gather_every(n, offset))
 
     def first(self) -> Expr:
@@ -650,7 +649,7 @@ class ExprListNameSpace:
         │ [1, 2]    ┆ 1     │
         └───────────┴───────┘
         """
-        return self.get(0)
+        return self.get(0, null_on_oob=True)
 
     def last(self) -> Expr:
         """
@@ -671,7 +670,7 @@ class ExprListNameSpace:
         │ [1, 2]    ┆ 2    │
         └───────────┴──────┘
         """
-        return self.get(-1)
+        return self.get(-1, null_on_oob=True)
 
     def contains(
         self, item: float | str | bool | int | date | datetime | time | IntoExprColumn
@@ -704,7 +703,7 @@ class ExprListNameSpace:
         │ [1, 2]    ┆ true     │
         └───────────┴──────────┘
         """
-        item = parse_as_expression(item, str_as_lit=True)
+        item = parse_into_expression(item, str_as_lit=True)
         return wrap_expr(self._pyexpr.list_contains(item))
 
     def join(self, separator: IntoExprColumn, *, ignore_nulls: bool = True) -> Expr:
@@ -756,7 +755,7 @@ class ExprListNameSpace:
         │ ["x", "y"]      ┆ _         ┆ x_y   │
         └─────────────────┴───────────┴───────┘
         """
-        separator = parse_as_expression(separator, str_as_lit=True)
+        separator = parse_into_expression(separator, str_as_lit=True)
         return wrap_expr(self._pyexpr.list_join(separator, ignore_nulls))
 
     def arg_min(self) -> Expr:
@@ -868,7 +867,6 @@ class ExprListNameSpace:
         """
         return wrap_expr(self._pyexpr.list_diff(n, null_behavior))
 
-    @deprecate_renamed_parameter("periods", "n", version="0.19.11")
     def shift(self, n: int | IntoExprColumn = 1) -> Expr:
         """
         Shift list values by the given number of indices.
@@ -913,7 +911,7 @@ class ExprListNameSpace:
         │ [4, 5]    ┆ [null, null]    │
         └───────────┴─────────────────┘
         """
-        n = parse_as_expression(n)
+        n = parse_into_expression(n)
         return wrap_expr(self._pyexpr.list_shift(n))
 
     def slice(
@@ -944,8 +942,8 @@ class ExprListNameSpace:
         │ [10, 2, 1]  ┆ [2, 1]    │
         └─────────────┴───────────┘
         """
-        offset = parse_as_expression(offset)
-        length = parse_as_expression(length)
+        offset = parse_into_expression(offset)
+        length = parse_into_expression(length)
         return wrap_expr(self._pyexpr.list_slice(offset, length))
 
     def head(self, n: int | str | Expr = 5) -> Expr:
@@ -996,7 +994,7 @@ class ExprListNameSpace:
         │ [10, 2, 1]  ┆ [2, 1]    │
         └─────────────┴───────────┘
         """
-        n = parse_as_expression(n)
+        n = parse_into_expression(n)
         return wrap_expr(self._pyexpr.list_tail(n))
 
     def explode(self) -> Expr:
@@ -1010,7 +1008,7 @@ class ExprListNameSpace:
 
         See Also
         --------
-        ExprNameSpace.reshape: Reshape this Expr to a flat Series or a Series of Lists.
+        Expr.reshape: Reshape this Expr to a flat Series or a Series of Lists.
 
         Examples
         --------
@@ -1058,7 +1056,7 @@ class ExprListNameSpace:
         │ [4, 4]      ┆ 0              │
         └─────────────┴────────────────┘
         """
-        element = parse_as_expression(element, str_as_lit=True)
+        element = parse_into_expression(element, str_as_lit=True)
         return wrap_expr(self._pyexpr.list_count_matches(element))
 
     def to_array(self, width: int) -> Expr:
@@ -1096,9 +1094,11 @@ class ExprListNameSpace:
 
     def to_struct(
         self,
-        n_field_strategy: ToStructStrategy = "first_non_null",
+        n_field_strategy: ListToStructWidthStrategy = "first_non_null",
         fields: Sequence[str] | Callable[[int], str] | None = None,
         upper_bound: int = 0,
+        *,
+        _eager: bool = False,
     ) -> Expr:
         """
         Convert the Series of type `List` to a Series of type `Struct`.
@@ -1129,6 +1129,11 @@ class ExprListNameSpace:
 
         Notes
         -----
+        It is recommended to set 'upper_bound' to the correct output size of the struct.
+        If this is not set, Polars will not know the output type of this operation and
+        will set it to 'Unknown' which can lead to errors because Polars is not able
+        to resolve the query.
+
         For performance reasons, the length of the first non-null sublist is used
         to determine the number of output fields. If the sublists can be of different
         lengths then `n_field_strategy="max_width"` must be used to obtain the expected
@@ -1139,9 +1144,7 @@ class ExprListNameSpace:
         Convert list to struct with default field name assignment:
 
         >>> df = pl.DataFrame({"n": [[0, 1], [0, 1, 2]]})
-        >>> df.with_columns(
-        ...     struct=pl.col("n").list.to_struct()
-        ... )  # doctest: +IGNORE_RESULT
+        >>> df.with_columns(struct=pl.col("n").list.to_struct())  # doctest: +SKIP
         shape: (2, 2)
         ┌───────────┬───────────┐
         │ n         ┆ struct    │
@@ -1157,7 +1160,7 @@ class ExprListNameSpace:
 
         >>> df.with_columns(
         ...     struct=pl.col("n").list.to_struct(n_field_strategy="max_width")
-        ... )  # doctest: +IGNORE_RESULT
+        ... )  # doctest: +SKIP
         shape: (2, 2)
         ┌───────────┬────────────┐
         │ n         ┆ struct     │
@@ -1173,7 +1176,7 @@ class ExprListNameSpace:
         >>> df = pl.DataFrame({"n": [[0, 1], [2, 3]]})
         >>> df.select(pl.col("n").list.to_struct(fields=lambda idx: f"n{idx}")).rows(
         ...     named=True
-        ... )
+        ... )  # doctest: +SKIP
         [{'n': {'n0': 0, 'n1': 1}}, {'n': {'n0': 2, 'n1': 3}}]
 
         Convert list to struct with field name assignment by index from a list of names:
@@ -1184,10 +1187,16 @@ class ExprListNameSpace:
         [{'n': {'one': 0, 'two': 1}}, {'n': {'one': 2, 'two': 3}}]
         """
         if isinstance(fields, Sequence):
-            field_names = list(fields)
-            pyexpr = self._pyexpr.list_to_struct(n_field_strategy, None, upper_bound)
-            return wrap_expr(pyexpr).struct.rename_fields(field_names)
+            pyexpr = self._pyexpr.list_to_struct_fixed_width(fields)
+            return wrap_expr(pyexpr)
         else:
+            if not _eager:
+                msg = (
+                    "`to_struct()` should be passed a list of field names to avoid "
+                    "query errors in subsequent operations (e.g. <struct operation> "
+                    "not supported for dtype Unknown)"
+                )
+                warnings.warn(msg, stacklevel=find_stacklevel())
             pyexpr = self._pyexpr.list_to_struct(n_field_strategy, fields, upper_bound)
             return wrap_expr(pyexpr)
 
@@ -1258,7 +1267,7 @@ class ExprListNameSpace:
         │ [5, 6, 7] ┆ [6, 8]       ┆ [5, 6, 7, 8]  │
         └───────────┴──────────────┴───────────────┘
         """  # noqa: W505.
-        other = parse_as_expression(other, str_as_lit=False)
+        other = parse_into_expression(other, str_as_lit=False)
         return wrap_expr(self._pyexpr.list_set_operation(other, "union"))
 
     def set_difference(self, other: IntoExpr) -> Expr:
@@ -1295,7 +1304,7 @@ class ExprListNameSpace:
         --------
         polars.Expr.list.diff: Calculates the n-th discrete difference of every sublist.
         """  # noqa: W505.
-        other = parse_as_expression(other, str_as_lit=False)
+        other = parse_into_expression(other, str_as_lit=False)
         return wrap_expr(self._pyexpr.list_set_operation(other, "difference"))
 
     def set_intersection(self, other: IntoExpr) -> Expr:
@@ -1328,7 +1337,7 @@ class ExprListNameSpace:
         │ [5, 6, 7] ┆ [6, 8]       ┆ [6]          │
         └───────────┴──────────────┴──────────────┘
         """  # noqa: W505.
-        other = parse_as_expression(other, str_as_lit=False)
+        other = parse_into_expression(other, str_as_lit=False)
         return wrap_expr(self._pyexpr.list_set_operation(other, "intersection"))
 
     def set_symmetric_difference(self, other: IntoExpr) -> Expr:
@@ -1361,59 +1370,5 @@ class ExprListNameSpace:
         │ [5, 6, 7] ┆ [6, 8]       ┆ [8, 5, 7] │
         └───────────┴──────────────┴───────────┘
         """  # noqa: W505.
-        other = parse_as_expression(other, str_as_lit=False)
+        other = parse_into_expression(other, str_as_lit=False)
         return wrap_expr(self._pyexpr.list_set_operation(other, "symmetric_difference"))
-
-    @deprecate_renamed_function("count_matches", version="0.19.3")
-    def count_match(self, element: IntoExpr) -> Expr:
-        """
-        Count how often the value produced by `element` occurs.
-
-        .. deprecated:: 0.19.3
-            This method has been renamed to :func:`count_matches`.
-
-        Parameters
-        ----------
-        element
-            An expression that produces a single value
-        """
-        return self.count_matches(element)
-
-    @deprecate_renamed_function("len", version="0.19.8")
-    def lengths(self) -> Expr:
-        """
-        Return the number of elements in each list.
-
-        .. deprecated:: 0.19.8
-            This method has been renamed to :meth:`.len`.
-        """
-        return self.len()
-
-    @deprecate_renamed_function("gather", version="0.19.14")
-    @deprecate_renamed_parameter("index", "indices", version="0.19.14")
-    def take(
-        self,
-        indices: Expr | Series | list[int] | list[list[int]],
-        *,
-        null_on_oob: bool = False,
-    ) -> Expr:
-        """
-        Take sublists by multiple indices.
-
-        The indices may be defined in a single column, or by sublists in another
-        column of dtype `List`.
-
-        .. deprecated:: 0.19.14
-            This method has been renamed to :func:`gather`.
-
-        Parameters
-        ----------
-        indices
-            Indices to return per sublist
-        null_on_oob
-            Behavior if an index is out of bounds:
-            True -> set as null
-            False -> raise an error
-            Note that defaulting to raising an error is much cheaper
-        """
-        return self.gather(indices)

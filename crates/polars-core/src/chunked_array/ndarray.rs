@@ -76,15 +76,15 @@ impl ListChunked {
 
 impl DataFrame {
     /// Create a 2D [`ndarray::Array`] from this [`DataFrame`]. This requires all columns in the
-    /// [`DataFrame`] to be non-null and numeric. They will be casted to the same data type
+    /// [`DataFrame`] to be non-null and numeric. They will be cast to the same data type
     /// (if they aren't already).
     ///
     /// For floating point data we implicitly convert `None` to `NaN` without failure.
     ///
     /// ```rust
     /// use polars_core::prelude::*;
-    /// let a = UInt32Chunked::new("a", &[1, 2, 3]).into_series();
-    /// let b = Float64Chunked::new("b", &[10., 8., 6.]).into_series();
+    /// let a = UInt32Chunked::new("a".into(), &[1, 2, 3]).into_column();
+    /// let b = Float64Chunked::new("b".into(), &[10., 8., 6.]).into_column();
     ///
     /// let df = DataFrame::new(vec![a, b]).unwrap();
     /// let ndarray = df.to_ndarray::<Float64Type>(IndexOrder::Fortran).unwrap();
@@ -100,46 +100,35 @@ impl DataFrame {
     where
         N: PolarsNumericType,
     {
-        let columns = POOL.install(|| {
-            self.get_columns()
-                .par_iter()
-                .map(|s| {
-                    let s = s.cast(&N::get_dtype())?;
-                    let s = match s.dtype() {
-                        DataType::Float32 => {
-                            let ca = s.f32().unwrap();
-                            ca.none_to_nan().into_series()
-                        },
-                        DataType::Float64 => {
-                            let ca = s.f64().unwrap();
-                            ca.none_to_nan().into_series()
-                        },
-                        _ => s,
-                    };
-                    Ok(s.rechunk())
-                })
-                .collect::<PolarsResult<Vec<_>>>()
-        })?;
-
         let shape = self.shape();
         let height = self.height();
         let mut membuf = Vec::with_capacity(shape.0 * shape.1);
         let ptr = membuf.as_ptr() as usize;
 
+        let columns = self.get_columns();
         POOL.install(|| {
-            columns
-                .par_iter()
-                .enumerate()
-                .map(|(col_idx, s)| {
-                    polars_ensure!(
-                        s.null_count() == 0,
-                        ComputeError: "creation of ndarray with null values is not supported"
-                    );
+            columns.par_iter().enumerate().try_for_each(|(col_idx, s)| {
+                let s = s.as_materialized_series().cast(&N::get_dtype())?;
+                let s = match s.dtype() {
+                    DataType::Float32 => {
+                        let ca = s.f32().unwrap();
+                        ca.none_to_nan().into_series()
+                    },
+                    DataType::Float64 => {
+                        let ca = s.f64().unwrap();
+                        ca.none_to_nan().into_series()
+                    },
+                    _ => s,
+                };
+                polars_ensure!(
+                    s.null_count() == 0,
+                    ComputeError: "creation of ndarray with null values is not supported"
+                );
+                let ca = s.unpack::<N>()?;
 
-                    // this is an Arc clone if already of type N
-                    let s = s.cast(&N::get_dtype())?;
-                    let ca = s.unpack::<N>()?;
-                    let vals = ca.cont_slice().unwrap();
+                let mut chunk_offset = 0;
+                for arr in ca.downcast_iter() {
+                    let vals = arr.values();
 
                     // Depending on the desired order, we add items to the buffer.
                     // SAFETY:
@@ -150,24 +139,28 @@ impl DataFrame {
                     match ordering {
                         IndexOrder::C => unsafe {
                             let num_cols = columns.len();
-                            let mut offset = (ptr as *mut N::Native).add(col_idx);
+                            let mut offset =
+                                (ptr as *mut N::Native).add(col_idx + chunk_offset * num_cols);
                             for v in vals.iter() {
                                 *offset = *v;
                                 offset = offset.add(num_cols);
                             }
                         },
                         IndexOrder::Fortran => unsafe {
-                            let offset_ptr = (ptr as *mut N::Native).add(col_idx * height);
+                            let offset_ptr =
+                                (ptr as *mut N::Native).add(col_idx * height + chunk_offset);
                             // SAFETY:
                             // this is uninitialized memory, so we must never read from this data
                             // copy_from_slice does not read
-                            let buf = std::slice::from_raw_parts_mut(offset_ptr, height);
+                            let buf = std::slice::from_raw_parts_mut(offset_ptr, vals.len());
                             buf.copy_from_slice(vals)
                         },
                     }
-                    Ok(())
-                })
-                .collect::<PolarsResult<Vec<_>>>()
+                    chunk_offset += vals.len();
+                }
+
+                Ok(())
+            })
         })?;
 
         // SAFETY:
@@ -193,12 +186,16 @@ mod test {
 
     #[test]
     fn test_ndarray_from_ca() -> PolarsResult<()> {
-        let ca = Float64Chunked::new("", &[1.0, 2.0, 3.0]);
+        let ca = Float64Chunked::new(PlSmallStr::EMPTY, &[1.0, 2.0, 3.0]);
         let ndarr = ca.to_ndarray()?;
         assert_eq!(ndarr, ArrayView1::from(&[1.0, 2.0, 3.0]));
 
-        let mut builder =
-            ListPrimitiveChunkedBuilder::<Float64Type>::new("", 10, 10, DataType::Float64);
+        let mut builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+            PlSmallStr::EMPTY,
+            10,
+            10,
+            DataType::Float64,
+        );
         builder.append_opt_slice(Some(&[1.0, 2.0, 3.0]));
         builder.append_opt_slice(Some(&[2.0, 4.0, 5.0]));
         builder.append_opt_slice(Some(&[6.0, 7.0, 8.0]));
@@ -209,8 +206,12 @@ mod test {
         assert_eq!(ndarr, expected);
 
         // test list array that is not square
-        let mut builder =
-            ListPrimitiveChunkedBuilder::<Float64Type>::new("", 10, 10, DataType::Float64);
+        let mut builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+            PlSmallStr::EMPTY,
+            10,
+            10,
+            DataType::Float64,
+        );
         builder.append_opt_slice(Some(&[1.0, 2.0, 3.0]));
         builder.append_opt_slice(Some(&[2.0]));
         builder.append_opt_slice(Some(&[6.0, 7.0, 8.0]));

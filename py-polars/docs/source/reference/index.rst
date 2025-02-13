@@ -53,6 +53,7 @@ methods. All classes and functions exposed in the ``polars.*`` namespace are pub
            :maxdepth: 2
 
            datatypes
+           schema/index
 
 
 .. grid::
@@ -63,6 +64,13 @@ methods. All classes and functions exposed in the ``polars.*`` namespace are pub
            :maxdepth: 2
 
            io
+
+    .. grid-item-card::
+
+        .. toctree::
+           :maxdepth: 2
+
+           catalog/index
 
     .. grid-item-card::
 
@@ -91,7 +99,7 @@ methods. All classes and functions exposed in the ``polars.*`` namespace are pub
         .. toctree::
            :maxdepth: 2
 
-           sql
+           sql/index
 
     .. grid-item-card::
 

@@ -1,5 +1,3 @@
-use std::borrow::Borrow;
-
 use crate::array::PrimitiveArray;
 use crate::bitmap::utils::set_bit_unchecked;
 use crate::bitmap::MutableBitmap;
@@ -18,7 +16,7 @@ pub trait CustomIterTools: Iterator {
     where
         Self: Sized,
     {
-        TrustMyLength::new(self, length)
+        unsafe { TrustMyLength::new(self, length) }
     }
 
     fn collect_trusted<T: FromTrustedLenIterator<Self::Item>>(self) -> T
@@ -33,40 +31,6 @@ pub trait CustomIterTools: Iterator {
         Self: Sized + TrustedLen,
     {
         FromIteratorReversed::from_trusted_len_iter_rev(self)
-    }
-
-    fn all_equal(&mut self) -> bool
-    where
-        Self: Sized,
-        Self::Item: PartialEq,
-    {
-        match self.next() {
-            None => true,
-            Some(a) => self.all(|x| a == x),
-        }
-    }
-
-    fn fold_options<A, B, F>(&mut self, mut start: B, mut f: F) -> Option<B>
-    where
-        Self: Iterator<Item = Option<A>>,
-        F: FnMut(B, A) -> B,
-    {
-        for elt in self {
-            match elt {
-                Some(v) => start = f(start, v),
-                None => return None,
-            }
-        }
-        Some(start)
-    }
-
-    fn contains<Q>(&mut self, query: &Q) -> bool
-    where
-        Self: Sized,
-        Self::Item: Borrow<Q>,
-        Q: PartialEq,
-    {
-        self.any(|x| x.borrow() == query)
     }
 }
 
@@ -113,21 +77,27 @@ impl<T: NativeType> FromTrustedLenIterator<T> for PrimitiveArray<T> {
     }
 }
 
+impl<T> FromIteratorReversed<T> for Vec<T> {
+    fn from_trusted_len_iter_rev<I: TrustedLen<Item = T>>(iter: I) -> Self {
+        unsafe {
+            let len = iter.size_hint().1.unwrap();
+            let mut out: Vec<T> = Vec::with_capacity(len);
+            let mut idx = len;
+            for x in iter {
+                debug_assert!(idx > 0);
+                idx -= 1;
+                out.as_mut_ptr().add(idx).write(x);
+            }
+            debug_assert!(idx == 0);
+            out.set_len(len);
+            out
+        }
+    }
+}
+
 impl<T: NativeType> FromIteratorReversed<T> for PrimitiveArray<T> {
     fn from_trusted_len_iter_rev<I: TrustedLen<Item = T>>(iter: I) -> Self {
-        let size = iter.size_hint().1.unwrap();
-
-        let mut vals: Vec<T> = Vec::with_capacity(size);
-        unsafe {
-            // Set to end of buffer.
-            let mut ptr = vals.as_mut_ptr().add(size);
-
-            iter.for_each(|item| {
-                ptr = ptr.sub(1);
-                std::ptr::write(ptr, item);
-            });
-            vals.set_len(size)
-        }
+        let vals: Vec<T> = iter.collect_reversed();
         PrimitiveArray::new(ArrowDataType::from(T::PRIMITIVE), vals.into(), None)
     }
 }

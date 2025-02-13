@@ -1,7 +1,9 @@
 use arrow::array::{Array, PrimitiveArray};
-use arrow::compute::cast::{cast, CastOptions};
 use arrow::compute::temporal;
+use polars_compute::cast::{cast, CastOptionsImpl};
 use polars_core::prelude::*;
+#[cfg(feature = "timezones")]
+use polars_ops::chunked_array::datetime::replace_time_zone;
 
 use super::*;
 
@@ -12,12 +14,12 @@ fn cast_and_apply<
     ca: &DatetimeChunked,
     func: F,
 ) -> ChunkedArray<T> {
-    let dtype = ca.dtype().to_arrow(true);
+    let dtype = ca.dtype().to_arrow(CompatLevel::newest());
     let chunks = ca.downcast_iter().map(|arr| {
         let arr = cast(
             arr,
             &dtype,
-            CastOptions {
+            CastOptionsImpl {
                 wrapped: true,
                 partial: false,
             },
@@ -25,7 +27,7 @@ fn cast_and_apply<
         .unwrap();
         func(&*arr).unwrap()
     });
-    ChunkedArray::from_chunk_iter(ca.name(), chunks)
+    ChunkedArray::from_chunk_iter(ca.name().clone(), chunks)
 }
 
 pub trait DatetimeMethods: AsDatetime {
@@ -130,7 +132,12 @@ pub trait DatetimeMethods: AsDatetime {
         ca.apply_kernel_cast::<Int16Type>(&f)
     }
 
-    fn parse_from_str_slice(name: &str, v: &[&str], fmt: &str, tu: TimeUnit) -> DatetimeChunked {
+    fn parse_from_str_slice(
+        name: PlSmallStr,
+        v: &[&str],
+        fmt: &str,
+        tu: TimeUnit,
+    ) -> DatetimeChunked {
         let func = match tu {
             TimeUnit::Nanoseconds => datetime_to_timestamp_ns,
             TimeUnit::Microseconds => datetime_to_timestamp_us,
@@ -143,6 +150,67 @@ pub trait DatetimeMethods: AsDatetime {
                 .map(|s| NaiveDateTime::parse_from_str(s, fmt).ok().map(func)),
         )
         .into_datetime(tu, None)
+    }
+
+    /// Construct a datetime ChunkedArray from individual time components.
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_parts(
+        year: &Int32Chunked,
+        month: &Int8Chunked,
+        day: &Int8Chunked,
+        hour: &Int8Chunked,
+        minute: &Int8Chunked,
+        second: &Int8Chunked,
+        nanosecond: &Int32Chunked,
+        ambiguous: &StringChunked,
+        time_unit: &TimeUnit,
+        time_zone: Option<&str>,
+        name: PlSmallStr,
+    ) -> PolarsResult<DatetimeChunked> {
+        let ca: Int64Chunked = year
+            .into_iter()
+            .zip(month)
+            .zip(day)
+            .zip(hour)
+            .zip(minute)
+            .zip(second)
+            .zip(nanosecond)
+            .map(|((((((y, m), d), h), mnt), s), ns)| {
+                if let (Some(y), Some(m), Some(d), Some(h), Some(mnt), Some(s), Some(ns)) =
+                    (y, m, d, h, mnt, s, ns)
+                {
+                    NaiveDate::from_ymd_opt(y, m as u32, d as u32)
+                        .and_then(|nd| {
+                            nd.and_hms_nano_opt(h as u32, mnt as u32, s as u32, ns as u32)
+                        })
+                        .map(|ndt| match time_unit {
+                            TimeUnit::Milliseconds => ndt.and_utc().timestamp_millis(),
+                            TimeUnit::Microseconds => ndt.and_utc().timestamp_micros(),
+                            TimeUnit::Nanoseconds => ndt.and_utc().timestamp_nanos_opt().unwrap(),
+                        })
+                } else {
+                    None
+                }
+            })
+            .collect_trusted();
+
+        let mut ca = match time_zone {
+            #[cfg(feature = "timezones")]
+            Some(_) => {
+                let mut ca = ca.into_datetime(*time_unit, None);
+                ca = replace_time_zone(&ca, time_zone, ambiguous, NonExistent::Raise)?;
+                ca
+            },
+            _ => {
+                polars_ensure!(
+                    time_zone.is_none(),
+                    ComputeError: "cannot make use of the `time_zone` argument without the 'timezones' feature enabled."
+                );
+                ca.into_datetime(*time_unit, None)
+            },
+        };
+        ca.rename(name);
+        Ok(ca)
     }
 }
 
@@ -175,7 +243,7 @@ mod test {
 
         // NOTE: the values are checked and correct.
         let dt = DatetimeChunked::from_naive_datetime(
-            "name",
+            "name".into(),
             datetimes.iter().copied(),
             TimeUnit::Nanoseconds,
         );

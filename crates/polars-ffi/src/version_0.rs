@@ -1,3 +1,5 @@
+use polars_core::prelude::{Column, CompatLevel};
+
 use super::*;
 
 /// An FFI exported `Series`.
@@ -51,14 +53,22 @@ unsafe extern "C" fn c_release_series_export(e: *mut SeriesExport) {
     e.release = None;
 }
 
+pub fn export_column(c: &Column) -> SeriesExport {
+    export_series(c.as_materialized_series())
+}
+
 pub fn export_series(s: &Series) -> SeriesExport {
-    let field = ArrowField::new(s.name(), s.dtype().to_arrow(true), true);
+    let field = ArrowField::new(
+        s.name().clone(),
+        s.dtype().to_arrow(CompatLevel::newest()),
+        true,
+    );
     let schema = Box::new(ffi::export_field_to_c(&field));
 
     let mut arrays = (0..s.chunks().len())
         .map(|i| {
             // Make sure we export the logical type.
-            let arr = s.to_arrow(i, true);
+            let arr = s.to_arrow(i, CompatLevel::newest());
             Box::into_raw(Box::new(ffi::export_array_to_c(arr.clone())))
         })
         .collect::<Box<_>>();
@@ -89,7 +99,7 @@ pub unsafe fn import_series(e: SeriesExport) -> PolarsResult<Series> {
         })
         .collect::<PolarsResult<Vec<_>>>()?;
 
-    Series::try_from((field.name.as_str(), chunks))
+    Series::try_from((field.name.clone(), chunks))
 }
 
 /// # Safety
@@ -122,7 +132,7 @@ impl CallerContext {
         self.bitflags |= 1 << k
     }
 
-    /// Parallelism is done by polars' main engine, the plugin should not run run its own parallelism.
+    /// Parallelism is done by polars' main engine, the plugin should not run its own parallelism.
     /// If this is `false`, the plugin could use parallelism without (much) contention with polars
     /// parallelism strategies.
     pub fn parallel(&self) -> bool {
@@ -142,7 +152,7 @@ mod test {
 
     #[test]
     fn test_ffi() {
-        let s = Series::new("a", [1, 2]);
+        let s = Series::new("a".into(), [1, 2]);
         let e = export_series(&s);
 
         unsafe {

@@ -1,236 +1,169 @@
+use std::ops::Not;
+
+use arrow::bitmap::Bitmap;
+
 use super::*;
-use crate::hashing::series_to_hashes;
+use crate::chunked_array::StructChunked;
 use crate::prelude::*;
 use crate::series::private::{PrivateSeries, PrivateSeriesNumeric};
 
-unsafe impl IntoSeries for StructChunked {
-    fn into_series(self) -> Series {
-        Series(Arc::new(SeriesWrap(self)))
+impl PrivateSeriesNumeric for SeriesWrap<StructChunked> {
+    fn bit_repr(&self) -> Option<BitRepr> {
+        None
     }
 }
 
-impl PrivateSeriesNumeric for SeriesWrap<StructChunked> {}
-
-impl private::PrivateSeries for SeriesWrap<StructChunked> {
-    fn compute_len(&mut self) {
-        for s in self.0.fields_mut() {
-            s._get_inner_mut().compute_len();
-        }
-    }
+impl PrivateSeries for SeriesWrap<StructChunked> {
     fn _field(&self) -> Cow<Field> {
         Cow::Borrowed(self.0.ref_field())
     }
+
     fn _dtype(&self) -> &DataType {
-        self.0.ref_field().data_type()
-    }
-    #[allow(unused)]
-    fn _set_flags(&mut self, flags: Settings) {}
-    fn _get_flags(&self) -> Settings {
-        Settings::empty()
-    }
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
-        self.0
-            ._apply_fields(|s| s.explode_by_offsets(offsets))
-            .into_series()
+        self.0.dtype()
     }
 
+    fn compute_len(&mut self) {
+        self.0.compute_len()
+    }
+
+    fn _get_flags(&self) -> StatisticsFlags {
+        StatisticsFlags::empty()
+    }
+
+    fn _set_flags(&mut self, _flags: StatisticsFlags) {}
+
+    // TODO! remove this. Very slow. Asof join should use row-encoding.
     unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
         let other = other.struct_().unwrap();
         self.0
-            .fields()
+            .fields_as_series()
             .iter()
-            .zip(other.fields())
-            .all(|(s, other)| s.equal_element(idx_self, idx_other, other))
+            .zip(other.fields_as_series())
+            .all(|(s, other)| s.equal_element(idx_self, idx_other, &other))
+    }
+
+    #[cfg(feature = "algorithm_group_by")]
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsType> {
+        let ca = self.0.get_row_encoded(Default::default())?;
+        ca.group_tuples(multithreaded, sorted)
     }
 
     #[cfg(feature = "zip_with")]
     fn zip_with_same_type(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
-        let other = other.struct_()?;
-        let fields = self
-            .0
-            .fields()
-            .iter()
-            .zip(other.fields())
-            .map(|(lhs, rhs)| lhs.zip_with_same_type(mask, rhs))
-            .collect::<PolarsResult<Vec<_>>>()?;
-        Ok(StructChunked::new_unchecked(self.0.name(), &fields).into_series())
+        self.0
+            .zip_with(mask, other.struct_()?)
+            .map(|ca| ca.into_series())
+    }
+
+    fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+        invalid_operation_panic!(into_total_eq_inner, self)
+    }
+    fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+        invalid_operation_panic!(into_total_ord_inner, self)
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
         self.0.agg_list(groups)
     }
 
-    #[cfg(feature = "algorithm_group_by")]
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
-        let df = DataFrame::empty();
-        let gb = df
-            .group_by_with_series(self.0.fields().to_vec(), multithreaded, sorted)
-            .unwrap();
-        Ok(gb.take_groups())
-    }
+    fn vec_hash(&self, build_hasher: PlRandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
+        let mut fields = self.0.fields_as_series().into_iter();
 
-    fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
-        series_to_hashes(self.0.fields(), Some(random_state), buf)?;
-        Ok(())
-    }
-
-    fn vec_hash_combine(&self, build_hasher: RandomState, hashes: &mut [u64]) -> PolarsResult<()> {
-        for field in self.0.fields() {
-            field.vec_hash_combine(build_hasher.clone(), hashes)?;
+        if let Some(s) = fields.next() {
+            s.vec_hash(build_hasher.clone(), buf)?
+        };
+        for s in fields {
+            s.vec_hash_combine(build_hasher.clone(), buf)?
         }
         Ok(())
     }
 }
 
 impl SeriesTrait for SeriesWrap<StructChunked> {
-    fn rename(&mut self, name: &str) {
+    fn rename(&mut self, name: PlSmallStr) {
         self.0.rename(name)
     }
 
-    fn has_validity(&self) -> bool {
-        self.0.fields().iter().any(|s| s.has_validity())
+    fn chunk_lengths(&self) -> ChunkLenIter {
+        self.0.chunk_lengths()
     }
 
-    /// Name of series.
-    fn name(&self) -> &str {
+    fn name(&self) -> &PlSmallStr {
         self.0.name()
     }
 
-    fn chunk_lengths(&self) -> ChunkIdIter {
-        let s = self.0.fields().first().unwrap();
-        s.chunk_lengths()
+    fn chunks(&self) -> &Vec<ArrayRef> {
+        &self.0.chunks
     }
 
-    /// Underlying chunks.
-    fn chunks(&self) -> &Vec<ArrayRef> {
-        self.0.chunks()
-    }
     unsafe fn chunks_mut(&mut self) -> &mut Vec<ArrayRef> {
         self.0.chunks_mut()
     }
 
-    /// Number of chunks in this Series
-    fn n_chunks(&self) -> usize {
-        let s = self.0.fields().first().unwrap();
-        s.n_chunks()
+    fn slice(&self, offset: i64, length: usize) -> Series {
+        self.0.slice(offset, length).into_series()
     }
 
-    /// Get a zero copy view of the data.
-    ///
-    /// When offset is negative the offset is counted from the
-    /// end of the array
-    fn slice(&self, offset: i64, length: usize) -> Series {
-        let mut out = self.0._apply_fields(|s| s.slice(offset, length));
-        out.update_chunks(0);
-        out.into_series()
+    fn split_at(&self, offset: i64) -> (Series, Series) {
+        let (l, r) = self.0.split_at(offset);
+        (l.into_series(), r.into_series())
     }
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
-        let other = other.struct_()?;
-        if self.is_empty() {
-            self.0 = other.clone();
-            Ok(())
-        } else if other.is_empty() {
-            Ok(())
-        } else {
-            let offset = self.chunks().len();
-            for (lhs, rhs) in self.0.fields_mut().iter_mut().zip(other.fields()) {
-                polars_ensure!(
-                    lhs.name() == rhs.name(), SchemaMismatch:
-                    "cannot append field with name {:?} to struct with field name {:?}",
-                    rhs.name(), lhs.name(),
-                );
-                lhs.append(rhs)?;
-            }
-            self.0.update_chunks(offset);
-            Ok(())
-        }
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append(other.as_ref().as_ref())
+    }
+    fn append_owned(&mut self, other: Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append_owned(other.take_inner())
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
-        let other = other.struct_()?;
-        if self.is_empty() {
-            self.0 = other.clone();
-            Ok(())
-        } else if other.is_empty() {
-            Ok(())
-        } else {
-            for (lhs, rhs) in self.0.fields_mut().iter_mut().zip(other.fields()) {
-                polars_ensure!(
-                    lhs.name() == rhs.name(), SchemaMismatch:
-                    "cannot extend field with name {:?} to struct with field name {:?}",
-                    rhs.name(), lhs.name(),
-                );
-                lhs.extend(rhs)?;
-            }
-            self.0.update_chunks(0);
-            Ok(())
-        }
+        polars_ensure!(self.0.dtype() == other.dtype(), extend);
+        self.0.extend(other.as_ref().as_ref())
     }
 
-    /// Filter by boolean mask. This operation clones data.
     fn filter(&self, _filter: &BooleanChunked) -> PolarsResult<Series> {
-        self.0
-            .try_apply_fields(|s| s.filter(_filter))
-            .map(|ca| ca.into_series())
+        ChunkFilter::filter(&self.0, _filter).map(|ca| ca.into_series())
     }
 
-    fn take(&self, indices: &IdxCa) -> PolarsResult<Series> {
-        self.0
-            .try_apply_fields(|s| s.take(indices))
-            .map(|ca| ca.into_series())
+    fn take(&self, _indices: &IdxCa) -> PolarsResult<Series> {
+        self.0.take(_indices).map(|ca| ca.into_series())
     }
 
-    unsafe fn take_unchecked(&self, indices: &IdxCa) -> Series {
-        self.0
-            ._apply_fields(|s| s.take_unchecked(indices))
-            .into_series()
+    unsafe fn take_unchecked(&self, _idx: &IdxCa) -> Series {
+        self.0.take_unchecked(_idx).into_series()
     }
 
-    fn take_slice(&self, indices: &[IdxSize]) -> PolarsResult<Series> {
-        self.0
-            .try_apply_fields(|s| s.take_slice(indices))
-            .map(|ca| ca.into_series())
+    fn take_slice(&self, _indices: &[IdxSize]) -> PolarsResult<Series> {
+        self.0.take(_indices).map(|ca| ca.into_series())
     }
 
-    unsafe fn take_slice_unchecked(&self, indices: &[IdxSize]) -> Series {
-        self.0
-            ._apply_fields(|s| s.take_slice_unchecked(indices))
-            .into_series()
+    unsafe fn take_slice_unchecked(&self, _idx: &[IdxSize]) -> Series {
+        self.0.take_unchecked(_idx).into_series()
     }
 
-    /// Get length of series.
     fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Aggregate all chunks to a contiguous array of memory.
     fn rechunk(&self) -> Series {
-        let mut out = self.0.clone();
-        out.rechunk();
-        out.into_series()
+        self.0.rechunk().into_owned().into_series()
     }
 
-    fn new_from_index(&self, index: usize, length: usize) -> Series {
-        self.0
-            ._apply_fields(|s| s.new_from_index(index, length))
-            .into_series()
+    fn new_from_index(&self, _index: usize, _length: usize) -> Series {
+        self.0.new_from_index(_index, _length).into_series()
     }
 
-    fn cast(&self, dtype: &DataType) -> PolarsResult<Series> {
-        self.0.cast(dtype)
-    }
-
-    fn get(&self, index: usize) -> PolarsResult<AnyValue> {
-        self.0.get_any_value(index)
+    fn cast(&self, dtype: &DataType, cast_options: CastOptions) -> PolarsResult<Series> {
+        self.0.cast_with_options(dtype, cast_options)
     }
 
     unsafe fn get_unchecked(&self, index: usize) -> AnyValue {
         self.0.get_any_value_unchecked(index)
     }
 
-    /// Count the null values.
     fn null_count(&self) -> usize {
         self.0.null_count()
     }
@@ -270,38 +203,53 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
         // this can called in aggregation, so this fast path can be worth a lot
         if self.len() == 1 {
-            return Ok(IdxCa::new_vec(self.name(), vec![0 as IdxSize]));
+            return Ok(IdxCa::new_vec(self.name().clone(), vec![0 as IdxSize]));
         }
         let main_thread = POOL.current_thread_index().is_none();
         let groups = self.group_tuples(main_thread, true)?;
         let first = groups.take_group_firsts();
-        Ok(IdxCa::from_vec(self.name(), first))
+        Ok(IdxCa::from_vec(self.name().clone(), first))
     }
 
-    /// Get a mask of the null values.
+    fn has_nulls(&self) -> bool {
+        self.0.has_nulls()
+    }
+
     fn is_null(&self) -> BooleanChunked {
-        let is_null = self.0.fields().iter().map(|s| s.is_null());
-        is_null.reduce(|lhs, rhs| lhs.bitand(rhs)).unwrap()
-    }
-
-    /// Get a mask of the non-null values.
-    fn is_not_null(&self) -> BooleanChunked {
-        let is_not_null = self.0.fields().iter().map(|s| s.is_not_null());
-        is_not_null.reduce(|lhs, rhs| lhs.bitor(rhs)).unwrap()
-    }
-
-    fn shrink_to_fit(&mut self) {
-        self.0.fields_mut().iter_mut().for_each(|s| {
-            s.shrink_to_fit();
+        let iter = self.downcast_iter().map(|arr| {
+            let bitmap = match arr.validity() {
+                Some(valid) => valid.not(),
+                None => Bitmap::new_with_value(false, arr.len()),
+            };
+            BooleanArray::from_data_default(bitmap, None)
         });
+        BooleanChunked::from_chunk_iter(self.name().clone(), iter)
+    }
+
+    fn is_not_null(&self) -> BooleanChunked {
+        let iter = self.downcast_iter().map(|arr| {
+            let bitmap = match arr.validity() {
+                Some(valid) => valid.clone(),
+                None => Bitmap::new_with_value(true, arr.len()),
+            };
+            BooleanArray::from_data_default(bitmap, None)
+        });
+        BooleanChunked::from_chunk_iter(self.name().clone(), iter)
     }
 
     fn reverse(&self) -> Series {
-        self.0._apply_fields(|s| s.reverse()).into_series()
+        let validity = self
+            .rechunk_validity()
+            .map(|x| x.into_iter().rev().collect::<Bitmap>());
+        self.0
+            ._apply_fields(|s| s.reverse())
+            .unwrap()
+            .with_outer_validity(validity)
+            .into_series()
     }
 
     fn shift(&self, periods: i64) -> Series {
-        self.0._apply_fields(|s| s.shift(periods)).into_series()
+        self.0.shift(periods).into_series()
     }
 
     fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
@@ -312,19 +260,16 @@ impl SeriesTrait for SeriesWrap<StructChunked> {
         &self.0
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self as _
+    }
+
     fn sort_with(&self, options: SortOptions) -> PolarsResult<Series> {
-        let df = self.0.clone().unnest();
-
-        let desc = if options.descending {
-            vec![true; df.width()]
-        } else {
-            vec![false; df.width()]
-        };
-
-        let multi_options = SortMultipleOptions::from(&options).with_order_descendings(desc);
-
-        let out = df.sort_impl(df.columns.clone(), multi_options, None)?;
-        Ok(StructChunked::new_unchecked(self.name(), &out.columns).into_series())
+        Ok(self.0.sort_with(options).into_series())
     }
 
     fn arg_sort(&self, options: SortOptions) -> IdxCa {

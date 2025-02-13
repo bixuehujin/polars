@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.fixture()
+@pytest.fixture
 def foods_ndjson_path(io_files_path: Path) -> Path:
     return io_files_path / "foods1.ndjson"
 
@@ -56,12 +56,17 @@ def test_scan_ndjson_with_schema(foods_ndjson_path: Path) -> None:
     assert df["sugars_g"].dtype == pl.Float64
 
 
+def test_scan_ndjson_infer_0(foods_ndjson_path: Path) -> None:
+    with pytest.raises(ValueError):
+        pl.scan_ndjson(foods_ndjson_path, infer_schema_length=0)
+
+
 def test_scan_ndjson_batch_size_zero() -> None:
     with pytest.raises(ValueError, match="invalid zero value"):
         pl.scan_ndjson("test.ndjson", batch_size=0)
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_scan_with_projection(tmp_path: Path) -> None:
     tmp_path.mkdir(exist_ok=True)
 
@@ -104,6 +109,30 @@ def test_scan_with_projection(tmp_path: Path) -> None:
     assert_frame_equal(actual, expected)
 
 
+def test_projection_pushdown_ndjson(io_files_path: Path) -> None:
+    file_path = io_files_path / "foods1.ndjson"
+    df = pl.scan_ndjson(file_path).select(pl.col.calories)
+
+    explain = df.explain()
+
+    assert "simple π" not in explain
+    assert "PROJECT 1/4 COLUMNS" in explain
+
+    assert_frame_equal(df.collect(no_optimization=True), df.collect())
+
+
+def test_predicate_pushdown_ndjson(io_files_path: Path) -> None:
+    file_path = io_files_path / "foods1.ndjson"
+    df = pl.scan_ndjson(file_path).filter(pl.col.calories > 80)
+
+    explain = df.explain()
+
+    assert "FILTER" not in explain
+    assert """SELECTION: [(col("calories")) > (80)]""" in explain
+
+    assert_frame_equal(df.collect(no_optimization=True), df.collect())
+
+
 def test_glob_n_rows(io_files_path: Path) -> None:
     file_path = io_files_path / "foods*.ndjson"
     df = pl.scan_ndjson(file_path, n_rows=40).collect()
@@ -135,8 +164,11 @@ def test_ndjson_list_arg(io_files_path: Path) -> None:
     assert df.row(0) == ("vegetables", 45, 0.5, 2)
 
 
-def test_anonymous_scan_explain(io_files_path: Path) -> None:
-    file = io_files_path / "foods1.ndjson"
-    q = pl.scan_ndjson(source=file)
-    assert "Anonymous" in q.explain()
-    assert "Anonymous" in q.show_graph(raw_output=True)  # type: ignore[operator]
+def test_glob_single_scan(io_files_path: Path) -> None:
+    file_path = io_files_path / "foods*.ndjson"
+    df = pl.scan_ndjson(file_path, n_rows=40)
+
+    explain = df.explain()
+
+    assert explain.count("SCAN") == 1
+    assert "UNION" not in explain

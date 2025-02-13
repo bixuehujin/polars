@@ -12,7 +12,7 @@ pub(crate) fn push_bitchunk<T: BitChunk>(buffer: &mut Vec<u8>, value: T) {
 
 /// Creates a [`Vec<u8>`] from a [`TrustedLen`] of [`BitChunk`].
 pub fn chunk_iter_to_vec<T: BitChunk, I: TrustedLen<Item = T>>(iter: I) -> Vec<u8> {
-    let cap = iter.size_hint().0 * std::mem::size_of::<T>();
+    let cap = iter.size_hint().0 * size_of::<T>();
     let mut buffer = Vec::with_capacity(cap);
     for v in iter {
         push_bitchunk(&mut buffer, v)
@@ -24,7 +24,7 @@ fn chunk_iter_to_vec_and_remainder<T: BitChunk, I: TrustedLen<Item = T>>(
     iter: I,
     remainder: T,
 ) -> Vec<u8> {
-    let cap = (iter.size_hint().0 + 1) * std::mem::size_of::<T>();
+    let cap = (iter.size_hint().0 + 1) * size_of::<T>();
     let mut buffer = Vec::with_capacity(cap);
     for v in iter {
         push_bitchunk(&mut buffer, v)
@@ -109,6 +109,50 @@ where
     let length = lhs.len();
 
     Bitmap::from_u8_vec(buffer, length)
+}
+
+/// Apply a bitwise operation `op` to two inputs and fold the result.
+pub fn binary_fold<B, F, R>(lhs: &Bitmap, rhs: &Bitmap, op: F, init: B, fold: R) -> B
+where
+    F: Fn(u64, u64) -> B,
+    R: Fn(B, B) -> B,
+{
+    assert_eq!(lhs.len(), rhs.len());
+    let lhs_chunks = lhs.chunks();
+    let rhs_chunks = rhs.chunks();
+    let rem_lhs = lhs_chunks.remainder();
+    let rem_rhs = rhs_chunks.remainder();
+
+    let result = lhs_chunks
+        .zip(rhs_chunks)
+        .fold(init, |prev, (left, right)| fold(prev, op(left, right)));
+
+    fold(result, op(rem_lhs, rem_rhs))
+}
+
+/// Apply a bitwise operation `op` to two inputs and fold the result.
+pub fn binary_fold_mut<B, F, R>(
+    lhs: &MutableBitmap,
+    rhs: &MutableBitmap,
+    op: F,
+    init: B,
+    fold: R,
+) -> B
+where
+    F: Fn(u64, u64) -> B,
+    R: Fn(B, B) -> B,
+{
+    assert_eq!(lhs.len(), rhs.len());
+    let lhs_chunks = lhs.chunks();
+    let rhs_chunks = rhs.chunks();
+    let rem_lhs = lhs_chunks.remainder();
+    let rem_rhs = rhs_chunks.remainder();
+
+    let result = lhs_chunks
+        .zip(rhs_chunks)
+        .fold(init, |prev, (left, right)| fold(prev, op(left, right)));
+
+    fold(result, op(rem_lhs, rem_rhs))
 }
 
 fn unary_impl<F, I>(iter: I, op: F, length: usize) -> Bitmap
@@ -226,13 +270,75 @@ fn eq(lhs: &Bitmap, rhs: &Bitmap) -> bool {
     lhs_remainder.zip(rhs_remainder).all(|(x, y)| x == y)
 }
 
+pub fn num_intersections_with(lhs: &Bitmap, rhs: &Bitmap) -> usize {
+    binary_fold(
+        lhs,
+        rhs,
+        |lhs, rhs| (lhs & rhs).count_ones() as usize,
+        0,
+        |lhs, rhs| lhs + rhs,
+    )
+}
+
+pub fn intersects_with(lhs: &Bitmap, rhs: &Bitmap) -> bool {
+    binary_fold(
+        lhs,
+        rhs,
+        |lhs, rhs| lhs & rhs != 0,
+        false,
+        |lhs, rhs| lhs || rhs,
+    )
+}
+
+pub fn intersects_with_mut(lhs: &MutableBitmap, rhs: &MutableBitmap) -> bool {
+    binary_fold_mut(
+        lhs,
+        rhs,
+        |lhs, rhs| lhs & rhs != 0,
+        false,
+        |lhs, rhs| lhs || rhs,
+    )
+}
+
+pub fn num_edges(lhs: &Bitmap) -> usize {
+    if lhs.is_empty() {
+        return 0;
+    }
+
+    // @TODO: If is probably quite inefficient to do it like this because now either one is not
+    // aligned. Maybe, we can implement a smarter way to do this.
+    binary_fold(
+        &unsafe { lhs.clone().sliced_unchecked(0, lhs.len() - 1) },
+        &unsafe { lhs.clone().sliced_unchecked(1, lhs.len() - 1) },
+        |l, r| (l ^ r).count_ones() as usize,
+        0,
+        |acc, v| acc + v,
+    )
+}
+
+/// Compute `out[i] = if selector[i] { truthy[i] } else { falsy }`.
+pub fn select_constant(selector: &Bitmap, truthy: &Bitmap, falsy: bool) -> Bitmap {
+    let falsy_mask: u64 = if falsy {
+        0xFFFF_FFFF_FFFF_FFFF
+    } else {
+        0x0000_0000_0000_0000
+    };
+
+    binary(selector, truthy, |s, t| (s & t) | (!s & falsy_mask))
+}
+
+/// Compute `out[i] = if selector[i] { truthy[i] } else { falsy[i] }`.
+pub fn select(selector: &Bitmap, truthy: &Bitmap, falsy: &Bitmap) -> Bitmap {
+    ternary(selector, truthy, falsy, |s, t, f| (s & t) | (!s & f))
+}
+
 impl PartialEq for Bitmap {
     fn eq(&self, other: &Self) -> bool {
         eq(self, other)
     }
 }
 
-impl<'a, 'b> BitOr<&'b Bitmap> for &'a Bitmap {
+impl<'b> BitOr<&'b Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitor(self, rhs: &'b Bitmap) -> Bitmap {
@@ -240,7 +346,7 @@ impl<'a, 'b> BitOr<&'b Bitmap> for &'a Bitmap {
     }
 }
 
-impl<'a, 'b> BitAnd<&'b Bitmap> for &'a Bitmap {
+impl<'b> BitAnd<&'b Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitand(self, rhs: &'b Bitmap) -> Bitmap {
@@ -248,7 +354,7 @@ impl<'a, 'b> BitAnd<&'b Bitmap> for &'a Bitmap {
     }
 }
 
-impl<'a, 'b> BitXor<&'b Bitmap> for &'a Bitmap {
+impl<'b> BitXor<&'b Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitxor(self, rhs: &'b Bitmap) -> Bitmap {

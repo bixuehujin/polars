@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::{match_integer_type, with_match_primitive_type};
+use crate::{match_integer_type, with_match_primitive_type_full};
 
 impl PartialEq for dyn Scalar + '_ {
     fn eq(&self, that: &dyn Scalar) -> bool {
@@ -30,15 +30,15 @@ macro_rules! dyn_eq {
 }
 
 fn equal(lhs: &dyn Scalar, rhs: &dyn Scalar) -> bool {
-    if lhs.data_type() != rhs.data_type() {
+    if lhs.dtype() != rhs.dtype() {
         return false;
     }
 
     use PhysicalType::*;
-    match lhs.data_type().to_physical_type() {
+    match lhs.dtype().to_physical_type() {
         Null => dyn_eq!(NullScalar, lhs, rhs),
         Boolean => dyn_eq!(BooleanScalar, lhs, rhs),
-        Primitive(primitive) => with_match_primitive_type!(primitive, |$T| {
+        Primitive(primitive) => with_match_primitive_type_full!(primitive, |$T| {
             dyn_eq!(PrimitiveScalar<$T>, lhs, rhs)
         }),
         LargeUtf8 => dyn_eq!(Utf8Scalar<i64>, lhs, rhs),

@@ -1,5 +1,5 @@
 use arrow::array::Array;
-use arrow::legacy::kernels::fixed_size_list::{
+use polars_compute::gather::sublist::fixed_size_list::{
     sub_fixed_size_list_get, sub_fixed_size_list_get_literal,
 };
 use polars_core::utils::align_chunks_binary;
@@ -11,9 +11,9 @@ fn array_get_literal(ca: &ArrayChunked, idx: i64, null_on_oob: bool) -> PolarsRe
         .downcast_iter()
         .map(|arr| sub_fixed_size_list_get_literal(arr, idx, null_on_oob))
         .collect::<PolarsResult<Vec<_>>>()?;
-    Series::try_from((ca.name(), chunks))
+    Series::try_from((ca.name().clone(), chunks))
         .unwrap()
-        .cast(&ca.inner_dtype())
+        .cast(ca.inner_dtype())
 }
 
 /// Get the value by literal index in the array.
@@ -31,14 +31,18 @@ pub fn array_get(
             if let Some(index) = index {
                 array_get_literal(ca, index, null_on_oob)
             } else {
-                Ok(Series::full_null(ca.name(), ca.len(), &ca.inner_dtype()))
+                Ok(Series::full_null(
+                    ca.name().clone(),
+                    ca.len(),
+                    ca.inner_dtype(),
+                ))
             }
         },
         len if len == ca.len() => {
             let out = binary_to_series_arr_get(ca, index, null_on_oob, |arr, idx, nob| {
                 sub_fixed_size_list_get(arr, idx, nob)
             });
-            out?.cast(&ca.inner_dtype())
+            out?.cast(ca.inner_dtype())
         },
         len => polars_bail!(
             ComputeError:
@@ -65,5 +69,5 @@ where
         .zip(rhs.downcast_iter())
         .map(|(lhs_arr, rhs_arr)| op(lhs_arr, rhs_arr, null_on_oob))
         .collect::<PolarsResult<Vec<_>>>()?;
-    Series::try_from((lhs.name(), chunks))
+    Series::try_from((lhs.name().clone(), chunks))
 }

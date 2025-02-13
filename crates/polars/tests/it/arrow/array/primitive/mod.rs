@@ -8,11 +8,13 @@ mod fmt;
 mod mutable;
 mod to_mutable;
 
+fn array() -> Int32Array {
+    vec![Some(1), None, Some(10)].into_iter().collect()
+}
+
 #[test]
 fn basics() {
-    let data = vec![Some(1), None, Some(10)];
-
-    let array = Int32Array::from_iter(data);
+    let array = array();
 
     assert_eq!(array.value(0), 1);
     assert_eq!(array.value(1), 0);
@@ -42,6 +44,19 @@ fn basics() {
         assert_eq!(array.value_unchecked(0), 0);
         assert_eq!(array.value_unchecked(1), 10);
     }
+}
+
+#[test]
+fn split_at() {
+    let (lhs, rhs) = array().split_at(1);
+
+    assert!(lhs.is_valid(0));
+    assert!(!rhs.is_valid(0));
+    assert!(rhs.is_valid(1));
+
+    assert_eq!(lhs.value(0), 1);
+    assert_eq!(rhs.value(0), 0);
+    assert_eq!(rhs.value(1), 10);
 }
 
 #[test]
@@ -88,7 +103,7 @@ fn months_days_ns_from_slice() {
 }
 
 #[test]
-fn wrong_data_type() {
+fn wrong_dtype() {
     let values = Buffer::from(b"abbb".to_vec());
     assert!(PrimitiveArray::try_new(ArrowDataType::Utf8, values, None).is_err());
 }

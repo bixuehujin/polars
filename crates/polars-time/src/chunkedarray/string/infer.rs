@@ -1,6 +1,6 @@
 use arrow::array::PrimitiveArray;
 use chrono::format::ParseErrorKind;
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use once_cell::sync::Lazy;
 use polars_core::prelude::*;
 use regex::Regex;
@@ -15,18 +15,18 @@ const DATETIME_DMY_PATTERN: &str = r#"(?x)
         ^
         ['"]?                        # optional quotes
         (?:\d{1,2})                  # day
-        [-/]                         # separator
+        [-/\.]                       # separator
         (?P<month>[01]?\d{1})        # month
-        [-/]                         # separator
+        [-/\.]                       # separator
         (?:\d{4,})                   # year
         (?:
             [T\ ]                    # separator
-            (?:\d{2})                # hour
+            (?:\d{1,2})              # hour
             :?                       # separator
-            (?:\d{2})                # minute
+            (?:\d{1,2})              # minute
             (?:
                 :?                   # separator
-                (?:\d{2})            # second
+                (?:\d{1,2})          # second
                 (?:
                     \.(?:\d{1,9})    # subsecond
                 )?
@@ -41,18 +41,18 @@ const DATETIME_YMD_PATTERN: &str = r#"(?x)
         ^
         ['"]?                      # optional quotes
         (?:\d{4,})                 # year
-        [-/]                       # separator
+        [-/\.]                     # separator
         (?P<month>[01]?\d{1})      # month
-        [-/]                       # separator
+        [-/\.]                     # separator
         (?:\d{1,2})                # day
         (?:
             [T\ ]                  # separator
-            (?:\d{2})              # hour
+            (?:\d{1,2})            # hour
             :?                     # separator
-            (?:\d{2})              # minute
+            (?:\d{1,2})            # minute
             (?:
                 :?                 # separator
-                (?:\d{2})          # seconds
+                (?:\d{1,2})        # seconds
                 (?:
                     \.(?:\d{1,9})  # subsecond
                 )?
@@ -66,9 +66,9 @@ const DATETIME_YMDZ_PATTERN: &str = r#"(?x)
         ^
         ['"]?                  # optional quotes
         (?:\d{4,})             # year
-        [-/]                   # separator
+        [-/\.]                 # separator
         (?P<month>[01]?\d{1})  # month
-        [-/]                   # separator
+        [-/\.]                 # separator
         (?:\d{1,2})            # year
         [T\ ]                  # separator
         (?:\d{2})              # hour
@@ -99,6 +99,7 @@ impl Pattern {
         match self {
             Pattern::DateDMY => true, // there are very few Date patterns, so it's cheaper
             Pattern::DateYMD => true, // to just try them
+            Pattern::Time => true,
             Pattern::DatetimeDMY => match DATETIME_DMY_RE.captures(val) {
                 Some(search) => (1..=12).contains(
                     &search
@@ -249,6 +250,7 @@ impl TryFromWithUnit<Pattern> for DatetimeInfer<Int64Type> {
                 (Pattern::DatetimeYMD, patterns::DATETIME_Y_M_D)
             },
             Pattern::DatetimeYMDZ => (Pattern::DatetimeYMDZ, patterns::DATETIME_Y_M_D_Z),
+            Pattern::Time => (Pattern::Time, patterns::TIME_H_M_S),
         };
 
         Ok(DatetimeInfer {
@@ -325,11 +327,11 @@ where
                 .map(|opt_val| opt_val.and_then(|val| self.parse(val)));
             PrimitiveArray::from_trusted_len_iter(iter)
         });
-        ChunkedArray::from_chunk_iter(ca.name(), chunks)
+        ChunkedArray::from_chunk_iter(ca.name().clone(), chunks)
             .into_series()
             .cast(&self.logical_type)
             .unwrap()
-            .with_name(ca.name())
+            .with_name(ca.name().clone())
     }
 }
 
@@ -396,7 +398,9 @@ fn transform_tzaware_datetime_ms(val: &str, fmt: &str) -> Option<i64> {
 
 pub fn infer_pattern_single(val: &str) -> Option<Pattern> {
     // Dates come first, because we see datetimes as superset of dates
-    infer_pattern_date_single(val).or_else(|| infer_pattern_datetime_single(val))
+    infer_pattern_date_single(val)
+        .or_else(|| infer_pattern_time_single(val))
+        .or_else(|| infer_pattern_datetime_single(val))
 }
 
 fn infer_pattern_datetime_single(val: &str) -> Option<Pattern> {
@@ -436,6 +440,13 @@ fn infer_pattern_date_single(val: &str) -> Option<Pattern> {
     }
 }
 
+fn infer_pattern_time_single(val: &str) -> Option<Pattern> {
+    patterns::TIME_H_M_S
+        .iter()
+        .any(|fmt| NaiveTime::parse_from_str(val, fmt).is_ok())
+        .then_some(Pattern::Time)
+}
+
 #[cfg(feature = "dtype-datetime")]
 pub(crate) fn to_datetime(
     ca: &StringChunked,
@@ -444,7 +455,9 @@ pub(crate) fn to_datetime(
     _ambiguous: &StringChunked,
 ) -> PolarsResult<DatetimeChunked> {
     match ca.first_non_null() {
-        None => Ok(Int64Chunked::full_null(ca.name(), ca.len()).into_datetime(tu, tz.cloned())),
+        None => {
+            Ok(Int64Chunked::full_null(ca.name().clone(), ca.len()).into_datetime(tu, tz.cloned()))
+        },
         Some(idx) => {
             let subset = ca.slice(idx as i64, ca.len());
             let pattern = subset
@@ -452,25 +465,17 @@ pub(crate) fn to_datetime(
                 .find_map(|opt_val| opt_val.and_then(infer_pattern_datetime_single))
                 .ok_or_else(|| polars_err!(parse_fmt_idk = "date"))?;
             let mut infer = DatetimeInfer::<Int64Type>::try_from_with_unit(pattern, Some(tu))?;
-            if pattern == Pattern::DatetimeYMDZ
-                && tz.is_some()
-                && tz.map(|x| x.as_str()) != Some("UTC")
-            {
-                polars_bail!(ComputeError: "offset-aware datetimes are converted to UTC. \
-                    Please either drop the time zone from the function call, or set it to UTC. \
-                    To convert to a different time zone, please use `convert_time_zone`.")
-            }
             match pattern {
                 #[cfg(feature = "timezones")]
                 Pattern::DatetimeYMDZ => infer.coerce_string(ca).datetime().map(|ca| {
                     let mut ca = ca.clone();
-                    ca.set_time_unit(tu);
-                    polars_ops::prelude::replace_time_zone(
-                        &ca,
-                        Some("UTC"),
-                        _ambiguous,
-                        NonExistent::Raise,
-                    )
+                    // `tz` has already been validated.
+                    ca.set_time_unit_and_time_zone(
+                        tu,
+                        tz.cloned()
+                            .unwrap_or_else(|| PlSmallStr::from_static("UTC")),
+                    )?;
+                    Ok(ca)
                 })?,
                 _ => infer.coerce_string(ca).datetime().map(|ca| {
                     let mut ca = ca.clone();
@@ -493,7 +498,7 @@ pub(crate) fn to_datetime(
 #[cfg(feature = "dtype-date")]
 pub(crate) fn to_date(ca: &StringChunked) -> PolarsResult<DateChunked> {
     match ca.first_non_null() {
-        None => Ok(Int32Chunked::full_null(ca.name(), ca.len()).into_date()),
+        None => Ok(Int32Chunked::full_null(ca.name().clone(), ca.len()).into_date()),
         Some(idx) => {
             let subset = ca.slice(idx as i64, ca.len());
             let pattern = subset

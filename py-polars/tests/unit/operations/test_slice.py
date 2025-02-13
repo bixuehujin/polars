@@ -173,10 +173,10 @@ def test_slice_nullcount(ref: list[int | None]) -> None:
 
 def test_slice_pushdown_set_sorted() -> None:
     ldf = pl.LazyFrame({"foo": [1, 2, 3]})
-    ldf = ldf.set_sorted("foo").head(5)
+    ldf = ldf.set_sorted("foo").head(2)
     plan = ldf.explain()
-    # check the set sorted is above slice
-    assert plan.index("set_sorted") < plan.index("SLICE")
+    assert "SLICE" not in plan
+    assert ldf.collect().height == 2
 
 
 def test_slice_pushdown_literal_projection_14349() -> None:
@@ -197,19 +197,17 @@ def test_slice_pushdown_literal_projection_14349() -> None:
 
     # For select, slice pushdown should happen when at least 1 input column is selected
     q = lf.select("a", x=1).head(0)
-    plan = q.explain()
-    assert plan.index("SELECT") < plan.index("SLICE")
+    # slice isn't in plan if it has been pushed down to the dataframe
+    assert "SLICE" not in q.explain()
     assert q.collect().height == 0
 
     # For with_columns, slice pushdown should happen if the input has at least 1 column
     q = lf.with_columns(x=1).head(0)
-    plan = q.explain()
-    assert plan.index("WITH_COLUMNS") < plan.index("SLICE")
+    assert "SLICE" not in q.explain()
     assert q.collect().height == 0
 
     q = lf.with_columns(pl.col("a") + 1).head(0)
-    plan = q.explain()
-    assert plan.index("WITH_COLUMNS") < plan.index("SLICE")
+    assert "SLICE" not in q.explain()
     assert q.collect().height == 0
 
     # This does not project any of the original columns
@@ -219,8 +217,7 @@ def test_slice_pushdown_literal_projection_14349() -> None:
     assert q.collect().height == 0
 
     q = lf.with_columns(b=1, c=2).head(0)
-    plan = q.explain()
-    assert plan.index("WITH_COLUMNS") < plan.index("SLICE")
+    assert "SLICE" not in q.explain()
     assert q.collect().height == 0
 
 
@@ -240,3 +237,76 @@ def test_slice_lazy_frame_raises_proper(input_slice: tuple[int | None]) -> None:
     s = slice(*input_slice)
     with pytest.raises(ValueError, match="not supported"):
         ldf[s].collect()
+
+
+def test_double_sort_slice_pushdown_15779() -> None:
+    assert (
+        pl.LazyFrame({"foo": [1, 2]}).sort("foo").head(0).sort("foo").collect()
+    ).shape == (0, 1)
+
+
+def test_slice_pushdown_simple_projection_18288() -> None:
+    lf = pl.DataFrame({"col": ["0", "notanumber"]}).lazy()
+    lf = lf.with_columns([pl.col("col").cast(pl.Int64)])
+    lf = lf.with_columns([pl.col("col"), pl.lit(None)])
+    assert lf.head(1).collect().to_dict(as_series=False) == {
+        "col": [0],
+        "literal": [None],
+    }
+
+
+def test_group_by_slice_all_keys() -> None:
+    df = pl.DataFrame(
+        {
+            "a": ["Tom", "Nick", "Marry", "Krish", "Jack", None],
+            "b": [
+                "2020-01-01",
+                "2020-01-02",
+                "2020-01-03",
+                "2020-01-04",
+                "2020-01-05",
+                None,
+            ],
+            "c": [5, 6, 6, 7, 8, 5],
+        }
+    )
+
+    gb = df.group_by(["a", "b", "c"], maintain_order=True)
+    assert_frame_equal(gb.tail(1), gb.head(1))
+
+
+def test_slice_first_in_agg_18551() -> None:
+    df = pl.DataFrame({"id": [1, 1, 2], "name": ["A", "B", "C"], "value": [31, 21, 32]})
+
+    assert df.group_by("id", maintain_order=True).agg(
+        sort_by=pl.col("name").sort_by("value"),
+        x=pl.col("name").sort_by("value").slice(0, 1).first(),
+        y=pl.col("name").sort_by("value").slice(1, 1).first(),
+    ).to_dict(as_series=False) == {
+        "id": [1, 2],
+        "sort_by": [["B", "A"], ["C"]],
+        "x": ["B", "C"],
+        "y": ["A", None],
+    }
+
+
+def test_slice_after_sort_with_nulls_20079() -> None:
+    df = pl.LazyFrame({"a": [None, 1.2, None]})
+    out = df.sort("a", nulls_last=True).slice(0, 10).collect()
+    expected = pl.DataFrame({"a": [1.2, None, None]})
+    assert_frame_equal(out, expected)
+
+    out = df.sort("a", nulls_last=False).slice(0, 10).collect()
+    expected = pl.DataFrame({"a": [None, None, 1.2]})
+    assert_frame_equal(out, expected)
+
+
+def test_slice_pushdown_panic_20216() -> None:
+    col = pl.col("A")
+
+    q = pl.LazyFrame({"A": "1/1"})
+    q = q.with_columns(col.str.split("/"))
+    q = q.with_columns(pl.when(col.is_not_null()).then(col.list.get(0)).otherwise(None))
+
+    assert_frame_equal(q.slice(0, 1).collect(), pl.DataFrame({"A": ["1"]}))
+    assert_frame_equal(q.collect(), pl.DataFrame({"A": ["1"]}))

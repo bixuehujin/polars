@@ -1,16 +1,19 @@
 use arrow::array::*;
 use arrow::datatypes::{ArrowDataType, Field};
 
-#[test]
-fn basics() {
-    let dt = ArrowDataType::Struct(vec![
-        Field::new("a", ArrowDataType::Utf8, true),
-        Field::new("b", ArrowDataType::Utf8, true),
-    ]);
-    let data_type = ArrowDataType::Map(Box::new(Field::new("a", dt.clone(), true)), false);
+fn dt() -> ArrowDataType {
+    ArrowDataType::Struct(vec![
+        Field::new("a".into(), ArrowDataType::Utf8, true),
+        Field::new("b".into(), ArrowDataType::Utf8, true),
+    ])
+}
+
+fn array() -> MapArray {
+    let dtype = ArrowDataType::Map(Box::new(Field::new("a".into(), dt(), true)), false);
 
     let field = StructArray::new(
-        dt.clone(),
+        dt(),
+        3,
         vec![
             Box::new(Utf8Array::<i32>::from_slice(["a", "aa", "aaa"])) as _,
             Box::new(Utf8Array::<i32>::from_slice(["b", "bb", "bbb"])),
@@ -18,17 +21,23 @@ fn basics() {
         None,
     );
 
-    let array = MapArray::new(
-        data_type,
-        vec![0, 1, 2].try_into().unwrap(),
+    MapArray::new(
+        dtype,
+        vec![0, 1, 2, 3].try_into().unwrap(),
         Box::new(field),
         None,
-    );
+    )
+}
+
+#[test]
+fn basics() {
+    let array = array();
 
     assert_eq!(
         array.value(0),
         Box::new(StructArray::new(
-            dt.clone(),
+            dt(),
+            1,
             vec![
                 Box::new(Utf8Array::<i32>::from_slice(["a"])) as _,
                 Box::new(Utf8Array::<i32>::from_slice(["b"])),
@@ -41,10 +50,53 @@ fn basics() {
     assert_eq!(
         sliced.value(0),
         Box::new(StructArray::new(
-            dt,
+            dt(),
+            1,
             vec![
                 Box::new(Utf8Array::<i32>::from_slice(["aa"])) as _,
                 Box::new(Utf8Array::<i32>::from_slice(["bb"])),
+            ],
+            None,
+        )) as Box<dyn Array>
+    );
+}
+
+#[test]
+fn split_at() {
+    let (lhs, rhs) = array().split_at(1);
+
+    assert_eq!(
+        lhs.value(0),
+        Box::new(StructArray::new(
+            dt(),
+            1,
+            vec![
+                Box::new(Utf8Array::<i32>::from_slice(["a"])) as _,
+                Box::new(Utf8Array::<i32>::from_slice(["b"])),
+            ],
+            None,
+        )) as Box<dyn Array>
+    );
+    assert_eq!(
+        rhs.value(0),
+        Box::new(StructArray::new(
+            dt(),
+            1,
+            vec![
+                Box::new(Utf8Array::<i32>::from_slice(["aa"])) as _,
+                Box::new(Utf8Array::<i32>::from_slice(["bb"])),
+            ],
+            None,
+        )) as Box<dyn Array>
+    );
+    assert_eq!(
+        rhs.value(1),
+        Box::new(StructArray::new(
+            dt(),
+            1,
+            vec![
+                Box::new(Utf8Array::<i32>::from_slice(["aaa"])) as _,
+                Box::new(Utf8Array::<i32>::from_slice(["bbb"])),
             ],
             None,
         )) as Box<dyn Array>

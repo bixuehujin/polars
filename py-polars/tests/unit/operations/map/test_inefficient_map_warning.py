@@ -9,8 +9,7 @@ from functools import partial
 from math import cosh
 from typing import Any, Callable
 
-import numpy
-import numpy as np  # noqa: F401
+import numpy as np
 import pytest
 
 import polars as pl
@@ -103,7 +102,7 @@ TEST_CASES = [
     ("e", "lambda x: np.arcsinh(x)", 'pl.col("e").arcsinh()'),
     ("e", "lambda x: np.arctan(x)", 'pl.col("e").arctan()'),
     ("e", "lambda x: np.arctanh(x)", 'pl.col("e").arctanh()'),
-    ("a", "lambda x: 0 + numpy.cbrt(x)", '0 + pl.col("a").cbrt()'),
+    ("a", "lambda x: 0 + np.cbrt(x)", '0 + pl.col("a").cbrt()'),
     ("e", "lambda x: np.ceil(x)", 'pl.col("e").ceil()'),
     ("e", "lambda x: np.cos(x)", 'pl.col("e").cos()'),
     ("e", "lambda x: np.cosh(x)", 'pl.col("e").cosh()'),
@@ -177,6 +176,26 @@ TEST_CASES = [
         """lambda x: x.lstrip().startswith(('!','#','?',"'"))""",
         """pl.col("b").str.strip_chars_start().str.contains(r"^(!|\\#|\\?|')")""",
     ),
+    (
+        "b",
+        "lambda x: x.replace(':','')",
+        """pl.col("b").str.replace_all(':','',literal=True)""",
+    ),
+    (
+        "b",
+        "lambda x: x.replace(':','',2)",
+        """pl.col("b").str.replace(':','',n=2,literal=True)""",
+    ),
+    (
+        "b",
+        "lambda x: x.removeprefix('A').removesuffix('F')",
+        """pl.col("b").str.strip_prefix('A').str.strip_suffix('F')""",
+    ),
+    (
+        "b",
+        "lambda x: x.zfill(8)",
+        """pl.col("b").str.zfill(8)""",
+    ),
     # ---------------------------------------------
     # json expr: load/extract
     # ---------------------------------------------
@@ -184,11 +203,11 @@ TEST_CASES = [
     # ---------------------------------------------
     # replace
     # ---------------------------------------------
-    ("a", "lambda x: MY_DICT[x]", 'pl.col("a").replace(MY_DICT)'),
+    ("a", "lambda x: MY_DICT[x]", 'pl.col("a").replace_strict(MY_DICT)'),
     (
         "a",
         "lambda x: MY_DICT[x - 1] + MY_DICT[1 + x]",
-        '(pl.col("a") - 1).replace(MY_DICT) + (1 + pl.col("a")).replace(MY_DICT)',
+        '(pl.col("a") - 1).replace_strict(MY_DICT) + (1 + pl.col("a")).replace_strict(MY_DICT)',
     ),
     # ---------------------------------------------
     # standard library datetime parsing
@@ -259,7 +278,7 @@ EVAL_ENVIRONMENT = {
     "datetime": datetime,
     "dt": dt,
     "math": math,
-    "np": numpy,
+    "np": np,
     "pl": pl,
 }
 
@@ -305,6 +324,7 @@ def test_parse_apply_functions(col: str, func: str, expr_repr: str) -> None:
                 ],
             }
         )
+
         result_frame = df.select(
             x=col,
             y=eval(suggested_expression, EVAL_ENVIRONMENT),
@@ -316,7 +336,7 @@ def test_parse_apply_functions(col: str, func: str, expr_repr: str) -> None:
         assert_frame_equal(
             result_frame,
             expected_frame,
-            check_dtype=(".dt." not in suggested_expression),
+            check_dtypes=(".dt." not in suggested_expression),
         )
 
 
@@ -329,7 +349,7 @@ def test_parse_apply_raw_functions() -> None:
 
     # test bare 'numpy' functions
     for func_name in _NUMPY_FUNCTIONS:
-        func = getattr(numpy, func_name)
+        func = getattr(np, func_name)
 
         # note: we can't parse/rewrite raw numpy functions...
         parser = BytecodeParser(func, map_target="expr")
@@ -342,10 +362,6 @@ def test_parse_apply_raw_functions() -> None:
         ):
             df1 = lf.select(pl.col("a").map_elements(func)).collect()
             df2 = lf.select(getattr(pl.col("a"), func_name)()).collect()
-            if func_name == "sign":
-                # note: Polars' 'sign' function returns an Int64, while numpy's
-                # 'sign' function returns a Float64
-                df1 = df1.with_columns(pl.col("a").cast(pl.Int64))
             assert_frame_equal(df1, df2)
 
     # test bare 'json.loads'
@@ -358,7 +374,7 @@ def test_parse_apply_raw_functions() -> None:
             pl.col("value").str.json_decode(),
             pl.col("value").map_elements(json.loads),
         ):
-            result_frames.append(
+            result_frames.append(  # noqa: PERF401
                 pl.LazyFrame({"value": ['{"a":1, "b": true, "c": "xx"}', None]})
                 .select(extracted=expr)
                 .unnest("extracted")
@@ -414,10 +430,8 @@ def test_parse_apply_miscellaneous() -> None:
     ):
         s = pl.Series("srs", [0, 1, 2, 3, 4])
         assert_series_equal(
-            s.map_elements(
-                lambda x: numpy.cos(3) + x - abs(-1), return_dtype=pl.Float64
-            ),
-            numpy.cos(3) + s - 1,
+            s.map_elements(lambda x: np.cos(3) + x - abs(-1), return_dtype=pl.Float64),
+            np.cos(3) + s - 1,
         )
 
     # if 's' is already the name of a global variable then the series alias
@@ -505,7 +519,7 @@ def test_omit_implicit_bool() -> None:
 
 
 def test_partial_functions_13523() -> None:
-    def plus(value, amount: int):  # type: ignore[no-untyped-def]
+    def plus(value: int, amount: int) -> int:
         return value + amount
 
     data = {"a": [1, 2], "b": [3, 4]}

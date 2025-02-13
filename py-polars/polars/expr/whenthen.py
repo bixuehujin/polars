@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 import polars.functions as F
-from polars._utils.parse_expr_input import (
-    parse_as_expression,
-    parse_when_inputs,
+from polars._utils.parse import (
+    parse_into_expression,
+    parse_predicates_constraints_into_expression,
 )
 from polars._utils.wrap import wrap_expr
 from polars.expr.expr import Expr
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from polars._typing import IntoExpr
     from polars.polars import PyExpr
-    from polars.type_aliases import IntoExpr
 
 
 class When:
@@ -24,7 +26,7 @@ class When:
     In this state, `then` must be called to continue to finish the expression.
     """
 
-    def __init__(self, when: Any):
+    def __init__(self, when: Any) -> None:
         self._when = when
 
     def then(self, statement: IntoExpr) -> Then:
@@ -38,7 +40,7 @@ class When:
             Accepts expression input. Strings are parsed as column names, other
             non-expression inputs are parsed as literals.
         """
-        statement_pyexpr = parse_as_expression(statement)
+        statement_pyexpr = parse_into_expression(statement)
         return Then(self._when.then(statement_pyexpr))
 
 
@@ -49,11 +51,11 @@ class Then(Expr):
     Represents the state of the expression after `pl.when(...).then(...)` is called.
     """
 
-    def __init__(self, then: Any):
+    def __init__(self, then: Any) -> None:
         self._then = then
 
     @classmethod
-    def _from_pyexpr(cls, pyexpr: PyExpr) -> Expr:  # type: ignore[override]
+    def _from_pyexpr(cls, pyexpr: PyExpr) -> Expr:
         return wrap_expr(pyexpr)
 
     @property
@@ -79,7 +81,9 @@ class Then(Expr):
             equality matches, such as `x = 123`. As with the predicates parameter,
             multiple conditions are implicitly combined using `&`.
         """
-        condition_pyexpr = parse_when_inputs(*predicates, **constraints)
+        condition_pyexpr = parse_predicates_constraints_into_expression(
+            *predicates, **constraints
+        )
         return ChainedWhen(self._then.when(condition_pyexpr))
 
     def otherwise(self, statement: IntoExpr) -> Expr:
@@ -93,11 +97,11 @@ class Then(Expr):
             Accepts expression input. Strings are parsed as column names, other
             non-expression inputs are parsed as literals.
         """
-        statement_pyexpr = parse_as_expression(statement)
+        statement_pyexpr = parse_into_expression(statement)
         return wrap_expr(self._then.otherwise(statement_pyexpr))
 
 
-class ChainedWhen(Expr):
+class ChainedWhen:
     """
     Utility class for the `when-then-otherwise` expression.
 
@@ -106,7 +110,7 @@ class ChainedWhen(Expr):
     In this state, `then` must be called to continue to finish the expression.
     """
 
-    def __init__(self, chained_when: Any):
+    def __init__(self, chained_when: Any) -> None:
         self._chained_when = chained_when
 
     def then(self, statement: IntoExpr) -> ChainedThen:
@@ -120,7 +124,7 @@ class ChainedWhen(Expr):
             Accepts expression input. Strings are parsed as column names, other
             non-expression inputs are parsed as literals.
         """
-        statement_pyexpr = parse_as_expression(statement)
+        statement_pyexpr = parse_into_expression(statement)
         return ChainedThen(self._chained_when.then(statement_pyexpr))
 
 
@@ -131,11 +135,11 @@ class ChainedThen(Expr):
     Represents the state of the expression after an additional `then` is called.
     """
 
-    def __init__(self, chained_then: Any):
+    def __init__(self, chained_then: Any) -> None:
         self._chained_then = chained_then
 
     @classmethod
-    def _from_pyexpr(cls, pyexpr: PyExpr) -> Expr:  # type: ignore[override]
+    def _from_pyexpr(cls, pyexpr: PyExpr) -> Expr:
         return wrap_expr(pyexpr)
 
     @property
@@ -161,7 +165,9 @@ class ChainedThen(Expr):
             equality matches, such as `x = 123`. As with the predicates parameter,
             multiple conditions are implicitly combined using `&`.
         """
-        condition_pyexpr = parse_when_inputs(*predicates, **constraints)
+        condition_pyexpr = parse_predicates_constraints_into_expression(
+            *predicates, **constraints
+        )
         return ChainedWhen(self._chained_then.when(condition_pyexpr))
 
     def otherwise(self, statement: IntoExpr) -> Expr:
@@ -175,5 +181,5 @@ class ChainedThen(Expr):
             Accepts expression input. Strings are parsed as column names, other
             non-expression inputs are parsed as literals.
         """
-        statement_pyexpr = parse_as_expression(statement)
+        statement_pyexpr = parse_into_expression(statement)
         return wrap_expr(self._chained_then.otherwise(statement_pyexpr))

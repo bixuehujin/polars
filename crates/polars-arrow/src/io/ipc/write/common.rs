@@ -11,7 +11,7 @@ use crate::io::ipc::endianness::is_native_little_endian;
 use crate::io::ipc::read::Dictionaries;
 use crate::legacy::prelude::LargeListArray;
 use crate::match_integer_type;
-use crate::record_batch::RecordBatch;
+use crate::record_batch::RecordBatchT;
 
 /// Compression codec
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,40 +30,34 @@ pub struct WriteOptions {
     pub compression: Option<Compression>,
 }
 
-fn encode_dictionary(
+/// Find the dictionary that are new and need to be encoded.
+pub fn dictionaries_to_encode(
     field: &IpcField,
     array: &dyn Array,
-    options: &WriteOptions,
     dictionary_tracker: &mut DictionaryTracker,
-    encoded_dictionaries: &mut Vec<EncodedData>,
+    dicts_to_encode: &mut Vec<(i64, Box<dyn Array>)>,
 ) -> PolarsResult<()> {
     use PhysicalType::*;
-    match array.data_type().to_physical_type() {
+    match array.dtype().to_physical_type() {
         Utf8 | LargeUtf8 | Binary | LargeBinary | Primitive(_) | Boolean | Null
         | FixedSizeBinary | BinaryView | Utf8View => Ok(()),
         Dictionary(key_type) => match_integer_type!(key_type, |$T| {
             let dict_id = field.dictionary_id
                 .ok_or_else(|| polars_err!(InvalidOperation: "Dictionaries must have an associated id"))?;
 
-            let emit = dictionary_tracker.insert(dict_id, array)?;
+            if dictionary_tracker.insert(dict_id, array)? {
+                dicts_to_encode.push((dict_id, array.to_boxed()));
+            }
 
             let array = array.as_any().downcast_ref::<DictionaryArray<$T>>().unwrap();
             let values = array.values();
-            encode_dictionary(field,
+            // @Q? Should this not pick fields[0]?
+            dictionaries_to_encode(field,
                 values.as_ref(),
-                options,
                 dictionary_tracker,
-                encoded_dictionaries
+                dicts_to_encode,
             )?;
 
-            if emit {
-                encoded_dictionaries.push(dictionary_batch_to_bytes::<$T>(
-                    dict_id,
-                    array,
-                    options,
-                    is_native_little_endian(),
-                ));
-            };
             Ok(())
         }),
         Struct => {
@@ -78,12 +72,11 @@ fn encode_dictionary(
                 .iter()
                 .zip(array.values().iter())
                 .try_for_each(|(field, values)| {
-                    encode_dictionary(
+                    dictionaries_to_encode(
                         field,
                         values.as_ref(),
-                        options,
                         dictionary_tracker,
-                        encoded_dictionaries,
+                        dicts_to_encode,
                     )
                 })
         },
@@ -94,13 +87,7 @@ fn encode_dictionary(
                 .unwrap()
                 .values();
             let field = &field.fields[0]; // todo: error instead
-            encode_dictionary(
-                field,
-                values.as_ref(),
-                options,
-                dictionary_tracker,
-                encoded_dictionaries,
-            )
+            dictionaries_to_encode(field, values.as_ref(), dictionary_tracker, dicts_to_encode)
         },
         LargeList => {
             let values = array
@@ -109,13 +96,7 @@ fn encode_dictionary(
                 .unwrap()
                 .values();
             let field = &field.fields[0]; // todo: error instead
-            encode_dictionary(
-                field,
-                values.as_ref(),
-                options,
-                dictionary_tracker,
-                encoded_dictionaries,
-            )
+            dictionaries_to_encode(field, values.as_ref(), dictionary_tracker, dicts_to_encode)
         },
         FixedSizeList => {
             let values = array
@@ -124,13 +105,7 @@ fn encode_dictionary(
                 .unwrap()
                 .values();
             let field = &field.fields[0]; // todo: error instead
-            encode_dictionary(
-                field,
-                values.as_ref(),
-                options,
-                dictionary_tracker,
-                encoded_dictionaries,
-            )
+            dictionaries_to_encode(field, values.as_ref(), dictionary_tracker, dicts_to_encode)
         },
         Union => {
             let values = array
@@ -148,31 +123,67 @@ fn encode_dictionary(
                 .iter()
                 .zip(values.iter())
                 .try_for_each(|(field, values)| {
-                    encode_dictionary(
+                    dictionaries_to_encode(
                         field,
                         values.as_ref(),
-                        options,
                         dictionary_tracker,
-                        encoded_dictionaries,
+                        dicts_to_encode,
                     )
                 })
         },
         Map => {
             let values = array.as_any().downcast_ref::<MapArray>().unwrap().field();
             let field = &field.fields[0]; // todo: error instead
-            encode_dictionary(
-                field,
-                values.as_ref(),
-                options,
-                dictionary_tracker,
-                encoded_dictionaries,
-            )
+            dictionaries_to_encode(field, values.as_ref(), dictionary_tracker, dicts_to_encode)
         },
     }
 }
 
+/// Encode a dictionary array with a certain id.
+///
+/// # Panics
+///
+/// This will panic if the given array is not a [`DictionaryArray`].
+pub fn encode_dictionary(
+    dict_id: i64,
+    array: &dyn Array,
+    options: &WriteOptions,
+    encoded_dictionaries: &mut Vec<EncodedData>,
+) -> PolarsResult<()> {
+    let PhysicalType::Dictionary(key_type) = array.dtype().to_physical_type() else {
+        panic!("Given array is not a DictionaryArray")
+    };
+
+    match_integer_type!(key_type, |$T| {
+        let array = array.as_any().downcast_ref::<DictionaryArray<$T>>().unwrap();
+        encoded_dictionaries.push(dictionary_batch_to_bytes::<$T>(
+            dict_id,
+            array,
+            options,
+            is_native_little_endian(),
+        ));
+    });
+
+    Ok(())
+}
+
+pub fn encode_new_dictionaries(
+    field: &IpcField,
+    array: &dyn Array,
+    options: &WriteOptions,
+    dictionary_tracker: &mut DictionaryTracker,
+    encoded_dictionaries: &mut Vec<EncodedData>,
+) -> PolarsResult<()> {
+    let mut dicts_to_encode = Vec::new();
+    dictionaries_to_encode(field, array, dictionary_tracker, &mut dicts_to_encode)?;
+    for (dict_id, dict_array) in dicts_to_encode {
+        encode_dictionary(dict_id, dict_array.as_ref(), options, encoded_dictionaries)?;
+    }
+    Ok(())
+}
+
 pub fn encode_chunk(
-    chunk: &RecordBatch<Box<dyn Array>>,
+    chunk: &RecordBatchT<Box<dyn Array>>,
     fields: &[IpcField],
     dictionary_tracker: &mut DictionaryTracker,
     options: &WriteOptions,
@@ -190,7 +201,7 @@ pub fn encode_chunk(
 
 // Amortizes `EncodedData` allocation.
 pub fn encode_chunk_amortized(
-    chunk: &RecordBatch<Box<dyn Array>>,
+    chunk: &RecordBatchT<Box<dyn Array>>,
     fields: &[IpcField],
     dictionary_tracker: &mut DictionaryTracker,
     options: &WriteOptions,
@@ -199,7 +210,7 @@ pub fn encode_chunk_amortized(
     let mut encoded_dictionaries = vec![];
 
     for (field, array) in fields.iter().zip(chunk.as_ref()) {
-        encode_dictionary(
+        encode_new_dictionaries(
             field,
             array.as_ref(),
             options,
@@ -208,7 +219,7 @@ pub fn encode_chunk_amortized(
         )?;
     }
 
-    chunk_to_bytes_amortized(chunk, options, encoded_message);
+    encode_record_batch(chunk, options, encoded_message);
 
     Ok(encoded_dictionaries)
 }
@@ -231,7 +242,7 @@ fn serialize_compression(
 }
 
 fn set_variadic_buffer_counts(counts: &mut Vec<i64>, array: &dyn Array) {
-    match array.data_type() {
+    match array.dtype() {
         ArrowDataType::Utf8View => {
             let array = array.as_any().downcast_ref::<Utf8ViewArray>().unwrap();
             counts.push(array.data_buffers().len() as i64);
@@ -254,21 +265,33 @@ fn set_variadic_buffer_counts(counts: &mut Vec<i64>, array: &dyn Array) {
             let array = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             set_variadic_buffer_counts(counts, array.values().as_ref())
         },
-        ArrowDataType::Dictionary(_, _, _) => {
-            let array = array
-                .as_any()
-                .downcast_ref::<DictionaryArray<u32>>()
-                .unwrap();
-            set_variadic_buffer_counts(counts, array.values().as_ref())
-        },
+        // Don't traverse dictionary values as those are set when the `Dictionary` IPC struct
+        // is read.
+        ArrowDataType::Dictionary(_, _, _) => (),
         _ => (),
     }
 }
 
-/// Write [`RecordBatch`] into two sets of bytes, one for the header (ipc::Schema::Message) and the
+fn gc_bin_view<'a, T: ViewType + ?Sized>(
+    arr: &'a Box<dyn Array>,
+    concrete_arr: &'a BinaryViewArrayGeneric<T>,
+) -> Cow<'a, Box<dyn Array>> {
+    let bytes_len = concrete_arr.total_bytes_len();
+    let buffer_len = concrete_arr.total_buffer_len();
+    let extra_len = buffer_len.saturating_sub(bytes_len);
+    if extra_len < bytes_len.min(1024) {
+        // We can afford some tiny waste.
+        Cow::Borrowed(arr)
+    } else {
+        // Force GC it.
+        Cow::Owned(concrete_arr.clone().gc().boxed())
+    }
+}
+
+/// Write [`RecordBatchT`] into two sets of bytes, one for the header (ipc::Schema::Message) and the
 /// other for the batch's data
-fn chunk_to_bytes_amortized(
-    chunk: &RecordBatch<Box<dyn Array>>,
+pub fn encode_record_batch(
+    chunk: &RecordBatchT<Box<dyn Array>>,
     options: &WriteOptions,
     encoded_message: &mut EncodedData,
 ) {
@@ -281,22 +304,14 @@ fn chunk_to_bytes_amortized(
     let mut variadic_buffer_counts = vec![];
     for array in chunk.arrays() {
         // We don't want to write all buffers in sliced arrays.
-        let array = match array.data_type() {
+        let array = match array.dtype() {
             ArrowDataType::BinaryView => {
                 let concrete_arr = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
-                if concrete_arr.is_sliced() {
-                    Cow::Owned(concrete_arr.clone().maybe_gc().boxed())
-                } else {
-                    Cow::Borrowed(array)
-                }
+                gc_bin_view(array, concrete_arr)
             },
             ArrowDataType::Utf8View => {
                 let concrete_arr = array.as_any().downcast_ref::<Utf8ViewArray>().unwrap();
-                if concrete_arr.is_sliced() {
-                    Cow::Owned(concrete_arr.clone().maybe_gc().boxed())
-                } else {
-                    Cow::Borrowed(array)
-                }
+                gc_bin_view(array, concrete_arr)
             },
             _ => Cow::Borrowed(array),
         };
@@ -424,7 +439,7 @@ impl DictionaryTracker {
     ///   has never been seen before, return `Ok(true)` to indicate that the dictionary was just
     ///   inserted.
     pub fn insert(&mut self, dict_id: i64, array: &dyn Array) -> PolarsResult<bool> {
-        let values = match array.data_type() {
+        let values = match array.dtype() {
             ArrowDataType::Dictionary(key_type, _, _) => {
                 match_integer_type!(key_type, |$T| {
                     let array = array
@@ -471,27 +486,27 @@ pub(crate) fn pad_to_64(len: usize) -> usize {
     ((len + 63) & !63) - len
 }
 
-/// An array [`RecordBatch`] with optional accompanying IPC fields.
+/// An array [`RecordBatchT`] with optional accompanying IPC fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record<'a> {
-    columns: Cow<'a, RecordBatch<Box<dyn Array>>>,
+    columns: Cow<'a, RecordBatchT<Box<dyn Array>>>,
     fields: Option<Cow<'a, [IpcField]>>,
 }
 
-impl<'a> Record<'a> {
+impl Record<'_> {
     /// Get the IPC fields for this record.
     pub fn fields(&self) -> Option<&[IpcField]> {
         self.fields.as_deref()
     }
 
     /// Get the Arrow columns in this record.
-    pub fn columns(&self) -> &RecordBatch<Box<dyn Array>> {
+    pub fn columns(&self) -> &RecordBatchT<Box<dyn Array>> {
         self.columns.borrow()
     }
 }
 
-impl From<RecordBatch<Box<dyn Array>>> for Record<'static> {
-    fn from(columns: RecordBatch<Box<dyn Array>>) -> Self {
+impl From<RecordBatchT<Box<dyn Array>>> for Record<'static> {
+    fn from(columns: RecordBatchT<Box<dyn Array>>) -> Self {
         Self {
             columns: Cow::Owned(columns),
             fields: None,
@@ -499,11 +514,11 @@ impl From<RecordBatch<Box<dyn Array>>> for Record<'static> {
     }
 }
 
-impl<'a, F> From<(RecordBatch<Box<dyn Array>>, Option<F>)> for Record<'a>
+impl<'a, F> From<(RecordBatchT<Box<dyn Array>>, Option<F>)> for Record<'a>
 where
     F: Into<Cow<'a, [IpcField]>>,
 {
-    fn from((columns, fields): (RecordBatch<Box<dyn Array>>, Option<F>)) -> Self {
+    fn from((columns, fields): (RecordBatchT<Box<dyn Array>>, Option<F>)) -> Self {
         Self {
             columns: Cow::Owned(columns),
             fields: fields.map(|f| f.into()),
@@ -511,11 +526,11 @@ where
     }
 }
 
-impl<'a, F> From<(&'a RecordBatch<Box<dyn Array>>, Option<F>)> for Record<'a>
+impl<'a, F> From<(&'a RecordBatchT<Box<dyn Array>>, Option<F>)> for Record<'a>
 where
     F: Into<Cow<'a, [IpcField]>>,
 {
-    fn from((columns, fields): (&'a RecordBatch<Box<dyn Array>>, Option<F>)) -> Self {
+    fn from((columns, fields): (&'a RecordBatchT<Box<dyn Array>>, Option<F>)) -> Self {
         Self {
             columns: Cow::Borrowed(columns),
             fields: fields.map(|f| f.into()),

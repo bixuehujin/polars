@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 
 import polars as pl
-from polars.exceptions import InvalidOperationError
+from polars.exceptions import DuplicateError, InvalidOperationError
 from polars.testing import assert_frame_equal, assert_series_equal
 
 if TYPE_CHECKING:
-    from polars.type_aliases import ConcatMethod
+    from polars._typing import ConcatMethod
 
 
 def test_concat_align() -> None:
@@ -18,31 +18,64 @@ def test_concat_align() -> None:
     b = pl.DataFrame({"a": ["a", "b", "c"], "c": [5.5, 6.0, 7.5]})
     c = pl.DataFrame({"a": ["a", "b", "c", "d", "e"], "d": ["w", "x", "y", "z", None]})
 
-    result = pl.concat([a, b, c], how="align")
+    for align_full in ("align", "align_full"):
+        result = pl.concat([a, b, c], how=align_full)
+        expected = pl.DataFrame(
+            {
+                "a": ["a", "b", "c", "d", "e", "e"],
+                "b": [1, 2, None, 4, 5, 6],
+                "c": [5.5, 6.0, 7.5, None, None, None],
+                "d": ["w", "x", "y", "z", None, None],
+            }
+        )
+        assert_frame_equal(result, expected)
 
+    result = pl.concat([a, b, c], how="align_left")
     expected = pl.DataFrame(
         {
-            "a": ["a", "b", "c", "d", "e", "e"],
-            "b": [1, 2, None, 4, 5, 6],
-            "c": [5.5, 6.0, 7.5, None, None, None],
-            "d": ["w", "x", "y", "z", None, None],
+            "a": ["a", "b", "d", "e", "e"],
+            "b": [1, 2, 4, 5, 6],
+            "c": [5.5, 6.0, None, None, None],
+            "d": ["w", "x", "z", None, None],
+        }
+    )
+    assert_frame_equal(result, expected)
+
+    result = pl.concat([a, b, c], how="align_right")
+    expected = pl.DataFrame(
+        {
+            "a": ["a", "b", "c", "d", "e"],
+            "b": [1, 2, None, None, None],
+            "c": [5.5, 6.0, 7.5, None, None],
+            "d": ["w", "x", "y", "z", None],
+        }
+    )
+    assert_frame_equal(result, expected)
+
+    result = pl.concat([a, b, c], how="align_inner")
+    expected = pl.DataFrame(
+        {
+            "a": ["a", "b"],
+            "b": [1, 2],
+            "c": [5.5, 6.0],
+            "d": ["w", "x"],
         }
     )
     assert_frame_equal(result, expected)
 
 
-def test_concat_align_no_common_cols() -> None:
+@pytest.mark.parametrize(
+    "strategy", ["align", "align_full", "align_left", "align_right"]
+)
+def test_concat_align_no_common_cols(strategy: ConcatMethod) -> None:
     df1 = pl.DataFrame({"a": [1, 2], "b": [1, 2]})
     df2 = pl.DataFrame({"c": [3, 4], "d": [3, 4]})
 
     with pytest.raises(
         InvalidOperationError,
-        match="'align' strategy requires at least one common column",
+        match=f"{strategy!r} strategy requires at least one common column",
     ):
-        pl.concat((df1, df2), how="align")
-
-
-data2 = pl.DataFrame({"field3": [3, 4], "field4": ["C", "D"]})
+        pl.concat((df1, df2), how=strategy)
 
 
 @pytest.mark.parametrize(
@@ -161,18 +194,12 @@ def test_concat_horizontal_single_df(lazy: bool) -> None:
     assert_frame_equal(out, expected)
 
 
-@pytest.mark.parametrize("lazy", [False, True])
-def test_concat_horizontal_duplicate_col(lazy: bool) -> None:
-    a = pl.DataFrame({"a": ["a", "b"], "b": [1, 2]})
-    b = pl.DataFrame({"c": [5, 7, 8, 9], "d": [1, 2, 1, 2], "a": [1, 2, 1, 2]})
+def test_concat_horizontal_duplicate_col() -> None:
+    a = pl.LazyFrame({"a": ["a", "b"], "b": [1, 2]})
+    b = pl.LazyFrame({"c": [5, 7, 8, 9], "d": [1, 2, 1, 2], "a": [1, 2, 1, 2]})
 
-    if lazy:
-        dfs: list[pl.DataFrame] | list[pl.LazyFrame] = [a.lazy(), b.lazy()]
-    else:
-        dfs = [a, b]
-
-    with pytest.raises(pl.DuplicateError):
-        pl.concat(dfs, how="horizontal")  # type: ignore[type-var]
+    with pytest.raises(DuplicateError):
+        pl.concat([a, b], how="horizontal").collect()
 
 
 def test_concat_vertical() -> None:
@@ -189,14 +216,18 @@ def test_concat_vertical() -> None:
     assert_frame_equal(result, expected)
 
 
+def test_extend_ints() -> None:
+    a = pl.DataFrame({"a": [1 for _ in range(1)]}, schema={"a": pl.Int64})
+    with pytest.raises(pl.exceptions.SchemaError):
+        a.extend(a.select(pl.lit(0, dtype=pl.Int32).alias("a")))
+
+
 def test_null_handling_correlation() -> None:
     df = pl.DataFrame({"a": [1, 2, 3, None, 4], "b": [1, 2, 3, 10, 4]})
 
     out = df.select(
-        [
-            pl.corr("a", "b").alias("pearson"),
-            pl.corr("a", "b", method="spearman").alias("spearman"),
-        ]
+        pl.corr("a", "b").alias("pearson"),
+        pl.corr("a", "b", method="spearman").alias("spearman"),
     )
     assert out["pearson"][0] == pytest.approx(1.0)
     assert out["spearman"][0] == pytest.approx(1.0)
@@ -256,7 +287,7 @@ def test_align_frames() -> None:
     assert_frame_equal(pl_dot, pl.from_pandas(pd_dot))
     pd.testing.assert_frame_equal(pd_dot, pl_dot.to_pandas())
 
-    # (also: confirm alignment function works with lazyframes)
+    # confirm alignment function works with lazy frames
     lf1, lf2 = pl.align_frames(
         pl.from_pandas(pdf1.reset_index()).lazy(),
         pl.from_pandas(pdf2.reset_index()).lazy(),
@@ -266,8 +297,8 @@ def test_align_frames() -> None:
     assert_frame_equal(lf1.collect(), pf1)
     assert_frame_equal(lf2.collect(), pf2)
 
-    # misc
-    assert [] == pl.align_frames(on="date")
+    # misc: no frames results in an empty list
+    assert pl.align_frames(on="date") == []
 
     # expected error condition
     with pytest.raises(TypeError):
@@ -277,6 +308,8 @@ def test_align_frames() -> None:
             on="date",
         )
 
+
+def test_align_frames_misc() -> None:
     # descending result
     df1 = pl.DataFrame([[3, 5, 6], [5, 8, 9]], orient="row")
     df2 = pl.DataFrame([[2, 5, 6], [3, 8, 9], [4, 2, 0]], orient="row")
@@ -290,6 +323,19 @@ def test_align_frames() -> None:
     assert pf1.rows() == [(5, 8, 9), (4, None, None), (3, 5, 6), (2, None, None)]
     for pf in (pf2, pf3):
         assert pf.rows() == [(5, None, None), (4, 2, 0), (3, 8, 9), (2, 5, 6)]
+
+
+def test_align_frames_with_nulls() -> None:
+    df1 = pl.DataFrame({"key": ["x", "y", None], "value": [1, 2, 0]})
+    df2 = pl.DataFrame({"key": ["x", None, "z", "y"], "value": [4, 3, 6, 5]})
+
+    a1, a2 = pl.align_frames(df1, df2, on="key")
+
+    aligned_frame_data = a1.to_dict(as_series=False), a2.to_dict(as_series=False)
+    assert aligned_frame_data == (
+        {"key": [None, "x", "y", "z"], "value": [0, 1, 2, None]},
+        {"key": [None, "x", "y", "z"], "value": [3, 4, 5, 6]},
+    )
 
 
 def test_align_frames_duplicate_key() -> None:
@@ -359,6 +405,14 @@ def test_align_frames_duplicate_key() -> None:
         ("b", None),
         ("b", None),
     ]
+
+
+def test_align_frames_single_row_20445() -> None:
+    left = pl.DataFrame({"a": [1], "b": [2]})
+    right = pl.DataFrame({"a": [1], "c": [3]})
+    result = pl.align_frames(left, right, how="left", on="a")
+    assert_frame_equal(result[0], left)
+    assert_frame_equal(result[1], right)
 
 
 def test_coalesce() -> None:
@@ -495,14 +549,12 @@ def test_lazy_functions() -> None:
 
     # regex selection
     out = df.select(
-        [
-            pl.struct(pl.max("^a|b$")).alias("x"),
-            pl.struct(pl.min("^.*[bc]$")).alias("y"),
-            pl.struct(pl.sum("^[^b]$")).alias("z"),
-        ]
+        pl.struct(pl.max("^a|b$")).alias("x"),
+        pl.struct(pl.min("^.*[bc]$")).alias("y"),
+        pl.struct(pl.sum("^[^a]$")).alias("z"),
     )
     assert out.rows() == [
-        ({"a": "foo", "b": 3}, {"b": 1, "c": -1.0}, {"a": None, "c": 5.0})
+        ({"a": "foo", "b": 3}, {"b": 1, "c": -1.0}, {"b": 6, "c": 5.0})
     ]
 
 
@@ -515,7 +567,7 @@ def test_count() -> None:
         pl.count("b", "a"),
         [pl.count("b"), pl.count("a")],
     ):
-        out = df.select(count_expr)  # type: ignore[arg-type]
+        out = df.select(count_expr)
         assert out.rows() == [(2, 3)]
 
 
@@ -527,3 +579,22 @@ def test_head_tail(fruits_cars: pl.DataFrame) -> None:
     res_expr = fruits_cars.select(pl.tail("A", 2))
     expected = pl.Series("A", [4, 5])
     assert_series_equal(res_expr.to_series(), expected)
+
+
+def test_escape_regex() -> None:
+    result = pl.escape_regex("abc(\\w+)")
+    expected = "abc\\(\\\\w\\+\\)"
+    assert result == expected
+
+    df = pl.DataFrame({"text": ["abc", "def", None, "abc(\\w+)"]})
+    with pytest.raises(
+        TypeError,
+        match="escape_regex function is unsupported for `Expr`, you may want use `Expr.str.escape_regex` instead",
+    ):
+        df.with_columns(escaped=pl.escape_regex(pl.col("text")))  # type: ignore[arg-type]
+
+    with pytest.raises(
+        TypeError,
+        match="escape_regex function supports only `str` type, got `<class 'int'>`",
+    ):
+        pl.escape_regex(3)  # type: ignore[arg-type]

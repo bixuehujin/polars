@@ -4,9 +4,9 @@ use super::*;
 #[cfg(feature = "dtype-datetime")]
 #[cfg_attr(miri, ignore)]
 fn test_datelike_join() -> PolarsResult<()> {
-    let s = Series::new("foo", &[1, 2, 3]);
+    let s = Column::new("foo".into(), &[1, 2, 3]);
     let mut s1 = s.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?;
-    s1.rename("bar");
+    s1.rename("bar".into());
 
     let df = DataFrame::new(vec![s, s1])?;
 
@@ -22,7 +22,7 @@ fn test_datelike_join() -> PolarsResult<()> {
         DataType::Datetime(TimeUnit::Nanoseconds, None)
     ));
 
-    let out = df.outer_join(&df.clone(), ["bar"], ["bar"])?;
+    let out = df.full_join(&df.clone(), ["bar"], ["bar"])?;
     assert!(matches!(
         out.column("bar")?.dtype(),
         DataType::Datetime(TimeUnit::Nanoseconds, None)
@@ -33,7 +33,7 @@ fn test_datelike_join() -> PolarsResult<()> {
 #[test]
 #[cfg(all(feature = "dtype-datetime", feature = "dtype-duration"))]
 fn test_datelike_methods() -> PolarsResult<()> {
-    let s = Series::new("foo", &[1, 2, 3]);
+    let s = Series::new("foo".into(), &[1, 2, 3]);
     let s = s.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?;
 
     let out = s.subtract(&s)?;
@@ -52,7 +52,7 @@ fn test_datelike_methods() -> PolarsResult<()> {
 #[test]
 #[cfg(all(feature = "dtype-datetime", feature = "dtype-duration"))]
 fn test_arithmetic_dispatch() {
-    let s = Int64Chunked::new("", &[1, 2, 3])
+    let s = Int64Chunked::new("".into(), &[1, 2, 3])
         .into_datetime(TimeUnit::Nanoseconds, None)
         .into_series();
 
@@ -113,13 +113,13 @@ fn test_arithmetic_dispatch() {
 #[test]
 #[cfg(feature = "dtype-duration")]
 fn test_duration() -> PolarsResult<()> {
-    let a = Int64Chunked::new("", &[1, 2, 3])
+    let a = Int64Chunked::new("".into(), &[1, 2, 3])
         .into_datetime(TimeUnit::Nanoseconds, None)
         .into_series();
-    let b = Int64Chunked::new("", &[2, 3, 4])
+    let b = Int64Chunked::new("".into(), &[2, 3, 4])
         .into_datetime(TimeUnit::Nanoseconds, None)
         .into_series();
-    let c = Int64Chunked::new("", &[1, 1, 1])
+    let c = Int64Chunked::new("".into(), &[1, 1, 1])
         .into_duration(TimeUnit::Nanoseconds)
         .into_series();
     assert_eq!(
@@ -132,7 +132,7 @@ fn test_duration() -> PolarsResult<()> {
     );
     assert_eq!(
         b.subtract(&a)?,
-        Int64Chunked::full("", 1, a.len())
+        Int64Chunked::full("".into(), 1, a.len())
             .into_duration(TimeUnit::Nanoseconds)
             .into_series()
     );
@@ -141,11 +141,16 @@ fn test_duration() -> PolarsResult<()> {
 
 #[test]
 #[cfg(feature = "dtype-duration")]
-fn test_duration_date_arithmetic() {
-    let date1 = Int32Chunked::new("", &[1, 1, 1]).into_date().into_series();
-    let date2 = Int32Chunked::new("", &[2, 3, 4]).into_date().into_series();
+fn test_duration_date_arithmetic() -> PolarsResult<()> {
+    let date1 = Int32Chunked::new("".into(), &[1, 1, 1])
+        .into_date()
+        .into_series();
+    let date2 = Int32Chunked::new("".into(), &[2, 3, 4])
+        .into_date()
+        .into_series();
 
     let diff_ms = &date2 - &date1;
+    let diff_ms = diff_ms?;
     let diff_us = diff_ms
         .cast(&DataType::Duration(TimeUnit::Microseconds))
         .unwrap();
@@ -154,14 +159,16 @@ fn test_duration_date_arithmetic() {
         .unwrap();
 
     // `+` is commutative for date and duration
-    assert_series_eq(&(&diff_ms + &date1), &(&date1 + &diff_ms));
-    assert_series_eq(&(&diff_us + &date1), &(&date1 + &diff_us));
-    assert_series_eq(&(&diff_ns + &date1), &(&date1 + &diff_ns));
+    assert_series_eq(&(&diff_ms + &date1)?, &(&date1 + &diff_ms)?);
+    assert_series_eq(&(&diff_us + &date1)?, &(&date1 + &diff_us)?);
+    assert_series_eq(&(&diff_ns + &date1)?, &(&date1 + &diff_ns)?);
 
     // `+` is correct date and duration
-    assert_series_eq(&(&diff_ms + &date1), &date2);
-    assert_series_eq(&(&diff_us + &date1), &date2);
-    assert_series_eq(&(&diff_ns + &date1), &date2);
+    assert_series_eq(&(&diff_ms + &date1)?, &date2);
+    assert_series_eq(&(&diff_us + &date1)?, &date2);
+    assert_series_eq(&(&diff_ns + &date1)?, &date2);
+
+    Ok(())
 }
 
 fn assert_series_eq(s1: &Series, s2: &Series) {

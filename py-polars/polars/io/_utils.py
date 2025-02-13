@@ -5,11 +5,19 @@ import re
 from contextlib import contextmanager
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import IO, Any, ContextManager, Iterator, Sequence, overload
+from typing import IO, TYPE_CHECKING, Any, overload
 
-from polars._utils.various import is_int_sequence, is_str_sequence, normalize_filepath
+from polars._utils.various import (
+    is_int_sequence,
+    is_str_sequence,
+    normalize_filepath,
+)
 from polars.dependencies import _FSSPEC_AVAILABLE, fsspec
 from polars.exceptions import NoDataError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+    from contextlib import AbstractContextManager as ContextManager
 
 
 def parse_columns_arg(
@@ -132,7 +140,10 @@ def prepare_file_arg(
     If encoding is not `utf8` or `utf8-lossy`, decoding is handled by
     fsspec too.
     """
-    storage_options = storage_options or {}
+    storage_options = storage_options.copy() if storage_options else {}
+    if storage_options and not _FSSPEC_AVAILABLE:
+        msg = "`fsspec` is required for `storage_options` argument"
+        raise ImportError(msg)
 
     # Small helper to use a variable as context
     @contextmanager
@@ -255,7 +266,7 @@ def _check_empty(
             if context in ("StringIO", "BytesIO") and read_position
             else ""
         )
-        msg = f"empty CSV data from {context}{hint}"
+        msg = f"empty data from {context}{hint}"
         raise NoDataError(msg)
     return b
 
@@ -276,10 +287,6 @@ def process_file_url(path: str, encoding: str | None = None) -> BytesIO:
 
 def is_glob_pattern(file: str) -> bool:
     return any(char in file for char in ["*", "?", "["])
-
-
-def is_supported_cloud(file: str) -> bool:
-    return bool(re.match("^(s3a?|gs|gcs|file|abfss?|azure|az|adl|https?)://", file))
 
 
 def is_local_file(file: str) -> bool:

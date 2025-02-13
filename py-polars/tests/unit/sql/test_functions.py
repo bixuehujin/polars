@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 
 import polars as pl
-from polars.exceptions import InvalidOperationError
+from polars.exceptions import SQLInterfaceError
 from polars.testing import assert_frame_equal
 
 
-@pytest.fixture()
+@pytest.fixture
 def foods_ipc_path() -> Path:
     return Path(__file__).parent.parent / "io" / "files" / "foods1.ipc"
 
@@ -32,6 +32,7 @@ def test_sql_expr() -> None:
     # expect expressions that can't reasonably be parsed as expressions to raise
     # (for example: those that explicitly reference tables and/or use wildcards)
     with pytest.raises(
-        InvalidOperationError, match=r"Unable to parse 'xyz\.\*' as Expr"
+        SQLInterfaceError,
+        match=r"unable to parse 'xyz\.\*' as Expr",
     ):
         pl.sql_expr("xyz.*")

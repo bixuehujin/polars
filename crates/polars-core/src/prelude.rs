@@ -4,11 +4,10 @@ pub use std::sync::Arc;
 pub use arrow::array::ArrayRef;
 pub(crate) use arrow::array::*;
 pub use arrow::datatypes::{ArrowSchema, Field as ArrowField};
-#[cfg(feature = "ewma")]
-pub use arrow::legacy::kernels::ewm::EWMOptions;
 pub use arrow::legacy::prelude::*;
 pub(crate) use arrow::trusted_len::TrustedLen;
-pub use polars_utils::index::{ChunkId, IdxSize, NullableChunkId, NullableIdxSize};
+pub use polars_utils::index::{ChunkId, IdxSize, NullableIdxSize};
+pub use polars_utils::pl_str::PlSmallStr;
 pub(crate) use polars_utils::total_ord::{TotalEq, TotalOrd};
 
 pub use crate::chunked_array::arithmetic::ArithmeticChunked;
@@ -31,15 +30,19 @@ pub use crate::chunked_array::ops::rolling_window::RollingOptionsFixedWindow;
 pub use crate::chunked_array::ops::*;
 #[cfg(feature = "temporal")]
 pub use crate::chunked_array::temporal::conversion::*;
-pub(crate) use crate::chunked_array::ChunkIdIter;
+pub(crate) use crate::chunked_array::ChunkLenIter;
 pub use crate::chunked_array::ChunkedArray;
+#[cfg(feature = "dtype-struct")]
+pub use crate::chunked_array::StructChunked;
 #[cfg(feature = "dtype-categorical")]
 pub use crate::datatypes::string_cache::StringCacheHolder;
 pub use crate::datatypes::{ArrayCollectIterExt, *};
+pub use crate::error::signals::try_raise_keyboard_interrupt;
 pub use crate::error::{
     polars_bail, polars_ensure, polars_err, polars_warn, PolarsError, PolarsResult,
 };
-pub use crate::frame::explode::MeltArgs;
+pub use crate::frame::column::{Column, IntoColumn};
+pub use crate::frame::explode::UnpivotArgsIR;
 #[cfg(feature = "algorithm_group_by")]
 pub(crate) use crate::frame::group_by::aggregations::*;
 #[cfg(feature = "algorithm_group_by")]
@@ -47,6 +50,7 @@ pub use crate::frame::group_by::*;
 pub use crate::frame::{DataFrame, UniqueKeepStrategy};
 pub use crate::hashing::VecHash;
 pub use crate::named_from::{NamedFrom, NamedFromOwned};
+pub use crate::scalar::Scalar;
 pub use crate::schema::*;
 #[cfg(feature = "checked_arithmetic")]
 pub use crate::series::arithmetic::checked::NumOpsDispatchChecked;

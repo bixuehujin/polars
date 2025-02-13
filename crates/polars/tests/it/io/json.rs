@@ -20,13 +20,13 @@ fn read_json() {
 "#;
     let file = Cursor::new(basic_json);
     let df = JsonReader::new(file)
-        .infer_schema_len(Some(3))
+        .infer_schema_len(NonZeroUsize::new(3))
         .with_json_format(JsonFormat::JsonLines)
         .with_batch_size(NonZeroUsize::new(3).unwrap())
         .finish()
         .unwrap();
-    assert_eq!("a", df.get_columns()[0].name());
-    assert_eq!("d", df.get_columns()[3].name());
+    assert_eq!("a", df.get_columns()[0].name().as_str());
+    assert_eq!("d", df.get_columns()[3].name().as_str());
     assert_eq!((12, 4), df.shape());
 }
 #[test]
@@ -48,13 +48,13 @@ fn read_json_with_whitespace() {
 {  "a":100000000000000, "b":0.6, "c":false, "d":"text"}"#;
     let file = Cursor::new(basic_json);
     let df = JsonReader::new(file)
-        .infer_schema_len(Some(3))
+        .infer_schema_len(NonZeroUsize::new(3))
         .with_json_format(JsonFormat::JsonLines)
         .with_batch_size(NonZeroUsize::new(3).unwrap())
         .finish()
         .unwrap();
-    assert_eq!("a", df.get_columns()[0].name());
-    assert_eq!("d", df.get_columns()[3].name());
+    assert_eq!("a", df.get_columns()[0].name().as_str());
+    assert_eq!("d", df.get_columns()[3].name().as_str());
     assert_eq!((12, 4), df.shape());
 }
 #[test]
@@ -73,15 +73,15 @@ fn read_json_with_escapes() {
 "#;
     let file = Cursor::new(escaped_json);
     let df = JsonLineReader::new(file)
-        .infer_schema_len(Some(6))
+        .infer_schema_len(NonZeroUsize::new(6))
         .finish()
         .unwrap();
-    assert_eq!("id", df.get_columns()[0].name());
+    assert_eq!("id", df.get_columns()[0].name().as_str());
     assert_eq!(
         AnyValue::String("\""),
         df.column("text").unwrap().get(0).unwrap()
     );
-    assert_eq!("text", df.get_columns()[1].name());
+    assert_eq!("text", df.get_columns()[1].name().as_str());
     assert_eq!((10, 3), df.shape());
 }
 
@@ -102,13 +102,13 @@ fn read_unordered_json() {
 "#;
     let file = Cursor::new(unordered_json);
     let df = JsonReader::new(file)
-        .infer_schema_len(Some(3))
+        .infer_schema_len(NonZeroUsize::new(3))
         .with_json_format(JsonFormat::JsonLines)
         .with_batch_size(NonZeroUsize::new(3).unwrap())
         .finish()
         .unwrap();
-    assert_eq!("a", df.get_columns()[0].name());
-    assert_eq!("d", df.get_columns()[3].name());
+    assert_eq!("a", df.get_columns()[0].name().as_str());
+    assert_eq!("d", df.get_columns()[3].name().as_str());
     assert_eq!((12, 4), df.shape());
 }
 
@@ -141,18 +141,24 @@ fn test_read_ndjson_iss_5875() {
     let df = JsonLineReader::new(cursor).finish();
     assert!(df.is_ok());
 
-    let field_int_inner = Field::new("int_inner", DataType::List(Box::new(DataType::Int64)));
-    let field_float_inner = Field::new("float_inner", DataType::Float64);
-    let field_str_inner = Field::new("str_inner", DataType::List(Box::new(DataType::String)));
+    let field_int_inner = Field::new(
+        "int_inner".into(),
+        DataType::List(Box::new(DataType::Int64)),
+    );
+    let field_float_inner = Field::new("float_inner".into(), DataType::Float64);
+    let field_str_inner = Field::new(
+        "str_inner".into(),
+        DataType::List(Box::new(DataType::String)),
+    );
 
-    let mut schema = Schema::new();
+    let mut schema = Schema::default();
     schema.with_column(
         "struct".into(),
         DataType::Struct(vec![field_int_inner, field_float_inner, field_str_inner]),
     );
     schema.with_column("float".into(), DataType::Float64);
 
-    assert_eq!(schema, df.unwrap().schema());
+    assert_eq!(&schema, &(**df.unwrap().schema()));
 }
 
 #[test]

@@ -4,13 +4,19 @@ import math
 from typing import Any
 
 import pytest
+from hypothesis import given
 
 import polars as pl
-from polars.exceptions import InvalidAssert
 from polars.testing import assert_frame_equal, assert_frame_not_equal
+from polars.testing.parametric import dataframes
 
 nan = float("nan")
 pytest_plugins = ["pytester"]
+
+
+@given(df=dataframes())
+def test_equal(df: pl.DataFrame) -> None:
+    assert_frame_equal(df, df.clone(), check_exact=True)
 
 
 @pytest.mark.parametrize(
@@ -43,13 +49,13 @@ pytest_plugins = ["pytester"]
         pytest.param(
             pl.DataFrame({"a": [0.0, 1.0, 2.0]}, schema={"a": pl.Float64}),
             pl.DataFrame({"a": [0, 1, 2]}, schema={"a": pl.Int64}),
-            {"check_dtype": False},
+            {"check_dtypes": False},
             id="equal_int_float_integer_no_check_dtype",
         ),
         pytest.param(
             pl.DataFrame({"a": [0, 1, 2]}, schema={"a": pl.Float64}),
             pl.DataFrame({"a": [0, 1, 2]}, schema={"a": pl.Float32}),
-            {"check_dtype": False},
+            {"check_dtypes": False},
             id="equal_int_float_integer_no_check_dtype",
         ),
         pytest.param(
@@ -154,7 +160,7 @@ def test_assert_frame_equal_passes_assertion(
         pytest.param(
             pl.DataFrame({"a": [[2.0, 3.0]]}),
             pl.DataFrame({"a": [[2, 3]]}),
-            {"check_exact": False, "check_dtype": True},
+            {"check_exact": False, "check_dtypes": True},
             id="list_of_float_list_of_int_check_dtype_true",
         ),
         pytest.param(
@@ -263,7 +269,7 @@ def test_compare_frame_equal_nested_nans() -> None:
     assert_frame_not_equal(df3, df4)
     for check_dtype in (True, False):
         with pytest.raises(AssertionError, match="mismatch|different"):
-            assert_frame_equal(df3, df4, check_dtype=check_dtype)
+            assert_frame_equal(df3, df4, check_dtypes=check_dtype)
 
 
 def test_assert_frame_equal_pass() -> None:
@@ -272,13 +278,17 @@ def test_assert_frame_equal_pass() -> None:
     assert_frame_equal(df1, df2)
 
 
-def test_assert_frame_equal_types() -> None:
+@pytest.mark.parametrize(
+    "assert_function",
+    [assert_frame_equal, assert_frame_not_equal],
+)
+def test_assert_frame_equal_types(assert_function: Any) -> None:
     df1 = pl.DataFrame({"a": [1, 2]})
     srs1 = pl.Series(values=[1, 2], name="a")
     with pytest.raises(
         AssertionError, match=r"inputs are different \(unexpected input types\)"
     ):
-        assert_frame_equal(df1, srs1)  # type: ignore[arg-type]
+        assert_function(df1, srs1)
 
 
 def test_assert_frame_equal_length_mismatch() -> None:
@@ -289,6 +299,7 @@ def test_assert_frame_equal_length_mismatch() -> None:
         match=r"DataFrames are different \(number of rows does not match\)",
     ):
         assert_frame_equal(df1, df2)
+    assert_frame_not_equal(df1, df2)
 
 
 def test_assert_frame_equal_column_mismatch() -> None:
@@ -298,6 +309,7 @@ def test_assert_frame_equal_column_mismatch() -> None:
         AssertionError, match="columns \\['a'\\] in left DataFrame, but not in right"
     ):
         assert_frame_equal(df1, df2)
+    assert_frame_not_equal(df1, df2)
 
 
 def test_assert_frame_equal_column_mismatch2() -> None:
@@ -308,6 +320,7 @@ def test_assert_frame_equal_column_mismatch2() -> None:
         match="columns \\['b', 'c'\\] in right LazyFrame, but not in left",
     ):
         assert_frame_equal(df1, df2)
+    assert_frame_not_equal(df1, df2)
 
 
 def test_assert_frame_equal_column_mismatch_order() -> None:
@@ -317,45 +330,42 @@ def test_assert_frame_equal_column_mismatch_order() -> None:
         assert_frame_equal(df1, df2)
 
     assert_frame_equal(df1, df2, check_column_order=False)
+    assert_frame_not_equal(df1, df2)
 
 
-def test_assert_frame_equal_ignore_row_order() -> None:
+def test_assert_frame_equal_check_row_order() -> None:
     df1 = pl.DataFrame({"a": [1, 2], "b": [4, 3]})
     df2 = pl.DataFrame({"a": [2, 1], "b": [3, 4]})
-    df3 = pl.DataFrame({"b": [3, 4], "a": [2, 1]})
+
     with pytest.raises(AssertionError, match="value mismatch for column 'a'"):
         assert_frame_equal(df1, df2)
 
     assert_frame_equal(df1, df2, check_row_order=False)
-    # eg:
-    # ┌─────┬─────┐      ┌─────┬─────┐
-    # │ a   ┆ b   │      │ a   ┆ b   │
-    # │ --- ┆ --- │      │ --- ┆ --- │
-    # │ i64 ┆ i64 │ (eq) │ i64 ┆ i64 │
-    # ╞═════╪═════╡  ==  ╞═════╪═════╡
-    # │ 1   ┆ 4   │      │ 2   ┆ 3   │
-    # │ 2   ┆ 3   │      │ 1   ┆ 4   │
-    # └─────┴─────┘      └─────┴─────┘
+    assert_frame_not_equal(df1, df2)
+
+
+def test_assert_frame_equal_check_row_col_order() -> None:
+    df1 = pl.DataFrame({"a": [1, 2], "b": [4, 3]})
+    df2 = pl.DataFrame({"b": [3, 4], "a": [2, 1]})
 
     with pytest.raises(AssertionError, match="columns are not in the same order"):
-        assert_frame_equal(df1, df3, check_row_order=False)
+        assert_frame_equal(df1, df2, check_row_order=False)
 
-    assert_frame_equal(df1, df3, check_row_order=False, check_column_order=False)
+    assert_frame_equal(df1, df2, check_row_order=False, check_column_order=False)
+    assert_frame_not_equal(df1, df2)
 
-    class Foo:
-        def __init__(self) -> None:
-            pass
 
-    # note: not all column types support sorting
+@pytest.mark.parametrize(
+    "assert_function",
+    [assert_frame_equal, assert_frame_not_equal],
+)
+def test_assert_frame_equal_check_row_order_unsortable(assert_function: Any) -> None:
+    df1 = pl.DataFrame({"a": [object(), object()], "b": [3, 4]})
+    df2 = pl.DataFrame({"a": [object(), object()], "b": [4, 3]})
     with pytest.raises(
-        InvalidAssert,
-        match="cannot set `check_row_order=False`.*unsortable columns",
+        TypeError, match="cannot set `check_row_order=False`.*unsortable columns"
     ):
-        assert_frame_equal(
-            left=pl.DataFrame({"a": [Foo(), Foo()], "b": [3, 4]}),
-            right=pl.DataFrame({"a": [Foo(), Foo()], "b": [4, 3]}),
-            check_row_order=False,
-        )
+        assert_function(df1, df2, check_row_order=False)
 
 
 def test_assert_frame_equal_dtypes_mismatch() -> None:
@@ -366,11 +376,29 @@ def test_assert_frame_equal_dtypes_mismatch() -> None:
     with pytest.raises(AssertionError, match="dtypes do not match"):
         assert_frame_equal(df1, df2, check_column_order=False)
 
+    assert_frame_not_equal(df1, df2, check_column_order=False)
+    assert_frame_not_equal(df1, df2)
+
 
 def test_assert_frame_not_equal() -> None:
     df = pl.DataFrame({"a": [1, 2]})
-    with pytest.raises(AssertionError, match="frames are equal"):
+    with pytest.raises(AssertionError, match="DataFrames are equal"):
         assert_frame_not_equal(df, df)
+    lf = df.lazy()
+    with pytest.raises(AssertionError, match="LazyFrames are equal"):
+        assert_frame_not_equal(lf, lf)
+
+
+def test_assert_frame_equal_check_dtype_deprecated() -> None:
+    df1 = pl.DataFrame({"a": [1, 2]})
+    df2 = pl.DataFrame({"a": [1.0, 2.0]})
+    df3 = pl.DataFrame({"a": [2, 1]})
+
+    with pytest.deprecated_call():
+        assert_frame_equal(df1, df2, check_dtype=False)  # type: ignore[call-arg]
+
+    with pytest.deprecated_call():
+        assert_frame_not_equal(df1, df3, check_dtype=False)  # type: ignore[call-arg]
 
 
 def test_tracebackhide(testdir: pytest.Testdir) -> None:
@@ -408,7 +436,7 @@ def test_frame_schema_fail():
     assert "polars/py-polars/polars/testing" not in stdout
 
     # The above should catch any polars testing functions that appear in the
-    # stack trace.  But we keep the following checks (for specific function
+    # stack trace. But we keep the following checks (for specific function
     # names) just to double-check.
 
     assert "def assert_frame_equal" not in stdout
@@ -431,6 +459,6 @@ def test_frame_schema_fail():
         "AssertionError: DataFrames are different (value mismatch for column 'a')"
         in stdout
     )
-    assert "AssertionError: frames are equal" in stdout
+    assert "AssertionError: DataFrames are equal" in stdout
     assert "AssertionError: inputs are different (unexpected input types)" in stdout
     assert "AssertionError: DataFrames are different (dtypes do not match)" in stdout

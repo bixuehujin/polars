@@ -2,25 +2,30 @@ from __future__ import annotations
 
 import contextlib
 import os
-import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Literal, TypedDict, get_args
 
-from polars._utils.deprecation import deprecate_nonkeyword_arguments
 from polars._utils.various import normalize_filepath
 from polars.dependencies import json
 
-if sys.version_info >= (3, 10):
-    from typing import TypeAlias
-else:
-    pass
-
 if TYPE_CHECKING:
+    import sys
     from types import TracebackType
 
-    from typing_extensions import TypeAlias
+    from polars._typing import FloatFmt
 
-    from polars.type_aliases import FloatFmt
+    if sys.version_info >= (3, 10):
+        from typing import TypeAlias
+    else:
+        from typing_extensions import TypeAlias
+
+    if sys.version_info >= (3, 11):
+        from typing import Self, Unpack
+    else:
+        from typing_extensions import Self, Unpack
+
+
+__all__ = ["Config"]
 
 TableFormatNames: TypeAlias = Literal[
     "ASCII_FULL",
@@ -30,6 +35,7 @@ TableFormatNames: TypeAlias = Literal[
     "ASCII_BORDERS_ONLY_CONDENSED",
     "ASCII_HORIZONTAL_ONLY",
     "ASCII_MARKDOWN",
+    "MARKDOWN",
     "UTF8_FULL",
     "UTF8_FULL_CONDENSED",
     "UTF8_NO_BORDERS",
@@ -38,13 +44,11 @@ TableFormatNames: TypeAlias = Literal[
     "NOTHING",
 ]
 
-
 # note: register all Config-specific environment variable names here; need to constrain
 # which 'POLARS_' environment variables are recognized, as there are other lower-level
 # and/or unstable settings that should not be saved or reset with the Config vars.
 _POLARS_CFG_ENV_VARS = {
     "POLARS_WARN_UNSTABLE",
-    "POLARS_ACTIVATE_DECIMAL",
     "POLARS_AUTO_STRUCTIFY",
     "POLARS_FMT_MAX_COLS",
     "POLARS_FMT_MAX_ROWS",
@@ -66,6 +70,7 @@ _POLARS_CFG_ENV_VARS = {
     "POLARS_STREAMING_CHUNK_SIZE",
     "POLARS_TABLE_WIDTH",
     "POLARS_VERBOSE",
+    "POLARS_MAX_EXPR_DEPTH",
 }
 
 # vars that set the rust env directly should declare themselves here as the Config
@@ -81,6 +86,60 @@ with contextlib.suppress(ImportError, NameError):
         "set_decimal_separator": plr.get_decimal_separator,
         "set_trim_decimal_zeros": plr.get_trim_decimal_zeros,
     }
+
+
+class ConfigParameters(TypedDict, total=False):
+    """Parameters supported by the polars Config."""
+
+    ascii_tables: bool | None
+    auto_structify: bool | None
+    decimal_separator: str | None
+    thousands_separator: str | bool | None
+    float_precision: int | None
+    fmt_float: FloatFmt | None
+    fmt_str_lengths: int | None
+    fmt_table_cell_list_len: int | None
+    streaming_chunk_size: int | None
+    tbl_cell_alignment: Literal["LEFT", "CENTER", "RIGHT"] | None
+    tbl_cell_numeric_alignment: Literal["LEFT", "CENTER", "RIGHT"] | None
+    tbl_cols: int | None
+    tbl_column_data_type_inline: bool | None
+    tbl_dataframe_shape_below: bool | None
+    tbl_formatting: TableFormatNames | None
+    tbl_hide_column_data_types: bool | None
+    tbl_hide_column_names: bool | None
+    tbl_hide_dtype_separator: bool | None
+    tbl_hide_dataframe_shape: bool | None
+    tbl_rows: int | None
+    tbl_width_chars: int | None
+    trim_decimal_zeros: bool | None
+    verbose: bool | None
+    expr_depth_warning: int
+
+    set_ascii_tables: bool | None
+    set_auto_structify: bool | None
+    set_decimal_separator: str | None
+    set_thousands_separator: str | bool | None
+    set_float_precision: int | None
+    set_fmt_float: FloatFmt | None
+    set_fmt_str_lengths: int | None
+    set_fmt_table_cell_list_len: int | None
+    set_streaming_chunk_size: int | None
+    set_tbl_cell_alignment: Literal["LEFT", "CENTER", "RIGHT"] | None
+    set_tbl_cell_numeric_alignment: Literal["LEFT", "CENTER", "RIGHT"] | None
+    set_tbl_cols: int | None
+    set_tbl_column_data_type_inline: bool | None
+    set_tbl_dataframe_shape_below: bool | None
+    set_tbl_formatting: TableFormatNames | None
+    set_tbl_hide_column_data_types: bool | None
+    set_tbl_hide_column_names: bool | None
+    set_tbl_hide_dtype_separator: bool | None
+    set_tbl_hide_dataframe_shape: bool | None
+    set_tbl_rows: int | None
+    set_tbl_width_chars: int | None
+    set_trim_decimal_zeros: bool | None
+    set_verbose: bool | None
+    set_expr_depth_warning: int
 
 
 class Config(contextlib.ContextDecorator):
@@ -112,9 +171,16 @@ class Config(contextlib.ContextDecorator):
     ...     pass
     """
 
+    _context_options: ConfigParameters | None = None
     _original_state: str = ""
 
-    def __init__(self, *, restore_defaults: bool = False, **options: Any) -> None:
+    def __init__(
+        self,
+        *,
+        restore_defaults: bool = False,
+        apply_on_context_enter: bool = False,
+        **options: Unpack[ConfigParameters],
+    ) -> None:
         """
         Initialise a Config object instance for context manager usage.
 
@@ -126,16 +192,23 @@ class Config(contextlib.ContextDecorator):
         restore_defaults
             set all options to their default values (this is applied before
             setting any other options).
+        apply_on_context_enter
+            defer applying the options until a context is entered. This allows you
+            to create multiple `Config` instances with different options, and then
+            reuse them independently as context managers or function decorators
+            with specific bundles of parameters.
         **options
             keyword args that will set the option; equivalent to calling the
             named "set_<option>" method with the given value.
 
         Examples
         --------
+        Customise Polars table formatting while in context scope:
+
         >>> df = pl.DataFrame({"abc": [1.0, 2.5, 5.0], "xyz": [True, False, True]})
         >>> with pl.Config(
         ...     # these options will be set for scope duration
-        ...     tbl_formatting="ASCII_MARKDOWN",
+        ...     tbl_formatting="MARKDOWN",
         ...     tbl_hide_dataframe_shape=True,
         ...     tbl_rows=10,
         ... ):
@@ -147,24 +220,51 @@ class Config(contextlib.ContextDecorator):
         | 1.0 | true  |
         | 2.5 | false |
         | 5.0 | true  |
+
+        Establish several independent Config instances for use in different contexts;
+        setting `apply_on_context_enter=True` defers setting the parameters until a
+        context (or function, when used as a decorator) is actually entered:
+
+        >>> cfg_polars_verbose = pl.Config(
+        ...     verbose=True,
+        ...     apply_on_context_enter=True,
+        ... )
+        >>> cfg_polars_detailed_tables = pl.Config(
+        ...     tbl_rows=25,
+        ...     tbl_cols=25,
+        ...     tbl_width_chars=200,
+        ...     apply_on_context_enter=True,
+        ... )
+
+        These Config instances can now be applied independently and re-used:
+
+        >>> @cfg_polars_verbose
+        ... def traced_function(df: pl.DataFrame) -> pl.DataFrame:
+        ...     return polars_operations(df)
+
+        >>> @cfg_polars_detailed_tables
+        ... def print_detailed_frames(*frames: pl.DataFrame) -> None:
+        ...     for df in frames:
+        ...         print(df)
         """
         # save original state _before_ any changes are made
         self._original_state = self.save()
-
         if restore_defaults:
             self.restore_defaults()
 
-        for opt, value in options.items():
-            if not hasattr(self, opt) and not opt.startswith("set_"):
-                opt = f"set_{opt}"
-            if not hasattr(self, opt):
-                msg = f"`Config` has no option {opt!r}"
-                raise AttributeError(msg)
-            getattr(self, opt)(value)
+        if apply_on_context_enter:
+            # defer setting options; apply only on entering a new context
+            self._context_options = options
+        else:
+            # apply the given options immediately
+            self._set_config_params(**options)
+            self._context_options = None
 
-    def __enter__(self) -> Config:
-        """Support setting temporary Config options that are reset on scope exit."""
+    def __enter__(self) -> Self:
+        """Support setting Config options that are reset on scope exit."""
         self._original_state = self._original_state or self.save()
+        if self._context_options:
+            self._set_config_params(**self._context_options)
         return self
 
     def __exit__(
@@ -177,8 +277,27 @@ class Config(contextlib.ContextDecorator):
         self.restore_defaults().load(self._original_state)
         self._original_state = ""
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Config):
+            return False
+        return (self._original_state == other._original_state) and (
+            self._context_options == other._context_options
+        )
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def _set_config_params(self, **options: Unpack[ConfigParameters]) -> None:
+        for opt, value in options.items():
+            if not hasattr(self, opt) and not opt.startswith("set_"):
+                opt = f"set_{opt}"
+            if not hasattr(self, opt):
+                msg = f"`Config` has no option {opt!r}"
+                raise AttributeError(msg)
+            getattr(self, opt)(value)
+
     @classmethod
-    def load(cls, cfg: str) -> type[Config]:
+    def load(cls, cfg: str) -> Config:
         """
         Load (and set) previously saved Config options from a JSON string.
 
@@ -190,7 +309,7 @@ class Config(contextlib.ContextDecorator):
         See Also
         --------
         load_from_file : Load (and set) Config options from a JSON file.
-        save: Save the current set of Config options as a JSON string or file.
+        save : Save the current set of Config options as a JSON string or file.
         """
         try:
             options = json.loads(cfg)
@@ -198,14 +317,21 @@ class Config(contextlib.ContextDecorator):
             msg = "invalid Config string (did you mean to use `load_from_file`?)"
             raise ValueError(msg) from err
 
-        os.environ.update(options.get("environment", {}))
+        cfg_load = Config()
+        opts = options.get("environment", {})
+        for key, opt in opts.items():
+            if opt is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = opt
+
         for cfg_methodname, value in options.get("direct", {}).items():
-            if hasattr(cls, cfg_methodname):
-                getattr(cls, cfg_methodname)(value)
-        return cls
+            if hasattr(cfg_load, cfg_methodname):
+                getattr(cfg_load, cfg_methodname)(value)
+        return cfg_load
 
     @classmethod
-    def load_from_file(cls, file: Path | str) -> type[Config]:
+    def load_from_file(cls, file: Path | str) -> Config:
         """
         Load (and set) previously saved Config options from file.
 
@@ -217,7 +343,7 @@ class Config(contextlib.ContextDecorator):
         See Also
         --------
         load : Load (and set) Config options from a JSON string.
-        save: Save the current set of Config options as a JSON string or file.
+        save : Save the current set of Config options as a JSON string or file.
         """
         try:
             options = Path(normalize_filepath(file)).read_text()
@@ -252,9 +378,15 @@ class Config(contextlib.ContextDecorator):
         return cls
 
     @classmethod
-    def save(cls) -> str:
+    def save(cls, *, if_set: bool = False) -> str:
         """
         Save the current set of Config options as a JSON string.
+
+        Parameters
+        ----------
+        if_set
+            By default this will save the state of all configuration options; set
+            to `False` to save only those that have been set to a non-default value.
 
         See Also
         --------
@@ -264,7 +396,7 @@ class Config(contextlib.ContextDecorator):
 
         Examples
         --------
-        >>> json_str = pl.Config.save()
+        >>> json_state = pl.Config.save()
 
         Returns
         -------
@@ -272,9 +404,9 @@ class Config(contextlib.ContextDecorator):
             JSON string containing current Config options.
         """
         environment_vars = {
-            key: os.environ[key]
+            key: os.environ.get(key)
             for key in sorted(_POLARS_CFG_ENV_VARS)
-            if (key in os.environ)
+            if not if_set or (os.environ.get(key) is not None)
         }
         direct_vars = {
             cfg_methodname: get_value()
@@ -311,23 +443,19 @@ class Config(contextlib.ContextDecorator):
         file.write_text(cls.save())
 
     @classmethod
-    @deprecate_nonkeyword_arguments(version="0.19.3")
     def state(
-        cls,
-        if_set: bool = False,  # noqa: FBT001
-        env_only: bool = False,  # noqa: FBT001
+        cls, *, if_set: bool = False, env_only: bool = False
     ) -> dict[str, str | None]:
         """
-        Show the current state of all Config variables as a dict.
+        Show the current state of all Config variables in the environment as a dict.
 
         Parameters
         ----------
-        if_set : bool
+        if_set
             By default this will show the state of all `Config` environment variables.
             change this to `True` to restrict the returned dictionary to include only
             those that have been set to a specific value.
-
-        env_only : bool
+        env_only
             Include only Config environment variables in the output; some options (such
             as "set_fmt_float") are set directly, not via an environment variable.
 
@@ -348,25 +476,15 @@ class Config(contextlib.ContextDecorator):
         return config_state
 
     @classmethod
-    def activate_decimals(cls, active: bool | None = True) -> type[Config]:
-        """
-        Activate `Decimal` data types.
-
-        This is a temporary setting that will be removed once the `Decimal` type
-        stabilizes (`Decimal` is currently considered to be in beta testing).
-        """
-        if not active:
-            os.environ.pop("POLARS_ACTIVATE_DECIMAL", None)
-        else:
-            os.environ["POLARS_ACTIVATE_DECIMAL"] = str(int(active))
-        return cls
-
-    @classmethod
     def set_ascii_tables(cls, active: bool | None = True) -> type[Config]:
         """
         Use ASCII characters to display table outlines.
 
-        Set False to revert to the default UTF8_FULL_CONDENSED formatting style.
+        Set False to revert to the standard UTF8_FULL_CONDENSED formatting style.
+
+        See Also
+        --------
+        set_tbl_formatting : Set the table formatting style (includes Markdown option).
 
         Examples
         --------
@@ -663,14 +781,14 @@ class Config(contextlib.ContextDecorator):
         ... )
         >>> df.with_columns(pl.col("txt").str.len_bytes().alias("len"))
         shape: (2, 2)
-        ┌───────────────────────────────────┬─────┐
-        │ txt                               ┆ len │
-        │ ---                               ┆ --- │
-        │ str                               ┆ u32 │
-        ╞═══════════════════════════════════╪═════╡
-        │ Play it, Sam. Play 'As Time Goes… ┆ 37  │
-        │ This is the beginning of a beaut… ┆ 48  │
-        └───────────────────────────────────┴─────┘
+        ┌─────────────────────────────────┬─────┐
+        │ txt                             ┆ len │
+        │ ---                             ┆ --- │
+        │ str                             ┆ u32 │
+        ╞═════════════════════════════════╪═════╡
+        │ Play it, Sam. Play 'As Time Go… ┆ 37  │
+        │ This is the beginning of a bea… ┆ 48  │
+        └─────────────────────────────────┴─────┘
         >>> with pl.Config(fmt_str_lengths=50):
         ...     print(df)
         shape: (2, 1)
@@ -913,7 +1031,7 @@ class Config(contextlib.ContextDecorator):
         cls, active: bool | None = True
     ) -> type[Config]:
         """
-        Moves the data type inline with the column name (to the right, in parentheses).
+        Display the data type next to the column name (to the right, in parentheses).
 
         Examples
         --------
@@ -982,7 +1100,8 @@ class Config(contextlib.ContextDecorator):
             * "ASCII_BORDERS_ONLY": ASCII, borders only.
             * "ASCII_BORDERS_ONLY_CONDENSED": ASCII, borders only, dense row spacing.
             * "ASCII_HORIZONTAL_ONLY": ASCII, horizontal lines only.
-            * "ASCII_MARKDOWN": ASCII, Markdown compatible.
+            * "ASCII_MARKDOWN": Markdown format (ascii ellipses for truncated values).
+            * "MARKDOWN": Markdown format (utf8 ellipses for truncated values).
             * "UTF8_FULL": UTF8, with all borders and lines, including row dividers.
             * "UTF8_FULL_CONDENSED": Same as UTF8_FULL, but with dense row spacing.
             * "UTF8_NO_BORDERS": UTF8, no borders.
@@ -1005,7 +1124,7 @@ class Config(contextlib.ContextDecorator):
         ...     {"abc": [-2.5, 5.0], "mno": ["hello", "world"], "xyz": [True, False]}
         ... )
         >>> with pl.Config(
-        ...     tbl_formatting="ASCII_MARKDOWN",
+        ...     tbl_formatting="MARKDOWN",
         ...     tbl_hide_column_data_types=True,
         ...     tbl_hide_dataframe_shape=True,
         ... ):
@@ -1094,11 +1213,11 @@ class Config(contextlib.ContextDecorator):
     @classmethod
     def set_tbl_hide_dtype_separator(cls, active: bool | None = True) -> type[Config]:
         """
-        Hide the '---' separator between the column names and column types.
+        Hide the '---' separator displayed between the column names and column types.
 
         See Also
         --------
-        set_tbl_column_data_type_inline
+        set_tbl_column_data_type_inline : Display the data type inline with the colname.
 
         Examples
         --------
@@ -1194,7 +1313,43 @@ class Config(contextlib.ContextDecorator):
         Parameters
         ----------
         width : int
-            Maximum table width in characters.
+            Maximum table width in characters; if n < 0 (eg: -1), display full width.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "id": ["SEQ1", "SEQ2"],
+        ...         "seq": ["ATGATAAAGGAG", "GCAACGCATATA"],
+        ...     }
+        ... )
+        >>> df
+        shape: (2, 2)
+        ┌──────┬──────────────┐
+        │ id   ┆ seq          │
+        │ ---  ┆ ---          │
+        │ str  ┆ str          │
+        ╞══════╪══════════════╡
+        │ SEQ1 ┆ ATGATAAAGGAG │
+        │ SEQ2 ┆ GCAACGCATATA │
+        └──────┴──────────────┘
+        >>> pl.Config.set_tbl_width_chars(12)  # doctest: +IGNORE_RESULT
+        >>> df
+        shape: (2, 2)
+        ┌─────┬─────┐
+        │ id  ┆ seq │
+        │ --- ┆ --- │
+        │ str ┆ str │
+        ╞═════╪═════╡
+        │ SEQ ┆ ATG │
+        │ 1   ┆ ATA │
+        │     ┆ AAG │
+        │     ┆ GAG │
+        │ SEQ ┆ GCA │
+        │ 2   ┆ ACG │
+        │     ┆ CAT │
+        │     ┆ ATA │
+        └─────┴─────┘
         """
         if width is None:
             os.environ.pop("POLARS_TABLE_WIDTH", None)
@@ -1216,7 +1371,7 @@ class Config(contextlib.ContextDecorator):
         --------
         >>> from decimal import Decimal as D
         >>> df = pl.DataFrame(
-        ...     data={"d": [D("1.01"), D("-5.6789")]},
+        ...     data={"d": [D("1.01000"), D("-5.67890")]},
         ...     schema={"d": pl.Decimal(scale=5)},
         ... )
         >>> with pl.Config(trim_decimal_zeros=False):
@@ -1280,4 +1435,18 @@ class Config(contextlib.ContextDecorator):
             os.environ.pop("POLARS_WARN_UNSTABLE", None)
         else:
             os.environ["POLARS_WARN_UNSTABLE"] = str(int(active))
+        return cls
+
+    @classmethod
+    def set_expr_depth_warning(cls, limit: int) -> type[Config]:
+        """
+        Set the the expression depth that Polars will accept without triggering a warning.
+
+        Having too deep expressions (several 1000s) can lead to overflowing the stack and might be worth a refactor.
+        """  # noqa: W505
+        if limit < 0:
+            msg = "limit should be positive"
+            raise ValueError(msg)
+
+        os.environ["POLARS_MAX_EXPR_DEPTH"] = str(limit)
         return cls

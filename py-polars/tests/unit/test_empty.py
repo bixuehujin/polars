@@ -13,12 +13,6 @@ def test_empty_str_concat_lit() -> None:
     }
 
 
-def test_top_k_empty() -> None:
-    df = pl.DataFrame({"test": []})
-
-    assert_frame_equal(df.select([pl.col("test").top_k(2)]), df)
-
-
 def test_empty_cross_join() -> None:
     a = pl.LazyFrame(schema={"a": pl.Int32})
     b = pl.LazyFrame(schema={"b": pl.Int32})
@@ -57,9 +51,9 @@ def test_empty_count_window() -> None:
 
 
 def test_empty_sort_by_args() -> None:
-    df = pl.DataFrame([1, 2, 3])
-    with pytest.raises(pl.InvalidOperationError):
-        df.select(pl.all().sort_by([]))
+    df = pl.DataFrame({"x": [2, 1, 3]})
+    assert_frame_equal(df, df.select(pl.col.x.sort_by([])))
+    assert_frame_equal(df, df.sort([]))
 
 
 def test_empty_9137() -> None:
@@ -110,7 +104,7 @@ def test_empty_set_union() -> None:
     assert_series_equal(full.rename("empty"), empty.list.set_union(full))
 
 
-def test_empty_set_symteric_difference() -> None:
+def test_empty_set_symmetric_difference() -> None:
     full = pl.Series("full", [[1, 2, 3]], pl.List(pl.UInt32))
     empty = pl.Series("empty", [[]], pl.List(pl.UInt32))
 
@@ -133,3 +127,41 @@ def test_empty_is_in() -> None:
     assert_series_equal(
         pl.Series("a", [1, 2, 3]).is_in([]), pl.Series("a", [False] * 3)
     )
+
+
+@pytest.mark.parametrize("method", ["drop_nulls", "unique"])
+def test_empty_to_empty(method: str) -> None:
+    assert getattr(pl.DataFrame(), method)().shape == (0, 0)
+
+
+def test_empty_shift_over_16676() -> None:
+    df = pl.DataFrame({"a": [], "b": []})
+    assert df.with_columns(pl.col("a").shift(fill_value=0).over("b")).shape == (0, 2)
+
+
+def test_empty_list_cat_16405() -> None:
+    df = pl.DataFrame(schema={"cat": pl.List(pl.Categorical)})
+    df.select(pl.col("cat") == pl.col("cat"))
+
+
+def test_empty_list_concat_16924() -> None:
+    df = pl.DataFrame(schema={"a": pl.Int16, "b": pl.List(pl.String)})
+    df.with_columns(pl.col("b").list.concat([pl.col("a").cast(pl.String)]))
+
+
+def test_empty_input_expansion() -> None:
+    df = pl.DataFrame({"A": [1], "B": [2]})
+
+    with pytest.raises(pl.exceptions.InvalidOperationError):
+        (
+            df.select("A", "B").with_columns(
+                pl.col("B").sort_by(pl.struct(pl.exclude("A", "B")))
+            )
+        )
+
+
+def test_empty_list_15523() -> None:
+    s = pl.Series("", [["a"], []], dtype=pl.List)
+    assert s.dtype == pl.List(pl.String)
+    s = pl.Series("", [[], ["a"]], dtype=pl.List)
+    assert s.dtype == pl.List(pl.String)

@@ -18,16 +18,15 @@ pub type StringChunkedBuilder = BinViewChunkedBuilder<str>;
 pub type BinaryChunkedBuilder = BinViewChunkedBuilder<[u8]>;
 
 impl<T: ViewType + ?Sized> BinViewChunkedBuilder<T> {
-    /// Create a new StringChunkedBuilder
+    /// Create a new BinViewChunkedBuilder
     ///
     /// # Arguments
     ///
     /// * `capacity` - Number of string elements in the final array.
-    /// * `bytes_capacity` - Number of bytes needed to store the string values.
-    pub fn new(name: &str, capacity: usize) -> Self {
+    pub fn new(name: PlSmallStr, capacity: usize) -> Self {
         Self {
             chunk_builder: MutableBinaryViewArray::with_capacity(capacity),
-            field: Arc::new(Field::new(name, DataType::from(&T::DATA_TYPE))),
+            field: Arc::new(Field::new(name, DataType::from_arrow_dtype(&T::DATA_TYPE))),
         }
     }
 
@@ -52,32 +51,12 @@ impl<T: ViewType + ?Sized> BinViewChunkedBuilder<T> {
 impl StringChunkedBuilder {
     pub fn finish(mut self) -> StringChunked {
         let arr = self.chunk_builder.as_box();
-
-        let mut ca = ChunkedArray {
-            field: self.field,
-            chunks: vec![arr],
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: 0,
-            null_count: 0,
-        };
-        ca.compute_len();
-        ca
+        ChunkedArray::new_with_compute_len(self.field, vec![arr])
     }
 }
 impl BinaryChunkedBuilder {
     pub fn finish(mut self) -> BinaryChunked {
         let arr = self.chunk_builder.as_box();
-
-        let mut ca = ChunkedArray {
-            field: self.field,
-            chunks: vec![arr],
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: 0,
-            null_count: 0,
-        };
-        ca.compute_len();
-        ca
+        ChunkedArray::new_with_compute_len(self.field, vec![arr])
     }
 }

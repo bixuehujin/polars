@@ -11,17 +11,11 @@ mod utf8;
 
 use arrow::array::growable::make_growable;
 use arrow::array::*;
-use arrow::datatypes::{ArrowDataType, Field};
+use arrow::datatypes::{ArrowDataType, ExtensionType, Field};
 
 #[test]
 fn test_make_growable() {
     let array = Int32Array::from_slice([1, 2]);
-    make_growable(&[&array], false, 2);
-
-    let array = Utf8Array::<i32>::from_slice(["a", "aa"]);
-    make_growable(&[&array], false, 2);
-
-    let array = Utf8Array::<i64>::from_slice(["a", "aa"]);
     make_growable(&[&array], false, 2);
 
     let array = BinaryArray::<i32>::from_slice([b"a".as_ref(), b"aa".as_ref()]);
@@ -50,26 +44,26 @@ fn test_make_growable_extension() {
     .unwrap();
     make_growable(&[&array], false, 2);
 
-    let data_type =
-        ArrowDataType::Extension("ext".to_owned(), Box::new(ArrowDataType::Int32), None);
-    let array = Int32Array::from_slice([1, 2]).to(data_type.clone());
+    let dtype = ArrowDataType::Extension(Box::new(ExtensionType {
+        name: "ext".into(),
+        inner: ArrowDataType::Int32,
+        metadata: None,
+    }));
+    let array = Int32Array::from_slice([1, 2]).to(dtype.clone());
     let array_grown = make_growable(&[&array], false, 2).as_box();
-    assert_eq!(array_grown.data_type(), &data_type);
+    assert_eq!(array_grown.dtype(), &dtype);
 
-    let data_type = ArrowDataType::Extension(
-        "ext".to_owned(),
-        Box::new(ArrowDataType::Struct(vec![Field::new(
-            "a",
-            ArrowDataType::Int32,
-            false,
-        )])),
-        None,
-    );
+    let dtype = ArrowDataType::Extension(Box::new(ExtensionType {
+        name: "ext".into(),
+        inner: ArrowDataType::Struct(vec![Field::new("a".into(), ArrowDataType::Int32, false)]),
+        metadata: None,
+    }));
     let array = StructArray::new(
-        data_type.clone(),
+        dtype.clone(),
+        2,
         vec![Int32Array::from_slice([1, 2]).boxed()],
         None,
     );
     let array_grown = make_growable(&[&array], false, 2).as_box();
-    assert_eq!(array_grown.data_type(), &data_type);
+    assert_eq!(array_grown.dtype(), &dtype);
 }

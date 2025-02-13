@@ -1,24 +1,11 @@
 use std::fmt::{Debug, Formatter};
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use ahash::RandomState;
 use arrow::array::*;
-#[cfg(any(feature = "serde-lazy", feature = "serde"))]
-use serde::{Deserialize, Serialize};
+use polars_utils::aliases::PlRandomState;
 
 use crate::datatypes::PlHashMap;
 use crate::using_string_cache;
-
-#[derive(Debug, Copy, Clone, PartialEq, Default)]
-#[cfg_attr(
-    any(feature = "serde-lazy", feature = "serde"),
-    derive(Serialize, Deserialize)
-)]
-pub enum CategoricalOrdering {
-    #[default]
-    Physical,
-    Lexical,
-}
 
 #[derive(Clone)]
 pub enum RevMapping {
@@ -76,15 +63,16 @@ impl RevMapping {
 
     fn build_hash(categories: &Utf8ViewArray) -> u128 {
         // TODO! we must also validate the cases of duplicates!
-        let mut hb = RandomState::with_seed(0).build_hasher();
+        let mut hb = PlRandomState::with_seed(0).build_hasher();
         categories.values_iter().for_each(|val| {
             val.hash(&mut hb);
         });
         let hash = hb.finish();
-        (hash as u128) << 64 | (categories.total_bytes_len() as u128)
+        ((hash as u128) << 64) | (categories.total_buffer_len() as u128)
     }
 
     pub fn build_local(categories: Utf8ViewArray) -> Self {
+        debug_assert_eq!(categories.null_count(), 0);
         let hash = Self::build_hash(&categories);
         Self::Local(categories, hash)
     }

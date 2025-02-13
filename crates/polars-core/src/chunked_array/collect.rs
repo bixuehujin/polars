@@ -13,20 +13,22 @@
 use std::sync::Arc;
 
 use arrow::trusted_len::TrustedLen;
+use polars_utils::pl_str::PlSmallStr;
 
 use crate::chunked_array::ChunkedArray;
 use crate::datatypes::{
     ArrayCollectIterExt, ArrayFromIter, ArrayFromIterDtype, DataType, Field, PolarsDataType,
 };
+use crate::prelude::CompatLevel;
 
 pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
     #[inline]
-    fn collect_ca_with_dtype(self, name: &str, dtype: DataType) -> ChunkedArray<T>
+    fn collect_ca_with_dtype(self, name: PlSmallStr, dtype: DataType) -> ChunkedArray<T>
     where
         T::Array: ArrayFromIterDtype<Self::Item>,
     {
         let field = Arc::new(Field::new(name, dtype.clone()));
-        let arr = self.collect_arr_with_dtype(field.dtype.to_arrow(true));
+        let arr = self.collect_arr_with_dtype(field.dtype.to_arrow(CompatLevel::newest()));
         ChunkedArray::from_chunk_iter_and_field(field, [arr])
     }
 
@@ -36,18 +38,18 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         T::Array: ArrayFromIterDtype<Self::Item>,
     {
         let field = Arc::clone(&name_dtype_src.field);
-        let arr = self.collect_arr_with_dtype(field.dtype.to_arrow(true));
+        let arr = self.collect_arr_with_dtype(field.dtype.to_arrow(CompatLevel::newest()));
         ChunkedArray::from_chunk_iter_and_field(field, [arr])
     }
 
     #[inline]
-    fn collect_ca_trusted_with_dtype(self, name: &str, dtype: DataType) -> ChunkedArray<T>
+    fn collect_ca_trusted_with_dtype(self, name: PlSmallStr, dtype: DataType) -> ChunkedArray<T>
     where
         T::Array: ArrayFromIterDtype<Self::Item>,
         Self: TrustedLen,
     {
         let field = Arc::new(Field::new(name, dtype.clone()));
-        let arr = self.collect_arr_trusted_with_dtype(field.dtype.to_arrow(true));
+        let arr = self.collect_arr_trusted_with_dtype(field.dtype.to_arrow(CompatLevel::newest()));
         ChunkedArray::from_chunk_iter_and_field(field, [arr])
     }
 
@@ -58,14 +60,14 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         Self: TrustedLen,
     {
         let field = Arc::clone(&name_dtype_src.field);
-        let arr = self.collect_arr_trusted_with_dtype(field.dtype.to_arrow(true));
+        let arr = self.collect_arr_trusted_with_dtype(field.dtype.to_arrow(CompatLevel::newest()));
         ChunkedArray::from_chunk_iter_and_field(field, [arr])
     }
 
     #[inline]
     fn try_collect_ca_with_dtype<U, E>(
         self,
-        name: &str,
+        name: PlSmallStr,
         dtype: DataType,
     ) -> Result<ChunkedArray<T>, E>
     where
@@ -73,7 +75,7 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         Self: Iterator<Item = Result<U, E>>,
     {
         let field = Arc::new(Field::new(name, dtype.clone()));
-        let arr = self.try_collect_arr_with_dtype(field.dtype.to_arrow(true))?;
+        let arr = self.try_collect_arr_with_dtype(field.dtype.to_arrow(CompatLevel::newest()))?;
         Ok(ChunkedArray::from_chunk_iter_and_field(field, [arr]))
     }
 
@@ -87,14 +89,14 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         Self: Iterator<Item = Result<U, E>>,
     {
         let field = Arc::clone(&name_dtype_src.field);
-        let arr = self.try_collect_arr_with_dtype(field.dtype.to_arrow(true))?;
+        let arr = self.try_collect_arr_with_dtype(field.dtype.to_arrow(CompatLevel::newest()))?;
         Ok(ChunkedArray::from_chunk_iter_and_field(field, [arr]))
     }
 
     #[inline]
     fn try_collect_ca_trusted_with_dtype<U, E>(
         self,
-        name: &str,
+        name: PlSmallStr,
         dtype: DataType,
     ) -> Result<ChunkedArray<T>, E>
     where
@@ -102,7 +104,8 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         Self: Iterator<Item = Result<U, E>> + TrustedLen,
     {
         let field = Arc::new(Field::new(name, dtype.clone()));
-        let arr = self.try_collect_arr_trusted_with_dtype(field.dtype.to_arrow(true))?;
+        let arr =
+            self.try_collect_arr_trusted_with_dtype(field.dtype.to_arrow(CompatLevel::newest()))?;
         Ok(ChunkedArray::from_chunk_iter_and_field(field, [arr]))
     }
 
@@ -116,7 +119,8 @@ pub trait ChunkedCollectIterExt<T: PolarsDataType>: Iterator + Sized {
         Self: Iterator<Item = Result<U, E>> + TrustedLen,
     {
         let field = Arc::clone(&name_dtype_src.field);
-        let arr = self.try_collect_arr_trusted_with_dtype(field.dtype.to_arrow(true))?;
+        let arr =
+            self.try_collect_arr_trusted_with_dtype(field.dtype.to_arrow(CompatLevel::newest()))?;
         Ok(ChunkedArray::from_chunk_iter_and_field(field, [arr]))
     }
 }
@@ -125,7 +129,7 @@ impl<T: PolarsDataType, I: Iterator> ChunkedCollectIterExt<T> for I {}
 
 pub trait ChunkedCollectInferIterExt<T: PolarsDataType>: Iterator + Sized {
     #[inline]
-    fn collect_ca(self, name: &str) -> ChunkedArray<T>
+    fn collect_ca(self, name: PlSmallStr) -> ChunkedArray<T>
     where
         T::Array: ArrayFromIter<Self::Item>,
     {
@@ -135,7 +139,7 @@ pub trait ChunkedCollectInferIterExt<T: PolarsDataType>: Iterator + Sized {
     }
 
     #[inline]
-    fn collect_ca_trusted(self, name: &str) -> ChunkedArray<T>
+    fn collect_ca_trusted(self, name: PlSmallStr) -> ChunkedArray<T>
     where
         T::Array: ArrayFromIter<Self::Item>,
         Self: TrustedLen,
@@ -146,7 +150,7 @@ pub trait ChunkedCollectInferIterExt<T: PolarsDataType>: Iterator + Sized {
     }
 
     #[inline]
-    fn try_collect_ca<U, E>(self, name: &str) -> Result<ChunkedArray<T>, E>
+    fn try_collect_ca<U, E>(self, name: PlSmallStr) -> Result<ChunkedArray<T>, E>
     where
         T::Array: ArrayFromIter<U>,
         Self: Iterator<Item = Result<U, E>>,
@@ -157,7 +161,7 @@ pub trait ChunkedCollectInferIterExt<T: PolarsDataType>: Iterator + Sized {
     }
 
     #[inline]
-    fn try_collect_ca_trusted<U, E>(self, name: &str) -> Result<ChunkedArray<T>, E>
+    fn try_collect_ca_trusted<U, E>(self, name: PlSmallStr) -> Result<ChunkedArray<T>, E>
     where
         T::Array: ArrayFromIter<U>,
         Self: Iterator<Item = Result<U, E>> + TrustedLen,

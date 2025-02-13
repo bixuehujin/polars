@@ -134,7 +134,9 @@ def test_from_dataframe_pyarrow_boolean() -> None:
     result = pl.from_dataframe(df_pa)
     assert_frame_equal(result, df)
 
-    with pytest.raises(RuntimeError, match="Boolean column will be casted to uint8"):
+    # note: pyarrow uses the incorrect form "casted" instead of "cast" in this error.
+    # (in case they fix it in the future, the regex match handles both forms)
+    with pytest.raises(RuntimeError, match="Boolean column will be cast(ed)? to uint8"):
         pl.from_dataframe(df_pa, allow_copy=False)
 
 
@@ -334,6 +336,7 @@ def test_string_column_to_series_no_offsets() -> None:
         _string_column_to_series(col, allow_copy=True)
 
 
+@pytest.mark.usefixtures("test_global_and_local")
 def test_categorical_column_to_series_non_dictionary() -> None:
     s = pl.Series(["a", "b", None, "a"], dtype=pl.Categorical)
 
@@ -406,13 +409,13 @@ def test_construct_offsets_buffer_copy() -> None:
     assert_series_equal(result, expected)
 
 
-@pytest.fixture()
+@pytest.fixture
 def bitmask() -> PolarsBuffer:
     data = pl.Series([False, True, True, False])
     return PolarsBuffer(data)
 
 
-@pytest.fixture()
+@pytest.fixture
 def bytemask() -> PolarsBuffer:
     data = pl.Series([0, 1, 1, 0], dtype=pl.UInt8)
     return PolarsBuffer(data)

@@ -1,18 +1,19 @@
 use arrow::legacy::time_zone::Tz;
 use arrow::trusted_len::TrustedLen;
-use polars_core::export::rayon::prelude::*;
 use polars_core::prelude::*;
 use polars_core::utils::_split_offsets;
 use polars_core::utils::flatten::flatten_par;
 use polars_core::POOL;
-use polars_utils::slice::GetSaferUnchecked;
+use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use strum_macros::IntoStaticStr;
 
 use crate::prelude::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[strum(serialize_all = "snake_case")]
 pub enum ClosedWindow {
     Left,
     Right,
@@ -20,16 +21,18 @@ pub enum ClosedWindow {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[strum(serialize_all = "snake_case")]
 pub enum Label {
     Left,
     Right,
     DataPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoStaticStr)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[strum(serialize_all = "snake_case")]
 pub enum StartBy {
     WindowBound,
     DataPoint,
@@ -124,14 +127,15 @@ fn update_groups_and_bounds(
     }
 }
 
-/// Based on the given `Window`, which has an
+/// Window boundaries are created based on the given `Window`, which is defined by:
 /// - every
 /// - period
 /// - offset
-/// window boundaries are created. And every window boundary we search for the values
-/// that fit that window by the given `ClosedWindow`. The groups are return as `GroupTuples`
-/// together with the lower bound and upper bound timestamps. These timestamps indicate the start (lower)
-/// and end (upper) of the window of that group.
+///
+/// And every window boundary we search for the values that fit that window by the given
+/// `ClosedWindow`. The groups are return as `GroupTuples` together with the lower bound and upper
+/// bound timestamps. These timestamps indicate the start (lower) and end (upper) of the window of
+/// that group.
 ///
 /// If `include_boundaries` is `false` those `lower` and `upper` vectors will be empty.
 #[allow(clippy::too_many_arguments)]
@@ -255,17 +259,26 @@ pub(crate) fn group_by_values_iter_lookbehind(
         0
     };
     let mut end = start;
+    let mut last = time[start_offset];
     Ok(time[start_offset..upper_bound]
         .iter()
         .enumerate()
         .map(move |(mut i, t)| {
+            // Fast path for duplicates.
+            if *t == last && i > 0 {
+                let len = end - start;
+                let offset = start as IdxSize;
+                return Ok((offset, len as IdxSize));
+            }
+            last = *t;
             i += start_offset;
+
             let lower = add(&offset, *t, tz.as_ref())?;
             let upper = *t;
 
             let b = Bounds::new(lower, upper);
 
-            for &t in unsafe { time.get_unchecked_release(start..i) } {
+            for &t in unsafe { time.get_unchecked(start..i) } {
                 if b.is_member_entry(t, closed_window) {
                     break;
                 }
@@ -279,7 +292,7 @@ pub(crate) fn group_by_values_iter_lookbehind(
                 end = std::cmp::max(end, start);
             }
             // we still must loop to consume duplicates
-            for &t in unsafe { time.get_unchecked_release(end..) } {
+            for &t in unsafe { time.get_unchecked(end..) } {
                 if !b.is_member_exit(t, closed_window) {
                     break;
                 }
@@ -313,7 +326,17 @@ pub(crate) fn group_by_values_iter_window_behind_t(
 
     let mut start = 0;
     let mut end = start;
+    let mut last = time[0];
+    let mut started = false;
     time.iter().map(move |lower| {
+        // Fast path for duplicates.
+        if *lower == last && started {
+            let len = end - start;
+            let offset = start as IdxSize;
+            return Ok((offset, len as IdxSize));
+        }
+        last = *lower;
+        started = true;
         let lower = add(&offset, *lower, tz.as_ref())?;
         let upper = add(&period, lower, tz.as_ref())?;
 
@@ -363,7 +386,16 @@ pub(crate) fn group_by_values_iter_partial_lookbehind(
 
     let mut start = 0;
     let mut end = start;
+    let mut last = time[0];
     time.iter().enumerate().map(move |(i, lower)| {
+        // Fast path for duplicates.
+        if *lower == last && i > 0 {
+            let len = end - start;
+            let offset = start as IdxSize;
+            return Ok((offset, len as IdxSize));
+        }
+        last = *lower;
+
         let lower = add(&offset, *lower, tz.as_ref())?;
         let upper = add(&period, lower, tz.as_ref())?;
 
@@ -415,7 +447,18 @@ pub(crate) fn group_by_values_iter_lookahead(
     let mut start = start_offset;
     let mut end = start;
 
+    let mut last = time[start_offset];
+    let mut started = false;
     time[start_offset..upper_bound].iter().map(move |lower| {
+        // Fast path for duplicates.
+        if *lower == last && started {
+            let len = end - start;
+            let offset = start as IdxSize;
+            return Ok((offset, len as IdxSize));
+        }
+        started = true;
+        last = *lower;
+
         let lower = add(&offset, *lower, tz.as_ref())?;
         let upper = add(&period, lower, tz.as_ref())?;
 
@@ -443,7 +486,7 @@ pub(crate) fn group_by_values_iter_lookahead(
     })
 }
 
-#[cfg(feature = "rolling_window")]
+#[cfg(feature = "rolling_window_by")]
 #[inline]
 pub(crate) fn group_by_values_iter(
     period: Duration,
@@ -556,7 +599,9 @@ pub(crate) fn group_by_values_iter_lookahead_collected(
 }
 
 /// Different from `group_by_windows`, where define window buckets and search which values fit that
-/// pre-defined bucket, this function defines every window based on the:
+/// pre-defined bucket.
+///
+/// This function defines every window based on the:
 ///     - timestamp (lower bound)
 ///     - timestamp + period (upper bound)
 /// where timestamps are the individual values in the array `time`
@@ -568,6 +613,10 @@ pub fn group_by_values(
     tu: TimeUnit,
     tz: Option<Tz>,
 ) -> PolarsResult<GroupsSlice> {
+    if time.is_empty() {
+        return Ok(GroupsSlice::from(vec![]));
+    }
+
     let mut thread_offsets = _split_offsets(time.len(), POOL.current_num_threads());
     // there are duplicates in the splits, so we opt for a single partition
     prune_splits_on_duplicates(time, &mut thread_offsets);
@@ -576,7 +625,7 @@ pub fn group_by_values(
     let run_parallel = !POOL.current_thread_has_pending_tasks().unwrap_or(false);
 
     // we have a (partial) lookbehind window
-    if offset.negative {
+    if offset.negative && !offset.is_zero() {
         // lookbehind
         if offset.duration_ns() == period.duration_ns() {
             // t is right at the end of the window
@@ -647,7 +696,7 @@ pub fn group_by_values(
             iter.map(|result| result.map(|(offset, len)| [offset, len]))
                 .collect::<PolarsResult<_>>()
         }
-    } else if offset != Duration::parse("0ns")
+    } else if !offset.is_zero()
         || closed_window == ClosedWindow::Right
         || closed_window == ClosedWindow::None
     {

@@ -4,6 +4,7 @@ use std::ops::Deref;
 
 use polars_error::{polars_bail, polars_err, PolarsError, PolarsResult};
 
+use crate::array::Splitable;
 use crate::buffer::Buffer;
 pub use crate::types::Offset;
 
@@ -146,6 +147,20 @@ impl<O: Offset> Offsets<O> {
     /// This is safe iff the invariants of this struct are guaranteed in `offsets`.
     #[inline]
     pub unsafe fn new_unchecked(offsets: Vec<O>) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            let mut prev_offset = O::default();
+            let mut is_monotonely_increasing = true;
+            for offset in &offsets {
+                is_monotonely_increasing &= *offset >= prev_offset;
+                prev_offset = *offset;
+            }
+            assert!(
+                is_monotonely_increasing,
+                "Unsafe precondition violated. Invariant of offsets broken."
+            );
+        }
+
         Self(offsets)
     }
 
@@ -158,9 +173,18 @@ impl<O: Offset> Offsets<O> {
         }
     }
 
-    /// Returns a range (start, end) corresponding to the position `index`
+    /// Returns a `length` corresponding to the position `index`
     /// # Panic
     /// This function panics iff `index >= self.len()`
+    #[inline]
+    pub fn length_at(&self, index: usize) -> usize {
+        let (start, end) = self.start_end(index);
+        end - start
+    }
+
+    /// Returns a range (start, end) corresponding to the position `index`
+    /// # Panic
+    /// This function panics iff `index >= self.len_proxy()`
     #[inline]
     pub fn start_end(&self, index: usize) -> (usize, usize) {
         // soundness: the invariant of the function
@@ -374,6 +398,11 @@ impl<O: Offset> OffsetsBuffer<O> {
         Self(vec![O::zero()].into())
     }
 
+    #[inline]
+    pub fn one_with_length(length: O) -> Self {
+        Self(vec![O::zero(), length].into())
+    }
+
     /// Copy-on-write API to convert [`OffsetsBuffer`] into [`Offsets`].
     #[inline]
     pub fn into_mut(self) -> either::Either<Self, Offsets<O>> {
@@ -390,7 +419,7 @@ impl<O: Offset> OffsetsBuffer<O> {
         &self.0
     }
 
-    /// Returns the length an array with these offsets would be.
+    /// Returns what the length an array with these offsets would be.
     #[inline]
     pub fn len_proxy(&self) -> usize {
         self.0.len() - 1
@@ -432,9 +461,18 @@ impl<O: Offset> OffsetsBuffer<O> {
         }
     }
 
+    /// Returns a `length` corresponding to the position `index`
+    /// # Panic
+    /// This function panics iff `index >= self.len_proxy()`
+    #[inline]
+    pub fn length_at(&self, index: usize) -> usize {
+        let (start, end) = self.start_end(index);
+        end - start
+    }
+
     /// Returns a range (start, end) corresponding to the position `index`
     /// # Panic
-    /// This function panics iff `index >= self.len()`
+    /// This function panics iff `index >= self.len_proxy()`
     #[inline]
     pub fn start_end(&self, index: usize) -> (usize, usize) {
         // soundness: the invariant of the function
@@ -475,14 +513,69 @@ impl<O: Offset> OffsetsBuffer<O> {
 
     /// Returns an iterator with the lengths of the offsets
     #[inline]
-    pub fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn lengths(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         self.0.windows(2).map(|w| (w[1] - w[0]).to_usize())
+    }
+
+    /// Returns `(offset, len)` pairs.
+    #[inline]
+    pub fn offset_and_length_iter(&self) -> impl ExactSizeIterator<Item = (usize, usize)> + '_ {
+        self.windows(2).map(|x| {
+            let [l, r] = x else { unreachable!() };
+            let l = l.to_usize();
+            let r = r.to_usize();
+            (l, r - l)
+        })
+    }
+
+    /// Offset and length of the primitive (leaf) array for a double+ nested list for every outer
+    /// row.
+    pub fn leaf_ranges_iter(
+        offsets: &[Self],
+    ) -> impl Iterator<Item = core::ops::Range<usize>> + '_ {
+        let others = &offsets[1..];
+
+        offsets[0].windows(2).map(move |x| {
+            let [l, r] = x else { unreachable!() };
+            let mut l = l.to_usize();
+            let mut r = r.to_usize();
+
+            for o in others {
+                let slc = o.as_slice();
+                l = slc[l].to_usize();
+                r = slc[r].to_usize();
+            }
+
+            l..r
+        })
+    }
+
+    /// Return the full range of the leaf array used by the list.
+    pub fn leaf_full_start_end(offsets: &[Self]) -> core::ops::Range<usize> {
+        let mut l = offsets[0].first().to_usize();
+        let mut r = offsets[0].last().to_usize();
+
+        for o in &offsets[1..] {
+            let slc = o.as_slice();
+            l = slc[l].to_usize();
+            r = slc[r].to_usize();
+        }
+
+        l..r
     }
 
     /// Returns the inner [`Buffer`].
     #[inline]
     pub fn into_inner(self) -> Buffer<O> {
         self.0
+    }
+
+    /// Returns the offset difference between `start` and `end`.
+    #[inline]
+    pub fn delta(&self, start: usize, end: usize) -> usize {
+        assert!(start <= end);
+
+        (self.0[end + 1] - self.0[start]).to_usize()
     }
 }
 
@@ -554,5 +647,21 @@ impl<O: Offset> std::ops::Deref for OffsetsBuffer<O> {
     #[inline]
     fn deref(&self) -> &[O] {
         self.0.as_slice()
+    }
+}
+
+impl<O: Offset> Splitable for OffsetsBuffer<O> {
+    fn check_bound(&self, offset: usize) -> bool {
+        offset <= self.len_proxy()
+    }
+
+    unsafe fn _split_at_unchecked(&self, offset: usize) -> (Self, Self) {
+        let mut lhs = self.0.clone();
+        let mut rhs = self.0.clone();
+
+        lhs.slice(0, offset + 1);
+        rhs.slice(offset, self.0.len() - offset);
+
+        (Self(lhs), Self(rhs))
     }
 }

@@ -110,7 +110,7 @@ impl ArrayNameSpace {
             FunctionExpr::ArrayExpr(ArrayFunction::Get(null_on_oob)),
             &[index],
             false,
-            false,
+            None,
         )
     }
 
@@ -122,7 +122,7 @@ impl ArrayNameSpace {
             FunctionExpr::ArrayExpr(ArrayFunction::Join(ignore_nulls)),
             &[separator],
             false,
-            false,
+            None,
         )
     }
 
@@ -135,7 +135,7 @@ impl ArrayNameSpace {
             FunctionExpr::ArrayExpr(ArrayFunction::Contains),
             &[other],
             false,
-            false,
+            None,
         )
     }
 
@@ -144,43 +144,39 @@ impl ArrayNameSpace {
     pub fn count_matches<E: Into<Expr>>(self, element: E) -> Expr {
         let other = element.into();
 
-        self.0
-            .map_many_private(
-                FunctionExpr::ArrayExpr(ArrayFunction::CountMatches),
-                &[other],
-                false,
-                false,
-            )
-            .with_function_options(|mut options| {
-                options.input_wildcard_expansion = true;
-                options
-            })
+        self.0.map_many_private(
+            FunctionExpr::ArrayExpr(ArrayFunction::CountMatches),
+            &[other],
+            false,
+            None,
+        )
     }
 
     #[cfg(feature = "array_to_struct")]
-    pub fn to_struct(self, name_generator: Option<ArrToStructNameGenerator>) -> Expr {
-        self.0
+    pub fn to_struct(self, name_generator: Option<ArrToStructNameGenerator>) -> PolarsResult<Expr> {
+        Ok(self
+            .0
             .map(
                 move |s| {
                     s.array()?
                         .to_struct(name_generator.clone())
-                        .map(|s| Some(s.into_series()))
+                        .map(|s| Some(s.into_column()))
                 },
                 GetOutput::map_dtype(move |dt: &DataType| {
                     let DataType::Array(inner, width) = dt else {
-                        panic!("Only array dtype is expected for `arr.to_struct`.")
+                        polars_bail!(InvalidOperation: "expected Array type, got: {}", dt)
                     };
 
                     let fields = (0..*width)
                         .map(|i| {
                             let name = arr_default_struct_name_gen(i);
-                            Field::from_owned(name, inner.as_ref().clone())
+                            Field::new(name, inner.as_ref().clone())
                         })
                         .collect();
-                    DataType::Struct(fields)
+                    Ok(DataType::Struct(fields))
                 }),
             )
-            .with_fmt("arr.to_struct")
+            .with_fmt("arr.to_struct"))
     }
 
     /// Shift every sub-array.
@@ -189,7 +185,12 @@ impl ArrayNameSpace {
             FunctionExpr::ArrayExpr(ArrayFunction::Shift),
             &[n],
             false,
-            false,
+            None,
         )
+    }
+    /// Returns a column with a separate row for every array element.
+    pub fn explode(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::ArrayExpr(ArrayFunction::Explode))
     }
 }

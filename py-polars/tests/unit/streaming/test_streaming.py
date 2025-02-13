@@ -14,7 +14,7 @@ from polars.exceptions import PolarsInefficientMapWarning
 from polars.testing import assert_frame_equal
 
 if TYPE_CHECKING:
-    from polars.type_aliases import JoinStrategy
+    from polars._typing import JoinStrategy
 
 pytestmark = pytest.mark.xdist_group("streaming")
 
@@ -53,6 +53,7 @@ def test_streaming_block_on_literals_6054() -> None:
     ).sort("col_1").to_dict(as_series=False) == {"col_1": [0, 1], "col_2": [0, 5]}
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_streaming_streamable_functions(monkeypatch: Any, capfd: Any) -> None:
     monkeypatch.setenv("POLARS_VERBOSE", "1")
     assert (
@@ -72,7 +73,8 @@ def test_streaming_streamable_functions(monkeypatch: Any, capfd: Any) -> None:
     assert "df -> function -> ordered_sink" in err
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
+@pytest.mark.may_fail_auto_streaming
 def test_cross_join_stack() -> None:
     a = pl.Series(np.arange(100_000)).to_frame().lazy()
     t0 = time.time()
@@ -115,42 +117,7 @@ def test_streaming_literal_expansion() -> None:
     }
 
 
-def test_tree_validation_streaming() -> None:
-    # this query leads to a tree collection with an invalid branch
-    # this test triggers the tree validation function.
-    df_1 = pl.DataFrame(
-        {
-            "a": [22, 1, 1],
-            "b": [500, 37, 20],
-        },
-    ).lazy()
-
-    df_2 = pl.DataFrame(
-        {"a": [23, 4, 20, 28, 3]},
-    ).lazy()
-
-    dfs = [df_2]
-    cat = pl.concat(dfs, how="vertical")
-
-    df_3 = df_1.select(
-        [
-            "a",
-            # this expression is not allowed streaming, so it invalidates a branch
-            pl.col("b")
-            .filter(pl.col("a").min() > pl.col("a").rank())
-            .alias("b_not_streaming"),
-        ]
-    ).join(
-        cat,
-        on=[
-            "a",
-        ],
-    )
-
-    out = df_1.join(df_3, on="a", how="left")
-    assert out.collect(streaming=True).shape == (3, 3)
-
-
+@pytest.mark.may_fail_auto_streaming
 def test_streaming_apply(monkeypatch: Any, capfd: Any) -> None:
     monkeypatch.setenv("POLARS_VERBOSE", "1")
 
@@ -174,7 +141,7 @@ def test_streaming_ternary() -> None:
             pl.when(pl.col("a") >= 2).then(pl.col("a")).otherwise(None).alias("b"),
         )
         .explain(streaming=True)
-        .startswith("--- STREAMING")
+        .startswith("STREAMING")
     )
 
 
@@ -197,8 +164,8 @@ def test_streaming_sortedness_propagation_9494() -> None:
     }
 
 
-@pytest.mark.write_disk()
-@pytest.mark.slow()
+@pytest.mark.write_disk
+@pytest.mark.slow
 def test_streaming_generic_left_and_inner_join_from_disk(tmp_path: Path) -> None:
     tmp_path.mkdir(exist_ok=True)
     p0 = tmp_path / "df0.parquet"
@@ -224,7 +191,11 @@ def test_streaming_generic_left_and_inner_join_from_disk(tmp_path: Path) -> None
     join_strategies: list[JoinStrategy] = ["left", "inner"]
     for how in join_strategies:
         q = lf0.join(lf1, left_on="id", right_on="id_r", how=how)
-        assert_frame_equal(q.collect(streaming=True), q.collect(streaming=False))
+        assert_frame_equal(
+            q.collect(streaming=True),
+            q.collect(streaming=False),
+            check_row_order=how == "left",
+        )
 
 
 def test_streaming_9776() -> None:
@@ -244,7 +215,7 @@ def test_streaming_9776() -> None:
     assert unordered.sort(["col_1", "ID"]).rows() == expected
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_stream_empty_file(tmp_path: Path) -> None:
     p = tmp_path / "in.parquet"
     schema = {
@@ -281,7 +252,7 @@ def test_streaming_empty_df() -> None:
 
 def test_streaming_duplicate_cols_5537() -> None:
     assert pl.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]}).lazy().with_columns(
-        [(pl.col("a") * 2).alias("foo"), (pl.col("a") * 3)]
+        (pl.col("a") * 2).alias("foo"), (pl.col("a") * 3)
     ).collect(streaming=True).to_dict(as_series=False) == {
         "a": [3, 6, 9],
         "b": [1, 2, 3],
@@ -315,22 +286,12 @@ def test_boolean_agg_schema() -> None:
     for streaming in [True, False]:
         assert (
             agg_df.collect(streaming=streaming).schema
-            == agg_df.schema
+            == agg_df.collect_schema()
             == {"x": pl.Int64, "max_y": pl.Boolean}
         )
 
 
-def test_streaming_11219() -> None:
-    lf = pl.LazyFrame({"a": [1, 2, 3], "b": ["a", "c", None]})
-    lf_other = pl.LazyFrame({"c": ["foo", "ham"]})
-    lf_other2 = pl.LazyFrame({"c": ["foo", "ham"]})
-
-    assert lf.with_context([lf_other, lf_other2]).select(
-        pl.col("b") + pl.col("c").first()
-    ).collect(streaming=True).to_dict(as_series=False) == {"b": ["afoo", "cfoo", None]}
-
-
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_streaming_csv_headers_but_no_data_13770(tmp_path: Path) -> None:
     with Path.open(tmp_path / "header_no_data.csv", "w") as f:
         f.write("name, age\n")
@@ -341,11 +302,11 @@ def test_streaming_csv_headers_but_no_data_13770(tmp_path: Path) -> None:
         .head()
         .collect(streaming=True)
     )
-    assert len(df) == 0
+    assert df.height == 0
     assert df.schema == schema
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_custom_temp_dir(tmp_path: Path, monkeypatch: Any) -> None:
     tmp_path.mkdir(exist_ok=True)
     monkeypatch.setenv("POLARS_TEMP_DIR", str(tmp_path))
@@ -359,7 +320,7 @@ def test_custom_temp_dir(tmp_path: Path, monkeypatch: Any) -> None:
     assert os.listdir(tmp_path), f"Temp directory '{tmp_path}' is empty"
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_streaming_with_hconcat(tmp_path: Path) -> None:
     df1 = pl.DataFrame(
         {
@@ -392,9 +353,9 @@ def test_streaming_with_hconcat(tmp_path: Path) -> None:
     # doesn't yet support streaming.
     for i, line in enumerate(plan_lines):
         if line.startswith("PLAN"):
-            assert plan_lines[i + 1].startswith(
-                "--- STREAMING"
-            ), f"{line} does not contain a streaming section"
+            assert plan_lines[i + 1].startswith("STREAMING"), (
+                f"{line} does not contain a streaming section"
+            )
 
     result = query.collect(streaming=True)
 
@@ -407,3 +368,38 @@ def test_streaming_with_hconcat(tmp_path: Path) -> None:
     )
 
     assert_frame_equal(result, expected)
+
+
+@pytest.mark.write_disk
+def test_elementwise_identification_in_ternary_15767(tmp_path: Path) -> None:
+    tmp_path.mkdir(exist_ok=True)
+
+    (
+        pl.LazyFrame({"a": pl.Series([1])})
+        .with_columns(b=pl.col("a").is_in(pl.Series([1, 2, 3])))
+        .sink_parquet(tmp_path / "1")
+    )
+
+    (
+        pl.LazyFrame({"a": pl.Series([1])})
+        .with_columns(
+            b=pl.when(pl.col("a").is_in(pl.Series([1, 2, 3]))).then(pl.col("a"))
+        )
+        .sink_parquet(tmp_path / "1")
+    )
+
+
+def test_streaming_temporal_17669() -> None:
+    df = (
+        pl.LazyFrame({"a": [1, 2, 3]}, schema={"a": pl.Datetime("us")})
+        .with_columns(
+            b=pl.col("a").dt.date(),
+            c=pl.col("a").dt.time(),
+        )
+        .collect(streaming=True)
+    )
+    assert df.schema == {
+        "a": pl.Datetime("us"),
+        "b": pl.Date,
+        "c": pl.Time,
+    }

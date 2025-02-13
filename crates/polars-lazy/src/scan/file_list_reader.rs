@@ -1,32 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use polars_core::error::to_compute_err;
 use polars_core::prelude::*;
 use polars_io::cloud::CloudOptions;
-use polars_io::{is_cloud_url, RowIndex};
+use polars_io::RowIndex;
+use polars_plan::prelude::UnionArgs;
 
 use crate::prelude::*;
-
-pub type PathIterator = Box<dyn Iterator<Item = PolarsResult<PathBuf>>>;
-
-// cloud_options is used only with async feature
-#[allow(unused_variables)]
-fn polars_glob(pattern: &str, cloud_options: Option<&CloudOptions>) -> PolarsResult<PathIterator> {
-    if is_cloud_url(pattern) {
-        #[cfg(feature = "async")]
-        {
-            let paths = polars_io::async_glob(pattern, cloud_options)?;
-            Ok(Box::new(paths.into_iter().map(|a| Ok(PathBuf::from(&a)))))
-        }
-        #[cfg(not(feature = "async"))]
-        panic!("Feature `async` must be enabled to use globbing patterns with cloud urls.")
-    } else {
-        let paths = glob::glob(pattern)
-            .map_err(|_| polars_err!(ComputeError: "invalid glob pattern given"))?;
-        let paths = paths.map(|v| v.map_err(to_compute_err));
-        Ok(Box::new(paths))
-    }
-}
 
 /// Reads [LazyFrame] from a filesystem or a cloud storage.
 /// Supports glob patterns.
@@ -35,43 +15,47 @@ fn polars_glob(pattern: &str, cloud_options: Option<&CloudOptions>) -> PolarsRes
 pub trait LazyFileListReader: Clone {
     /// Get the final [LazyFrame].
     fn finish(self) -> PolarsResult<LazyFrame> {
-        if let Some(paths) = self.iter_paths()? {
-            let lfs = paths
-                .map(|r| {
-                    let path = r?;
-                    self.clone()
-                        // Each individual reader should not apply a row limit.
-                        .with_n_rows(None)
-                        // Each individual reader should not apply a row index.
-                        .with_row_index(None)
-                        .with_path(path.clone())
-                        .with_rechunk(false)
-                        .finish_no_glob()
-                        .map_err(|e| {
-                            polars_err!(
-                                ComputeError: "error while reading {}: {}", path.display(), e
-                            )
-                        })
-                })
-                .collect::<PolarsResult<Vec<_>>>()?;
-
-            polars_ensure!(
-                !lfs.is_empty(),
-                ComputeError: "no matching files found in {}", self.path().display()
-            );
-
-            let mut lf = self.concat_impl(lfs)?;
-            if let Some(n_rows) = self.n_rows() {
-                lf = lf.slice(0, n_rows as IdxSize)
-            };
-            if let Some(rc) = self.row_index() {
-                lf = lf.with_row_index(&rc.name, Some(rc.offset))
-            };
-
-            Ok(lf)
-        } else {
-            self.finish_no_glob()
+        if !self.glob() {
+            return self.finish_no_glob();
         }
+
+        let ScanSources::Paths(paths) = self.sources() else {
+            unreachable!("opened-files or in-memory buffers should never be globbed");
+        };
+
+        let lfs = paths
+            .iter()
+            .map(|path| {
+                self.clone()
+                    // Each individual reader should not apply a row limit.
+                    .with_n_rows(None)
+                    // Each individual reader should not apply a row index.
+                    .with_row_index(None)
+                    .with_paths([path.clone()].into())
+                    .with_rechunk(false)
+                    .finish_no_glob()
+                    .map_err(|e| {
+                        polars_err!(
+                            ComputeError: "error while reading {}: {}", path.display(), e
+                        )
+                    })
+            })
+            .collect::<PolarsResult<Vec<_>>>()?;
+
+        polars_ensure!(
+            !lfs.is_empty(),
+            ComputeError: "no matching files found in {:?}", paths.iter().map(|x| x.to_str().unwrap()).collect::<Vec<_>>()
+        );
+
+        let mut lf = self.concat_impl(lfs)?;
+        if let Some(n_rows) = self.n_rows() {
+            lf = lf.slice(0, n_rows as IdxSize)
+        };
+        if let Some(rc) = self.row_index() {
+            lf = lf.with_row_index(rc.name.clone(), Some(rc.offset))
+        };
+
+        Ok(lf)
     }
 
     /// Recommended concatenation of [LazyFrame]s from many input files.
@@ -79,7 +63,14 @@ pub trait LazyFileListReader: Clone {
     /// This method should not take into consideration [LazyFileListReader::n_rows]
     /// nor [LazyFileListReader::row_index].
     fn concat_impl(&self, lfs: Vec<LazyFrame>) -> PolarsResult<LazyFrame> {
-        concat_impl(&lfs, self.rechunk(), true, true, false)
+        let args = UnionArgs {
+            rechunk: self.rechunk(),
+            parallel: true,
+            to_supertypes: false,
+            from_partitioned_ds: true,
+            ..Default::default()
+        };
+        concat_impl(&lfs, args)
     }
 
     /// Get the final [LazyFrame].
@@ -88,21 +79,22 @@ pub trait LazyFileListReader: Clone {
     /// It is recommended to always use [LazyFileListReader::finish] method.
     fn finish_no_glob(self) -> PolarsResult<LazyFrame>;
 
-    /// Path of the scanned file.
-    /// It can be potentially a glob pattern.
-    fn path(&self) -> &Path;
+    fn glob(&self) -> bool {
+        true
+    }
 
-    fn paths(&self) -> &[PathBuf];
+    /// Get the sources for this reader.
+    fn sources(&self) -> &ScanSources;
 
-    /// Set path of the scanned file.
-    /// Support glob patterns.
+    /// Set sources of the scanned files.
     #[must_use]
-    fn with_path(self, path: PathBuf) -> Self;
+    fn with_sources(self, source: ScanSources) -> Self;
 
     /// Set paths of the scanned files.
-    /// Doesn't glob patterns.
     #[must_use]
-    fn with_paths(self, paths: Arc<[PathBuf]>) -> Self;
+    fn with_paths(self, paths: Arc<[PathBuf]>) -> Self {
+        self.with_sources(ScanSources::Paths(paths))
+    }
 
     /// Configure the row limit.
     fn with_n_rows(self, n_rows: impl Into<Option<usize>>) -> Self;
@@ -127,25 +119,5 @@ pub trait LazyFileListReader: Clone {
     /// [CloudOptions] used to list files.
     fn cloud_options(&self) -> Option<&CloudOptions> {
         None
-    }
-
-    /// Get list of files referenced by this reader.
-    ///
-    /// Returns [None] if path is not a glob pattern.
-    fn iter_paths(&self) -> PolarsResult<Option<PathIterator>> {
-        let paths = self.paths();
-        if paths.is_empty() {
-            let path_str = self.path().to_string_lossy();
-            if path_str.contains('*') || path_str.contains('?') || path_str.contains('[') {
-                polars_glob(&path_str, self.cloud_options()).map(Some)
-            } else {
-                Ok(None)
-            }
-        } else {
-            polars_ensure!(self.path().to_string_lossy() == "", InvalidOperation: "expected only a single path argument");
-            // Lint is incorrect as we need static lifetime.
-            #[allow(clippy::unnecessary_to_owned)]
-            Ok(Some(Box::new(paths.to_vec().into_iter().map(Ok))))
-        }
     }
 }

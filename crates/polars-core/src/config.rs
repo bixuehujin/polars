@@ -29,17 +29,25 @@ pub(crate) const FMT_TABLE_INLINE_COLUMN_DATA_TYPE: &str =
 pub(crate) const FMT_TABLE_ROUNDED_CORNERS: &str = "POLARS_FMT_TABLE_ROUNDED_CORNERS";
 pub(crate) const FMT_TABLE_CELL_LIST_LEN: &str = "POLARS_FMT_TABLE_CELL_LIST_LEN";
 
-// Other env vars
-#[cfg(all(feature = "dtype-decimal", feature = "python"))]
-pub(crate) const DECIMAL_ACTIVE: &str = "POLARS_ACTIVATE_DECIMAL";
-
-#[cfg(all(feature = "dtype-decimal", feature = "python"))]
-pub(crate) fn decimal_is_active() -> bool {
-    std::env::var(DECIMAL_ACTIVE).as_deref().unwrap_or("") == "1"
-}
-
 pub fn verbose() -> bool {
     std::env::var("POLARS_VERBOSE").as_deref().unwrap_or("") == "1"
+}
+
+/// Prints a log message if sensitive verbose logging has been enabled.
+pub fn verbose_print_sensitive<F: Fn() -> String>(create_log_message: F) {
+    fn do_log(create_log_message: &dyn Fn() -> String) {
+        if std::env::var("POLARS_VERBOSE_SENSITIVE")
+            .as_deref()
+            .unwrap_or("")
+            == "1"
+        {
+            // Force the message to be a single line.
+            let msg = create_log_message().replace('\n', "");
+            eprintln!("[SENSITIVE]: {}", msg)
+        }
+    }
+
+    do_log(&create_log_message)
 }
 
 pub fn get_file_prefetch_size() -> usize {

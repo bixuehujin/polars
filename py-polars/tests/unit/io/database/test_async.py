@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from math import ceil
-from typing import TYPE_CHECKING, Any, Iterable, overload
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, overload
 
 import pytest
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+import sqlalchemy
+from sqlalchemy.ext.asyncio import create_async_engine
 
 import polars as pl
+from polars._utils.various import parse_version
 from polars.testing import assert_frame_equal
+from tests.unit.conftest import mock_module_import
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
 SURREAL_MOCK_DATA: list[dict[str, Any]] = [
@@ -48,7 +53,7 @@ class MockSurrealConnection:
         await self.connect()
         return self
 
-    async def __aexit__(self, *args: Any, **kwargs: Any) -> None:
+    async def __aexit__(self, *args: object, **kwargs: Any) -> None:
         await self.close()
 
     async def close(self) -> None:
@@ -61,18 +66,30 @@ class MockSurrealConnection:
         pass
 
     async def query(
-        self, sql: str, vars: dict[str, Any] | None = None
+        self, query: str, variables: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         return [{"result": self._mock_data, "status": "OK", "time": "32.083µs"}]
 
 
+class MockedSurrealModule(ModuleType):
+    """Mock SurrealDB module; enables internal `isinstance` check for AsyncSurrealDB."""
+
+    AsyncSurrealDB = MockSurrealConnection
+
+
+@pytest.mark.skipif(
+    parse_version(sqlalchemy.__version__) < (2, 0),
+    reason="SQLAlchemy 2.0+ required for async tests",
+)
 def test_read_async(tmp_sqlite_db: Path) -> None:
     # confirm that we can load frame data from the core sqlalchemy async
     # primitives: AsyncConnection, AsyncEngine, and async_sessionmaker
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     async_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_sqlite_db}")
     async_connection = async_engine.connect()
     async_session = async_sessionmaker(async_engine)
+    async_session_inst = async_session()
 
     expected_frame = pl.DataFrame(
         {"id": [2, 1], "name": ["other", "misc"], "value": [-99.5, 100.0]}
@@ -82,8 +99,9 @@ def test_read_async(tmp_sqlite_db: Path) -> None:
         async_engine,
         async_connection,
         async_session,
+        async_session_inst,
     ):
-        if async_conn is async_session:
+        if async_conn in (async_session, async_session_inst):
             constraint, execute_opts = "", {}
         else:
             constraint = "WHERE value > :n"
@@ -109,11 +127,12 @@ async def _nested_async_test(tmp_sqlite_db: Path) -> pl.DataFrame:
     )
 
 
+@pytest.mark.skipif(
+    parse_version(sqlalchemy.__version__) < (2, 0),
+    reason="SQLAlchemy 2.0+ required for async tests",
+)
 def test_read_async_nested(tmp_sqlite_db: Path) -> None:
-    # this tests validates that we can handle nested async calls. without
-    # the nested asyncio handling provided by `nest_asyncio` this test
-    # would raise a RuntimeError
-
+    # This tests validates that we can handle nested async calls
     expected_frame = pl.DataFrame({"id": [1, 2], "name": ["misc", "other"]})
     df = asyncio.run(_nested_async_test(tmp_sqlite_db))
     assert_frame_equal(expected_frame, df)
@@ -148,18 +167,19 @@ async def _surreal_query_as_frame(
 
 @pytest.mark.parametrize("batch_size", [None, 1, 2, 3, 4])
 def test_surrealdb_fetchall(batch_size: int | None) -> None:
-    df_expected = pl.DataFrame(SURREAL_MOCK_DATA)
-    res = asyncio.run(
-        _surreal_query_as_frame(
-            url="ws://localhost:8000/rpc",
-            query="SELECT * FROM item",
-            batch_size=batch_size,
+    with mock_module_import("surrealdb", MockedSurrealModule("surrealdb")):
+        df_expected = pl.DataFrame(SURREAL_MOCK_DATA)
+        res = asyncio.run(
+            _surreal_query_as_frame(
+                url="ws://localhost:8000/rpc",
+                query="SELECT * FROM item",
+                batch_size=batch_size,
+            )
         )
-    )
-    if batch_size:
-        frames = list(res)  # type: ignore[call-overload]
-        n_mock_rows = len(SURREAL_MOCK_DATA)
-        assert len(frames) == ceil(n_mock_rows / batch_size)
-        assert_frame_equal(df_expected[:batch_size], frames[0])
-    else:
-        assert_frame_equal(df_expected, res)  # type: ignore[arg-type]
+        if batch_size:
+            frames = list(res)  # type: ignore[call-overload]
+            n_mock_rows = len(SURREAL_MOCK_DATA)
+            assert len(frames) == ceil(n_mock_rows / batch_size)
+            assert_frame_equal(df_expected[:batch_size], frames[0])
+        else:
+            assert_frame_equal(df_expected, res)  # type: ignore[arg-type]

@@ -1,16 +1,16 @@
 use arrow::legacy::time_zone::Tz;
 use arrow::legacy::utils::CustomIterTools;
-use polars_core::export::rayon::prelude::*;
 use polars_core::prelude::*;
 use polars_core::series::IsSorted;
-use polars_core::utils::ensure_sorted_arg;
 use polars_core::utils::flatten::flatten_par;
 use polars_core::POOL;
+use polars_ops::series::SeriesMethods;
 use polars_utils::idx_vec::IdxVec;
-use polars_utils::slice::{GetSaferUnchecked, SortedSlice};
+use polars_utils::pl_str::PlSmallStr;
+use polars_utils::slice::SortedSlice;
+use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use smartstring::alias::String as SmartString;
 
 use crate::prelude::*;
 
@@ -21,7 +21,7 @@ struct Wrap<T>(pub T);
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DynamicGroupOptions {
     /// Time or index column.
-    pub index_column: SmartString,
+    pub index_column: PlSmallStr,
     /// Start a window at this interval.
     pub every: Duration,
     /// Window duration.
@@ -34,9 +34,6 @@ pub struct DynamicGroupOptions {
     pub include_boundaries: bool,
     pub closed_window: ClosedWindow,
     pub start_by: StartBy,
-    /// In cases sortedness cannot be checked by the sorted flag,
-    /// traverse the data to check sortedness.
-    pub check_sorted: bool,
 }
 
 impl Default for DynamicGroupOptions {
@@ -50,7 +47,6 @@ impl Default for DynamicGroupOptions {
             include_boundaries: false,
             closed_window: ClosedWindow::Left,
             start_by: Default::default(),
-            check_sorted: true,
         }
     }
 }
@@ -59,14 +55,11 @@ impl Default for DynamicGroupOptions {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RollingGroupOptions {
     /// Time or index column.
-    pub index_column: SmartString,
+    pub index_column: PlSmallStr,
     /// Window duration.
     pub period: Duration,
     pub offset: Duration,
     pub closed_window: ClosedWindow,
-    /// In cases sortedness cannot be checked by the sorted flag,
-    /// traverse the data to check sortedness.
-    pub check_sorted: bool,
 }
 
 impl Default for RollingGroupOptions {
@@ -76,7 +69,6 @@ impl Default for RollingGroupOptions {
             period: Duration::new(1),
             offset: Duration::new(1),
             closed_window: ClosedWindow::Left,
-            check_sorted: true,
         }
     }
 }
@@ -92,31 +84,31 @@ const UP_NAME: &str = "_upper_boundary";
 pub trait PolarsTemporalGroupby {
     fn rolling(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &RollingGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)>;
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)>;
 
     fn group_by_dynamic(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &DynamicGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)>;
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)>;
 }
 
 impl PolarsTemporalGroupby for DataFrame {
     fn rolling(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &RollingGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         Wrap(self).rolling(group_by, options)
     }
 
     fn group_by_dynamic(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &DynamicGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         Wrap(self).group_by_dynamic(group_by, options)
     }
 }
@@ -124,26 +116,28 @@ impl PolarsTemporalGroupby for DataFrame {
 impl Wrap<&DataFrame> {
     fn rolling(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &RollingGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         polars_ensure!(
-                        options.period.duration_ns() > 0 && !options.period.negative,
+                        !options.period.is_zero() && !options.period.negative,
                         ComputeError:
                         "rolling window period should be strictly positive",
         );
         let time = self.0.column(&options.index_column)?.clone();
-        if group_by.is_empty() && options.check_sorted {
+        if group_by.is_empty() {
             // If by is given, the column must be sorted in the 'by' arg, which we can not check now
             // this will be checked when the groups are materialized.
-            ensure_sorted_arg(&time, "rolling")?;
+            time.as_materialized_series().ensure_sorted_arg("rolling")?;
         }
         let time_type = time.dtype();
 
         polars_ensure!(time.null_count() == 0, ComputeError: "null values in `rolling` not supported, fill nulls.");
+        ensure_duration_matches_dtype(options.period, time_type, "period")?;
+        ensure_duration_matches_dtype(options.offset, time_type, "offset")?;
 
         use DataType::*;
-        let (dt, tu, tz): (Series, TimeUnit, Option<TimeZone>) = match time_type {
+        let (dt, tu, tz): (Column, TimeUnit, Option<TimeZone>) = match time_type {
             Datetime(tu, tz) => (time.clone(), *tu, tz.clone()),
             Date => (
                 time.cast(&Datetime(TimeUnit::Milliseconds, None))?,
@@ -196,27 +190,22 @@ impl Wrap<&DataFrame> {
     /// Returns: time_keys, keys, groupsproxy.
     fn group_by_dynamic(
         &self,
-        group_by: Vec<Series>,
+        group_by: Vec<Column>,
         options: &DynamicGroupOptions,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
-        if options.offset.parsed_int || options.every.parsed_int || options.period.parsed_int {
-            polars_ensure!(
-                ((options.offset.parsed_int || options.offset.is_zero())
-                    && (options.every.parsed_int || options.every.is_zero())
-                    && (options.period.parsed_int || options.period.is_zero())),
-                ComputeError: "you cannot combine time durations like '2h' with integer durations like '3i'"
-            )
-        }
-
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         let time = self.0.column(&options.index_column)?.rechunk();
-        if group_by.is_empty() && options.check_sorted {
+        if group_by.is_empty() {
             // If by is given, the column must be sorted in the 'by' arg, which we can not check now
             // this will be checked when the groups are materialized.
-            ensure_sorted_arg(&time, "group_by_dynamic")?;
+            time.as_materialized_series()
+                .ensure_sorted_arg("group_by_dynamic")?;
         }
         let time_type = time.dtype();
 
         polars_ensure!(time.null_count() == 0, ComputeError: "null values in dynamic group_by not supported, fill nulls.");
+        ensure_duration_matches_dtype(options.every, time_type, "every")?;
+        ensure_duration_matches_dtype(options.offset, time_type, "offset")?;
+        ensure_duration_matches_dtype(options.period, time_type, "period")?;
 
         use DataType::*;
         let (dt, tu) = match time_type {
@@ -237,7 +226,7 @@ impl Wrap<&DataFrame> {
                 )?;
                 let out = out.cast(&Int64).unwrap().cast(&Int32).unwrap();
                 for k in &mut keys {
-                    if k.name() == UP_NAME || k.name() == LB_NAME {
+                    if k.name().as_str() == UP_NAME || k.name().as_str() == LB_NAME {
                         *k = k.cast(&Int64).unwrap().cast(&Int32).unwrap()
                     }
                 }
@@ -255,7 +244,7 @@ impl Wrap<&DataFrame> {
                 )?;
                 let out = out.cast(&Int64).unwrap();
                 for k in &mut keys {
-                    if k.name() == UP_NAME || k.name() == LB_NAME {
+                    if k.name().as_str() == UP_NAME || k.name().as_str() == LB_NAME {
                         *k = k.cast(&Int64).unwrap()
                     }
                 }
@@ -272,15 +261,15 @@ impl Wrap<&DataFrame> {
 
     fn impl_group_by_dynamic(
         &self,
-        mut dt: Series,
-        mut by: Vec<Series>,
+        mut dt: Column,
+        mut by: Vec<Column>,
         options: &DynamicGroupOptions,
         tu: TimeUnit,
         time_type: &DataType,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         polars_ensure!(!options.every.negative, ComputeError: "'every' argument must be positive");
         if dt.is_empty() {
-            return dt.cast(time_type).map(|s| (s, by, GroupsProxy::default()));
+            return dt.cast(time_type).map(|s| (s, by, Default::default()));
         }
 
         // A requirement for the index so we can set this such that downstream code has this info.
@@ -333,7 +322,7 @@ impl Wrap<&DataFrame> {
                 options.start_by,
             );
             update_bounds(lower, upper);
-            PolarsResult::Ok(GroupsProxy::Slice {
+            PolarsResult::Ok(GroupsType::Slice {
                 groups,
                 rolling: false,
             })
@@ -345,17 +334,15 @@ impl Wrap<&DataFrame> {
 
             // Include boundaries cannot be parallel (easily).
             if include_lower_bound | include_upper_bound {
-                POOL.install(|| match groups {
-                    GroupsProxy::Idx(groups) => {
+                POOL.install(|| match groups.as_ref() {
+                    GroupsType::Idx(groups) => {
                         let ir = groups
                             .par_iter()
                             .map(|base_g| {
                                 let dt = unsafe { dt.take_unchecked(base_g.1) };
                                 let vals = dt.downcast_iter().next().unwrap();
                                 let ts = vals.values().as_slice();
-                                if options.check_sorted
-                                    && !matches!(dt.is_sorted_flag(), IsSorted::Ascending)
-                                {
+                                if !matches!(dt.is_sorted_flag(), IsSorted::Ascending) {
                                     check_sortedness_slice(ts)?
                                 }
                                 let (sub_groups, lower, upper) = group_by_windows(
@@ -383,9 +370,9 @@ impl Wrap<&DataFrame> {
                         });
 
                         // then parallelize the flatten in the `from` impl
-                        Ok(GroupsProxy::Idx(GroupsIdx::from(groups)))
+                        Ok(GroupsType::Idx(GroupsIdx::from(groups)))
                     },
-                    GroupsProxy::Slice { groups, .. } => {
+                    GroupsType::Slice { groups, .. } => {
                         let mut ir = groups
                             .par_iter()
                             .map(|base_g| {
@@ -417,24 +404,22 @@ impl Wrap<&DataFrame> {
                         let mut groups = Vec::with_capacity(capacity);
                         ir.iter().for_each(|(_, _, g)| groups.extend_from_slice(g));
 
-                        Ok(GroupsProxy::Slice {
+                        Ok(GroupsType::Slice {
                             groups,
                             rolling: false,
                         })
                     },
                 })
             } else {
-                POOL.install(|| match groups {
-                    GroupsProxy::Idx(groups) => {
+                POOL.install(|| match groups.as_ref() {
+                    GroupsType::Idx(groups) => {
                         let groupsidx = groups
                             .par_iter()
                             .map(|base_g| {
                                 let dt = unsafe { dt.take_unchecked(base_g.1) };
                                 let vals = dt.downcast_iter().next().unwrap();
                                 let ts = vals.values().as_slice();
-                                if options.check_sorted
-                                    && !matches!(dt.is_sorted_flag(), IsSorted::Ascending)
-                                {
+                                if !matches!(dt.is_sorted_flag(), IsSorted::Ascending) {
                                     check_sortedness_slice(ts)?
                                 }
                                 let (sub_groups, _, _) = group_by_windows(
@@ -450,9 +435,9 @@ impl Wrap<&DataFrame> {
                                 Ok(update_subgroups_idx(&sub_groups, base_g))
                             })
                             .collect::<PolarsResult<Vec<_>>>()?;
-                        Ok(GroupsProxy::Idx(GroupsIdx::from(groupsidx)))
+                        Ok(GroupsType::Idx(GroupsIdx::from(groupsidx)))
                     },
-                    GroupsProxy::Slice { groups, .. } => {
+                    GroupsType::Slice { groups, .. } => {
                         let groups = groups
                             .par_iter()
                             .map(|base_g| {
@@ -475,7 +460,7 @@ impl Wrap<&DataFrame> {
 
                         let groups = flatten_par(&groups);
 
-                        Ok(GroupsProxy::Slice {
+                        Ok(GroupsType::Slice {
                             groups,
                             rolling: false,
                         })
@@ -492,21 +477,23 @@ impl Wrap<&DataFrame> {
             *key = unsafe { key.agg_first(&groups) };
         }
 
-        let lower = lower_bound.map(|lower| Int64Chunked::new_vec(LB_NAME, lower));
-        let upper = upper_bound.map(|upper| Int64Chunked::new_vec(UP_NAME, upper));
+        let lower =
+            lower_bound.map(|lower| Int64Chunked::new_vec(PlSmallStr::from_static(LB_NAME), lower));
+        let upper =
+            upper_bound.map(|upper| Int64Chunked::new_vec(PlSmallStr::from_static(UP_NAME), upper));
 
         if options.label == Label::Left {
             let mut lower = lower.clone().unwrap();
             if by.is_empty() {
                 lower.set_sorted_flag(IsSorted::Ascending)
             }
-            dt = lower.with_name(dt.name());
+            dt = lower.with_name(dt.name().clone());
         } else if options.label == Label::Right {
             let mut upper = upper.clone().unwrap();
             if by.is_empty() {
                 upper.set_sorted_flag(IsSorted::Ascending)
             }
-            dt = upper.with_name(dt.name());
+            dt = upper.with_name(dt.name().clone());
         }
 
         if let (true, Some(mut lower), Some(mut upper)) = (options.include_boundaries, lower, upper)
@@ -515,26 +502,26 @@ impl Wrap<&DataFrame> {
                 lower.set_sorted_flag(IsSorted::Ascending);
                 upper.set_sorted_flag(IsSorted::Ascending);
             }
-            by.push(lower.into_datetime(tu, tz.clone()).into_series());
-            by.push(upper.into_datetime(tu, tz.clone()).into_series());
+            by.push(lower.into_datetime(tu, tz.clone()).into_column());
+            by.push(upper.into_datetime(tu, tz.clone()).into_column());
         }
 
         dt.into_datetime(tu, None)
-            .into_series()
+            .into_column()
             .cast(time_type)
-            .map(|s| (s, by, groups))
+            .map(|s| (s, by, groups.into_sliceable()))
     }
 
     /// Returns: time_keys, keys, groupsproxy
     fn impl_rolling(
         &self,
-        dt: Series,
-        group_by: Vec<Series>,
+        dt: Column,
+        group_by: Vec<Column>,
         options: &RollingGroupOptions,
         tu: TimeUnit,
         tz: Option<Tz>,
         time_type: &DataType,
-    ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+    ) -> PolarsResult<(Column, Vec<Column>, GroupPositions)> {
         let mut dt = dt.rechunk();
 
         let groups = if group_by.is_empty() {
@@ -544,7 +531,7 @@ impl Wrap<&DataFrame> {
             let dt = dt.datetime().unwrap();
             let vals = dt.downcast_iter().next().unwrap();
             let ts = vals.values().as_slice();
-            PolarsResult::Ok(GroupsProxy::Slice {
+            PolarsResult::Ok(GroupsType::Slice {
                 groups: group_by_values(
                     options.period,
                     options.offset,
@@ -569,17 +556,15 @@ impl Wrap<&DataFrame> {
 
             // continue determining the rolling indexes.
 
-            POOL.install(|| match groups {
-                GroupsProxy::Idx(groups) => {
+            POOL.install(|| match groups.as_ref() {
+                GroupsType::Idx(groups) => {
                     let idx = groups
                         .par_iter()
                         .map(|base_g| {
                             let dt = unsafe { dt_local.take_unchecked(base_g.1) };
                             let vals = dt.downcast_iter().next().unwrap();
                             let ts = vals.values().as_slice();
-                            if options.check_sorted
-                                && !matches!(dt.is_sorted_flag(), IsSorted::Ascending)
-                            {
+                            if !matches!(dt.is_sorted_flag(), IsSorted::Ascending) {
                                 check_sortedness_slice(ts)?
                             }
 
@@ -595,9 +580,9 @@ impl Wrap<&DataFrame> {
                         })
                         .collect::<PolarsResult<Vec<_>>>()?;
 
-                    Ok(GroupsProxy::Idx(GroupsIdx::from(idx)))
+                    Ok(GroupsType::Idx(GroupsIdx::from(idx)))
                 },
-                GroupsProxy::Slice { groups, .. } => {
+                GroupsType::Slice { groups, .. } => {
                     let slice_groups = groups
                         .par_iter()
                         .map(|base_g| {
@@ -617,7 +602,7 @@ impl Wrap<&DataFrame> {
                         .collect::<PolarsResult<Vec<_>>>()?;
 
                     let slice_groups = flatten_par(&slice_groups);
-                    Ok(GroupsProxy::Slice {
+                    Ok(GroupsType::Slice {
                         groups: slice_groups,
                         rolling: false,
                     })
@@ -627,7 +612,7 @@ impl Wrap<&DataFrame> {
 
         let dt = dt.cast(time_type).unwrap();
 
-        Ok((dt, group_by, groups))
+        Ok((dt, group_by, groups.into_sliceable()))
     }
 }
 
@@ -635,7 +620,13 @@ fn update_subgroups_slice(sub_groups: &[[IdxSize; 2]], base_g: [IdxSize; 2]) -> 
     sub_groups
         .iter()
         .map(|&[first, len]| {
-            let new_first = base_g[0] + first;
+            let new_first = if len == 0 {
+                // In case the group is empty, keep the original first so that the
+                // group_by keys still point to the original group.
+                base_g[0]
+            } else {
+                base_g[0] + first
+            };
             [new_first, len]
         })
         .collect_trusted::<Vec<_>>()
@@ -653,13 +644,13 @@ fn update_subgroups_idx(
                 // group_by keys still point to the original group.
                 base_g.0
             } else {
-                unsafe { *base_g.1.get_unchecked_release(first as usize) }
+                unsafe { *base_g.1.get_unchecked(first as usize) }
             };
 
             let first = first as usize;
             let len = len as usize;
             let idx = (first..first + len)
-                .map(|i| unsafe { *base_g.1.get_unchecked_release(i) })
+                .map(|i| unsafe { *base_g.1.get_unchecked(i) })
                 .collect::<IdxVec>();
             (new_first, idx)
         })
@@ -683,7 +674,7 @@ mod test {
             TimeUnit::Milliseconds,
         ] {
             let mut date = StringChunked::new(
-                "dt",
+                "dt".into(),
                 [
                     "2020-01-01 13:45:48",
                     "2020-01-01 16:42:13",
@@ -701,9 +692,9 @@ mod test {
                 None,
                 &StringChunked::from_iter(std::iter::once("raise")),
             )?
-            .into_series();
+            .into_column();
             date.set_sorted_flag(IsSorted::Ascending);
-            let a = Series::new("a", [3, 7, 5, 9, 2, 1]);
+            let a = Column::new("a".into(), [3, 7, 5, 9, 2, 1]);
             let df = DataFrame::new(vec![date, a.clone()])?;
 
             let (_, _, groups) = df
@@ -714,13 +705,12 @@ mod test {
                         period: Duration::parse("2d"),
                         offset: Duration::parse("-2d"),
                         closed_window: ClosedWindow::Right,
-                        ..Default::default()
                     },
                 )
                 .unwrap();
 
             let sum = unsafe { a.agg_sum(&groups) };
-            let expected = Series::new("", [3, 10, 15, 24, 11, 1]);
+            let expected = Column::new("".into(), [3, 10, 15, 24, 11, 1]);
             assert_eq!(sum, expected);
         }
 
@@ -730,7 +720,7 @@ mod test {
     #[test]
     fn test_rolling_group_by_aggs() -> PolarsResult<()> {
         let mut date = StringChunked::new(
-            "dt",
+            "dt".into(),
             [
                 "2020-01-01 13:45:48",
                 "2020-01-01 16:42:13",
@@ -748,10 +738,10 @@ mod test {
             None,
             &StringChunked::from_iter(std::iter::once("raise")),
         )?
-        .into_series();
+        .into_column();
         date.set_sorted_flag(IsSorted::Ascending);
 
-        let a = Series::new("a", [3, 7, 5, 9, 2, 1]);
+        let a = Column::new("a".into(), [3, 7, 5, 9, 2, 1]);
         let df = DataFrame::new(vec![date, a.clone()])?;
 
         let (_, _, groups) = df
@@ -762,45 +752,50 @@ mod test {
                     period: Duration::parse("2d"),
                     offset: Duration::parse("-2d"),
                     closed_window: ClosedWindow::Right,
-                    ..Default::default()
                 },
             )
             .unwrap();
 
-        let nulls = Series::new("", [Some(3), Some(7), None, Some(9), Some(2), Some(1)]);
+        let nulls = Series::new(
+            "".into(),
+            [Some(3), Some(7), None, Some(9), Some(2), Some(1)],
+        );
 
-        let min = unsafe { a.agg_min(&groups) };
-        let expected = Series::new("", [3, 3, 3, 3, 2, 1]);
+        let min = unsafe { a.as_materialized_series().agg_min(&groups) };
+        let expected = Series::new("".into(), [3, 3, 3, 3, 2, 1]);
         assert_eq!(min, expected);
 
         // Expected for nulls is equality.
         let min = unsafe { nulls.agg_min(&groups) };
         assert_eq!(min, expected);
 
-        let max = unsafe { a.agg_max(&groups) };
-        let expected = Series::new("", [3, 7, 7, 9, 9, 1]);
+        let max = unsafe { a.as_materialized_series().agg_max(&groups) };
+        let expected = Series::new("".into(), [3, 7, 7, 9, 9, 1]);
         assert_eq!(max, expected);
 
         let max = unsafe { nulls.agg_max(&groups) };
         assert_eq!(max, expected);
 
-        let var = unsafe { a.agg_var(&groups, 1) };
+        let var = unsafe { a.as_materialized_series().agg_var(&groups, 1) };
         let expected = Series::new(
-            "",
+            "".into(),
             [0.0, 8.0, 4.000000000000002, 6.666666666666667, 24.5, 0.0],
         );
-        assert!(abs(&(var - expected)).unwrap().lt(1e-12).unwrap().all());
+        assert!(abs(&(var - expected)?).unwrap().lt(1e-12).unwrap().all());
 
         let var = unsafe { nulls.agg_var(&groups, 1) };
-        let expected = Series::new("", [0.0, 8.0, 8.0, 9.333333333333343, 24.5, 0.0]);
-        assert!(abs(&(var - expected)).unwrap().lt(1e-12).unwrap().all());
+        let expected = Series::new("".into(), [0.0, 8.0, 8.0, 9.333333333333343, 24.5, 0.0]);
+        assert!(abs(&(var - expected)?).unwrap().lt(1e-12).unwrap().all());
 
-        let quantile = unsafe { a.agg_quantile(&groups, 0.5, QuantileInterpolOptions::Linear) };
-        let expected = Series::new("", [3.0, 5.0, 5.0, 6.0, 5.5, 1.0]);
+        let quantile = unsafe {
+            a.as_materialized_series()
+                .agg_quantile(&groups, 0.5, QuantileMethod::Linear)
+        };
+        let expected = Series::new("".into(), [3.0, 5.0, 5.0, 6.0, 5.5, 1.0]);
         assert_eq!(quantile, expected);
 
-        let quantile = unsafe { nulls.agg_quantile(&groups, 0.5, QuantileInterpolOptions::Linear) };
-        let expected = Series::new("", [3.0, 5.0, 5.0, 7.0, 5.5, 1.0]);
+        let quantile = unsafe { nulls.agg_quantile(&groups, 0.5, QuantileMethod::Linear) };
+        let expected = Series::new("".into(), [3.0, 5.0, 5.0, 7.0, 5.5, 1.0]);
         assert_eq!(quantile, expected);
 
         Ok(())
@@ -821,7 +816,7 @@ mod test {
             .and_utc()
             .timestamp_millis();
         let range = datetime_range_impl(
-            "date",
+            "date".into(),
             start,
             stop,
             Duration::parse("30m"),
@@ -829,9 +824,9 @@ mod test {
             TimeUnit::Milliseconds,
             None,
         )?
-        .into_series();
+        .into_column();
 
-        let groups = Series::new("groups", ["a", "a", "a", "b", "b", "a", "a"]);
+        let groups = Column::new("groups".into(), ["a", "a", "a", "b", "b", "a", "a"]);
         let df = DataFrame::new(vec![range, groups.clone()]).unwrap();
 
         let (time_key, mut keys, groups) = df
@@ -846,7 +841,6 @@ mod test {
                     include_boundaries: true,
                     closed_window: ClosedWindow::Both,
                     start_by: Default::default(),
-                    ..Default::default()
                 },
             )
             .unwrap();
@@ -876,7 +870,7 @@ mod test {
             .and_utc()
             .timestamp_millis();
         let range = datetime_range_impl(
-            "_upper_boundary",
+            "_upper_boundary".into(),
             start,
             stop,
             Duration::parse("1h"),
@@ -884,7 +878,7 @@ mod test {
             TimeUnit::Milliseconds,
             None,
         )?
-        .into_series();
+        .into_column();
         assert_eq!(&upper, &range);
 
         let upper = out.column("_lower_boundary").unwrap().slice(0, 3);
@@ -901,7 +895,7 @@ mod test {
             .and_utc()
             .timestamp_millis();
         let range = datetime_range_impl(
-            "_lower_boundary",
+            "_lower_boundary".into(),
             start,
             stop,
             Duration::parse("1h"),
@@ -909,10 +903,10 @@ mod test {
             TimeUnit::Milliseconds,
             None,
         )?
-        .into_series();
+        .into_column();
         assert_eq!(&upper, &range);
 
-        let expected = GroupsProxy::Idx(
+        let expected = GroupsType::Idx(
             vec![
                 (0 as IdxSize, unitvec![0 as IdxSize, 1, 2]),
                 (2, unitvec![2]),
@@ -922,7 +916,8 @@ mod test {
                 (4, unitvec![4]),
             ]
             .into(),
-        );
+        )
+        .into_sliceable();
         assert_eq!(expected, groups);
         Ok(())
     }
@@ -942,7 +937,7 @@ mod test {
             .and_utc()
             .timestamp_millis();
         let range = datetime_range_impl(
-            "date",
+            "date".into(),
             start,
             stop,
             Duration::parse("1d"),
@@ -950,9 +945,9 @@ mod test {
             TimeUnit::Milliseconds,
             None,
         )?
-        .into_series();
+        .into_column();
 
-        let groups = Series::new("groups", ["a", "a", "a", "b", "b", "a", "a"]);
+        let groups = Column::new("groups".into(), ["a", "a", "a", "b", "b", "a", "a"]);
         let df = DataFrame::new(vec![range, groups.clone()]).unwrap();
 
         let (mut time_key, keys, _groups) = df
@@ -967,12 +962,11 @@ mod test {
                     include_boundaries: true,
                     closed_window: ClosedWindow::Both,
                     start_by: Default::default(),
-                    ..Default::default()
                 },
             )
             .unwrap();
-        time_key.rename("");
-        let lower_bound = keys[1].clone().with_name("");
+        time_key.rename("".into());
+        let lower_bound = keys[1].clone().with_name("".into());
         assert!(time_key.equals(&lower_bound));
         Ok(())
     }

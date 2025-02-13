@@ -1,14 +1,28 @@
 use std::io::Write;
-use std::path::PathBuf;
 
-use arrow::io::ipc::write;
-use arrow::io::ipc::write::WriteOptions;
+use arrow::datatypes::Metadata;
+use arrow::io::ipc::write::{self, EncodedData, WriteOptions};
 use polars_core::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
-use crate::WriterFactory;
+use crate::shared::schema_to_arrow_checked;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct IpcWriterOptions {
+    /// Data page compression
+    pub compression: Option<IpcCompression>,
+    /// maintain the order the data was processed
+    pub maintain_order: bool,
+}
+
+impl IpcWriterOptions {
+    pub fn to_writer<W: Write>(&self, writer: W) -> IpcWriter<W> {
+        IpcWriter::new(writer).with_compression(self.compression)
+    }
+}
 
 /// Write a DataFrame to Arrow's IPC format
 ///
@@ -23,8 +37,16 @@ use crate::WriterFactory;
 /// fn example(df: &mut DataFrame) -> PolarsResult<()> {
 ///     let mut file = File::create("file.ipc").expect("could not create file");
 ///
-///     IpcWriter::new(&mut file)
-///         .finish(df)
+///     let mut writer = IpcWriter::new(&mut file);
+///
+///     let custom_metadata = [
+///         ("first_name".into(), "John".into()),
+///         ("last_name".into(), "Doe".into()),
+///     ]
+///     .into_iter()
+///     .collect();
+///     writer.set_custom_schema_metadata(Arc::new(custom_metadata));
+///     writer.finish(df)
 /// }
 ///
 /// ```
@@ -33,7 +55,9 @@ pub struct IpcWriter<W> {
     pub(super) writer: W,
     pub(super) compression: Option<IpcCompression>,
     /// Polars' flavor of arrow. This might be temporary.
-    pub(super) pl_flavor: bool,
+    pub(super) compat_level: CompatLevel,
+    pub(super) parallel: bool,
+    pub(super) custom_schema_metadata: Option<Arc<Metadata>>,
 }
 
 impl<W: Write> IpcWriter<W> {
@@ -43,15 +67,21 @@ impl<W: Write> IpcWriter<W> {
         self
     }
 
-    pub fn with_pl_flavor(mut self, pl_flavor: bool) -> Self {
-        self.pl_flavor = pl_flavor;
+    pub fn with_compat_level(mut self, compat_level: CompatLevel) -> Self {
+        self.compat_level = compat_level;
+        self
+    }
+
+    pub fn with_parallel(mut self, parallel: bool) -> Self {
+        self.parallel = parallel;
         self
     }
 
     pub fn batched(self, schema: &Schema) -> PolarsResult<BatchedWriter<W>> {
+        let schema = schema_to_arrow_checked(schema, self.compat_level, "ipc")?;
         let mut writer = write::FileWriter::new(
             self.writer,
-            Arc::new(schema.to_arrow(self.pl_flavor)),
+            Arc::new(schema),
             None,
             WriteOptions {
                 compression: self.compression.map(|c| c.into()),
@@ -61,8 +91,13 @@ impl<W: Write> IpcWriter<W> {
 
         Ok(BatchedWriter {
             writer,
-            pl_flavor: self.pl_flavor,
+            compat_level: self.compat_level,
         })
+    }
+
+    /// Sets custom schema metadata. Must be called before `start` is called
+    pub fn set_custom_schema_metadata(&mut self, custom_metadata: Arc<Metadata>) {
+        self.custom_schema_metadata = Some(custom_metadata);
     }
 }
 
@@ -74,21 +109,32 @@ where
         IpcWriter {
             writer,
             compression: None,
-            pl_flavor: false,
+            compat_level: CompatLevel::newest(),
+            parallel: true,
+            custom_schema_metadata: None,
         }
     }
 
     fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()> {
+        let schema = schema_to_arrow_checked(df.schema(), self.compat_level, "ipc")?;
         let mut ipc_writer = write::FileWriter::try_new(
             &mut self.writer,
-            Arc::new(df.schema().to_arrow(self.pl_flavor)),
+            Arc::new(schema),
             None,
             WriteOptions {
                 compression: self.compression.map(|c| c.into()),
             },
         )?;
-        df.align_chunks();
-        let iter = df.iter_chunks(self.pl_flavor);
+        if let Some(custom_metadata) = &self.custom_schema_metadata {
+            ipc_writer.set_custom_schema_metadata(Arc::clone(custom_metadata));
+        }
+
+        if self.parallel {
+            df.align_chunks_par();
+        } else {
+            df.align_chunks();
+        }
+        let iter = df.iter_chunks(self.compat_level, true);
 
         for batch in iter {
             ipc_writer.write(&batch, None)?
@@ -100,19 +146,32 @@ where
 
 pub struct BatchedWriter<W: Write> {
     writer: write::FileWriter<W>,
-    pl_flavor: bool,
+    compat_level: CompatLevel,
 }
 
 impl<W: Write> BatchedWriter<W> {
-    /// Write a batch to the parquet writer.
+    /// Write a batch to the ipc writer.
     ///
     /// # Panics
     /// The caller must ensure the chunks in the given [`DataFrame`] are aligned.
     pub fn write_batch(&mut self, df: &DataFrame) -> PolarsResult<()> {
-        let iter = df.iter_chunks(self.pl_flavor);
+        let iter = df.iter_chunks(self.compat_level, true);
         for batch in iter {
             self.writer.write(&batch, None)?
         }
+        Ok(())
+    }
+
+    /// Write a encoded data to the ipc writer.
+    ///
+    /// # Panics
+    /// The caller must ensure the chunks in the given [`DataFrame`] are aligned.
+    pub fn write_encoded(
+        &mut self,
+        dictionaries: &[EncodedData],
+        message: &EncodedData,
+    ) -> PolarsResult<()> {
+        self.writer.write_encoded(dictionaries, message)?;
         Ok(())
     }
 
@@ -140,180 +199,5 @@ impl From<IpcCompression> for write::Compression {
             IpcCompression::LZ4 => write::Compression::LZ4,
             IpcCompression::ZSTD => write::Compression::ZSTD,
         }
-    }
-}
-
-pub struct IpcWriterOption {
-    compression: Option<IpcCompression>,
-    extension: PathBuf,
-}
-
-impl IpcWriterOption {
-    pub fn new() -> Self {
-        Self {
-            compression: None,
-            extension: PathBuf::from(".ipc"),
-        }
-    }
-
-    /// Set the compression used. Defaults to None.
-    pub fn with_compression(mut self, compression: Option<IpcCompression>) -> Self {
-        self.compression = compression;
-        self
-    }
-
-    /// Set the extension. Defaults to ".ipc".
-    pub fn with_extension(mut self, extension: PathBuf) -> Self {
-        self.extension = extension;
-        self
-    }
-}
-
-impl Default for IpcWriterOption {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WriterFactory for IpcWriterOption {
-    fn create_writer<W: Write + 'static>(&self, writer: W) -> Box<dyn SerWriter<W>> {
-        Box::new(IpcWriter::new(writer).with_compression(self.compression))
-    }
-
-    fn extension(&self) -> PathBuf {
-        self.extension.to_owned()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::io::Cursor;
-
-    use polars_core::df;
-    use polars_core::prelude::*;
-
-    use crate::prelude::*;
-
-    #[test]
-    fn write_and_read_ipc() {
-        // Vec<T> : Write + Read
-        // Cursor<Vec<_>>: Seek
-        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let mut df = create_df();
-
-        IpcWriter::new(&mut buf)
-            .finish(&mut df)
-            .expect("ipc writer");
-
-        buf.set_position(0);
-
-        let df_read = IpcReader::new(buf).finish().unwrap();
-        assert!(df.equals(&df_read));
-    }
-
-    #[test]
-    fn test_read_ipc_with_projection() {
-        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let mut df = df!("a" => [1, 2, 3], "b" => [2, 3, 4], "c" => [3, 4, 5]).unwrap();
-
-        IpcWriter::new(&mut buf)
-            .finish(&mut df)
-            .expect("ipc writer");
-        buf.set_position(0);
-
-        let expected = df!("b" => [2, 3, 4], "c" => [3, 4, 5]).unwrap();
-        let df_read = IpcReader::new(buf)
-            .with_projection(Some(vec![1, 2]))
-            .finish()
-            .unwrap();
-        assert_eq!(df_read.shape(), (3, 2));
-        df_read.equals(&expected);
-    }
-
-    #[test]
-    fn test_read_ipc_with_columns() {
-        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let mut df = df!("a" => [1, 2, 3], "b" => [2, 3, 4], "c" => [3, 4, 5]).unwrap();
-
-        IpcWriter::new(&mut buf)
-            .finish(&mut df)
-            .expect("ipc writer");
-        buf.set_position(0);
-
-        let expected = df!("b" => [2, 3, 4], "c" => [3, 4, 5]).unwrap();
-        let df_read = IpcReader::new(buf)
-            .with_columns(Some(vec!["c".to_string(), "b".to_string()]))
-            .finish()
-            .unwrap();
-        df_read.equals(&expected);
-
-        for pl_flavor in [false, true] {
-            let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-            let mut df = df![
-                "letters" => ["x", "y", "z"],
-                "ints" => [123, 456, 789],
-                "floats" => [4.5, 10.0, 10.0],
-                "other" => ["misc", "other", "value"],
-            ]
-            .unwrap();
-            IpcWriter::new(&mut buf)
-                .with_pl_flavor(pl_flavor)
-                .finish(&mut df)
-                .expect("ipc writer");
-            buf.set_position(0);
-            let expected = df![
-                "letters" => ["x", "y", "z"],
-                "floats" => [4.5, 10.0, 10.0],
-                "other" => ["misc", "other", "value"],
-                "ints" => [123, 456, 789],
-            ]
-            .unwrap();
-            let df_read = IpcReader::new(&mut buf)
-                .with_columns(Some(vec![
-                    "letters".to_string(),
-                    "floats".to_string(),
-                    "other".to_string(),
-                    "ints".to_string(),
-                ]))
-                .finish()
-                .unwrap();
-            assert!(df_read.equals(&expected));
-        }
-    }
-
-    #[test]
-    fn test_write_with_compression() {
-        let mut df = create_df();
-
-        let compressions = vec![None, Some(IpcCompression::LZ4), Some(IpcCompression::ZSTD)];
-
-        for compression in compressions.into_iter() {
-            let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-            IpcWriter::new(&mut buf)
-                .with_compression(compression)
-                .finish(&mut df)
-                .expect("ipc writer");
-            buf.set_position(0);
-
-            let df_read = IpcReader::new(buf)
-                .finish()
-                .unwrap_or_else(|_| panic!("IPC reader: {:?}", compression));
-            assert!(df.equals(&df_read));
-        }
-    }
-
-    #[test]
-    fn write_and_read_ipc_empty_series() {
-        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
-        let chunked_array = Float64Chunked::new("empty", &[0_f64; 0]);
-        let mut df = DataFrame::new(vec![chunked_array.into_series()]).unwrap();
-        IpcWriter::new(&mut buf)
-            .finish(&mut df)
-            .expect("ipc writer");
-
-        buf.set_position(0);
-
-        let df_read = IpcReader::new(buf).finish().unwrap();
-        assert!(df.equals(&df_read));
     }
 }

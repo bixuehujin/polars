@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from typing import Any, ContextManager
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import polars as pl
-from polars.testing import assert_frame_equal
+from polars.exceptions import ComputeError
+from polars.testing import assert_frame_equal, assert_series_equal
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager as ContextManager
+
+    from polars._typing import PolarsDataType
 
 
 def test_comparison_order_null_broadcasting() -> None:
@@ -154,6 +160,49 @@ def test_missing_equality_on_bools() -> None:
     ]
 
 
+def test_struct_equality_18870() -> None:
+    s = pl.Series([{"a": 1}, None])
+
+    # eq
+    result = s.eq(s).to_list()
+    expected = [True, None]
+    assert result == expected
+
+    # ne
+    result = s.ne(s).to_list()
+    expected = [False, None]
+    assert result == expected
+
+    # eq_missing
+    result = s.eq_missing(s).to_list()
+    expected = [True, True]
+    assert result == expected
+
+    # ne_missing
+    result = s.ne_missing(s).to_list()
+    expected = [False, False]
+    assert result == expected
+
+
+def test_struct_nested_equality() -> None:
+    df = pl.DataFrame(
+        {
+            "a": [{"foo": 0, "bar": "1"}, {"foo": None, "bar": "1"}, None],
+            "b": [{"foo": 0, "bar": "1"}] * 3,
+        }
+    )
+
+    # eq
+    ans = df.select(pl.col("a").eq(pl.col("b")))
+    expected = pl.DataFrame({"a": [True, False, None]})
+    assert_frame_equal(ans, expected)
+
+    # ne
+    ans = df.select(pl.col("a").ne(pl.col("b")))
+    expected = pl.DataFrame({"a": [False, True, None]})
+    assert_frame_equal(ans, expected)
+
+
 def isnan(x: Any) -> bool:
     return isinstance(x, float) and math.isnan(x)
 
@@ -199,7 +248,7 @@ def reference_ordering_missing(lhs: Any, rhs: Any) -> str:
 
 
 def verify_total_ordering(
-    lhs: Any, rhs: Any, dummy: Any, dtype: pl.PolarsDataType
+    lhs: Any, rhs: Any, dummy: Any, dtype: PolarsDataType
 ) -> None:
     ref = reference_ordering_propagating(lhs, rhs)
     refmiss = reference_ordering_missing(lhs, rhs)
@@ -232,14 +281,14 @@ def verify_total_ordering(
         "ne_missing": [refmiss != "="],
     }
     ans_correct = pl.DataFrame(
-        ans_correct_dict, schema={c: pl.Boolean for c in ans_correct_dict}
+        ans_correct_dict, schema=dict.fromkeys(ans_correct_dict, pl.Boolean)
     )
 
     assert_frame_equal(ans[:1], ans_correct)
 
 
 def verify_total_ordering_broadcast(
-    lhs: Any, rhs: Any, dummy: Any, dtype: pl.PolarsDataType
+    lhs: Any, rhs: Any, dummy: Any, dtype: PolarsDataType
 ) -> None:
     ref = reference_ordering_propagating(lhs, rhs)
     refmiss = reference_ordering_missing(lhs, rhs)
@@ -283,7 +332,7 @@ def verify_total_ordering_broadcast(
         "ne_missing": [refmiss != "="],
     }
     ans_correct = pl.DataFrame(
-        ans_correct_dict, schema={c: pl.Boolean for c in ans_correct_dict}
+        ans_correct_dict, schema=dict.fromkeys(ans_correct_dict, pl.Boolean)
     )
 
     assert_frame_equal(ans_first[:1], ans_correct)
@@ -303,7 +352,7 @@ INTERESTING_FLOAT_VALUES = [
 ]
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 @pytest.mark.parametrize("lhs", INTERESTING_FLOAT_VALUES)
 @pytest.mark.parametrize("rhs", INTERESTING_FLOAT_VALUES)
 def test_total_ordering_float_series(lhs: float | None, rhs: float | None) -> None:
@@ -331,7 +380,7 @@ INTERESTING_STRING_VALUES = [
 ]
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 @pytest.mark.parametrize("lhs", INTERESTING_STRING_VALUES)
 @pytest.mark.parametrize("rhs", INTERESTING_STRING_VALUES)
 def test_total_ordering_string_series(lhs: str | None, rhs: str | None) -> None:
@@ -343,7 +392,7 @@ def test_total_ordering_string_series(lhs: str | None, rhs: str | None) -> None:
         verify_total_ordering_broadcast(lhs, rhs, "", pl.String)
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 @pytest.mark.parametrize("str_lhs", INTERESTING_STRING_VALUES)
 @pytest.mark.parametrize("str_rhs", INTERESTING_STRING_VALUES)
 def test_total_ordering_binary_series(str_lhs: str | None, str_rhs: str | None) -> None:
@@ -366,3 +415,45 @@ def test_total_ordering_bool_series(lhs: bool | None, rhs: bool | None) -> None:
     )
     with context:
         verify_total_ordering_broadcast(lhs, rhs, False, pl.Boolean)
+
+
+def test_cat_compare_with_bool() -> None:
+    data = pl.DataFrame([pl.Series("col1", ["a", "b"], dtype=pl.Categorical)])
+
+    with pytest.raises(ComputeError, match="cannot compare categorical with bool"):
+        data.filter(pl.col("col1") == True)  # noqa: E712
+
+
+def test_schema_ne_missing_9256() -> None:
+    df = pl.DataFrame({"a": [0, 1, None], "b": [True, False, True]})
+
+    assert df.select(pl.col("a").ne_missing(0).or_(pl.col("b")))["a"].all()
+
+
+def test_nested_binary_literal_super_type_12227() -> None:
+    # The `.alias` is important here to trigger the bug.
+    result = pl.select(x=1).select((pl.lit(0) + ((pl.col("x") > 0) * 0.1)).alias("x"))
+    assert result.item() == 0.1
+
+    result = pl.select((pl.lit(0) + (pl.lit(0) == pl.lit(0)) * pl.lit(0.1)) + pl.lit(0))
+    assert result.item() == 0.1
+
+
+def test_struct_broadcasting_comparison() -> None:
+    df = pl.DataFrame({"foo": [{"a": 1}, {"a": 2}, {"a": 1}]})
+    assert df.select(eq=pl.col.foo == pl.col.foo.last()).to_dict(as_series=False) == {
+        "eq": [True, False, True]
+    }
+
+
+@pytest.mark.parametrize("dtype", [pl.List(pl.Int64), pl.Array(pl.Int64, 1)])
+def test_compare_list_broadcast_empty_first_chunk_20165(dtype: pl.DataType) -> None:
+    s = pl.concat(2 * [pl.Series([[1]], dtype=dtype)]).filter([False, True])
+
+    assert s.len() == 1
+    assert s.n_chunks() == 2
+
+    assert_series_equal(
+        pl.select(pl.lit(pl.Series([[1], [2]]), dtype=dtype) == pl.lit(s)).to_series(),
+        pl.Series([True, False]),
+    )

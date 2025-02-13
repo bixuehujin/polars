@@ -12,8 +12,8 @@ from polars.datatypes import dtype_to_ffiname
 
 if TYPE_CHECKING:
     from polars import Series
+    from polars._typing import PolarsDataType
     from polars.polars import PySeries
-    from polars.type_aliases import PolarsDataType
 
     if sys.version_info >= (3, 10):
         from typing import ParamSpec
@@ -32,7 +32,7 @@ def expr_dispatch(cls: type[T]) -> type[T]:
     * Applied to the Series class, and/or any Series 'NameSpace' classes.
     * Walks the class attributes, looking for methods that have empty function
       bodies, with signatures compatible with an existing Expr function.
-    * IIF both conditions are met, the empty method is decorated with @call_expr.
+    * IFF both conditions are met, the empty method is decorated with @call_expr.
     """
     # create lookup of expression functions in this namespace
     namespace = getattr(cls, "_accessor", None)
@@ -100,8 +100,7 @@ def call_expr(func: SeriesMethod) -> SeriesMethod:
     def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> Series:
         s = wrap_s(self._s)
         expr = F.col(s.name)
-        namespace = getattr(self, "_accessor", None)
-        if namespace is not None:
+        if (namespace := getattr(self, "_accessor", None)) is not None:
             expr = getattr(expr, namespace)
         f = getattr(expr, func.__name__)
         return s.to_frame().select_seq(f(*args, **kwargs)).to_series()
@@ -175,3 +174,18 @@ def get_ffi_func(
     ffi_name = dtype_to_ffiname(dtype)
     fname = name.replace("<>", ffi_name)
     return getattr(obj, fname, None)
+
+
+def _with_no_check_length(func: Callable[..., Any]) -> Any:
+    from polars.polars import check_length
+
+    # Catch any error so that we can be sure that we always restore length checks
+    try:
+        check_length(False)
+        result = func()
+        check_length(True)
+    except Exception:
+        check_length(True)
+        raise
+    else:
+        return result

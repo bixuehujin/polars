@@ -24,18 +24,14 @@ pub(crate) fn predicate_at_scan(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
 
-    (&lp_arena).iter(lp).any(|(_, lp)| {
-        use IR::*;
-        matches!(
-            lp,
-            DataFrameScan {
-                selection: Some(_),
-                ..
-            } | Scan {
-                predicate: Some(_),
-                ..
-            }
-        )
+    (&lp_arena).iter(lp).any(|(_, lp)| match lp {
+        IR::Filter { input, .. } => {
+            matches!(lp_arena.get(*input), IR::DataFrameScan { .. })
+        },
+        IR::Scan {
+            predicate: Some(_), ..
+        } => true,
+        _ => false,
     })
 }
 
@@ -43,18 +39,14 @@ pub(crate) fn predicate_at_all_scans(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
 
-    (&lp_arena).iter(lp).all(|(_, lp)| {
-        use IR::*;
-        matches!(
-            lp,
-            DataFrameScan {
-                selection: Some(_),
-                ..
-            } | Scan {
-                predicate: Some(_),
-                ..
-            }
-        )
+    (&lp_arena).iter(lp).all(|(_, lp)| match lp {
+        IR::Filter { input, .. } => {
+            matches!(lp_arena.get(*input), IR::DataFrameScan { .. })
+        },
+        IR::Scan {
+            predicate: Some(_), ..
+        } => true,
+        _ => false,
     })
 }
 
@@ -65,7 +57,7 @@ pub(crate) fn is_pipeline(q: LazyFrame) -> bool {
     matches!(
         lp_arena.get(lp),
         IR::MapFunction {
-            function: FunctionNode::Pipeline { .. },
+            function: FunctionIR::Pipeline { .. },
             ..
         }
     )
@@ -79,7 +71,7 @@ pub(crate) fn has_pipeline(q: LazyFrame) -> bool {
         matches!(
             lp,
             IR::MapFunction {
-                function: FunctionNode::Pipeline { .. },
+                function: FunctionIR::Pipeline { .. },
                 ..
             }
         )
@@ -93,7 +85,7 @@ fn slice_at_scan(q: LazyFrame) -> bool {
     (&lp_arena).iter(lp).any(|(_, lp)| {
         use IR::*;
         match lp {
-            Scan { file_options, .. } => file_options.n_rows.is_some(),
+            Scan { file_options, .. } => file_options.slice.is_some(),
             _ => false,
         }
     })
@@ -128,11 +120,6 @@ fn test_pred_pd_1() -> PolarsResult<()> {
         .filter(col("B").gt(lit(1)));
 
     assert!(predicate_at_scan(q));
-
-    // check if we do not pass slice
-    let q = df.lazy().limit(10).filter(col("B").gt(lit(1)));
-
-    assert!(!predicate_at_scan(q));
 
     Ok(())
 }
@@ -295,12 +282,12 @@ pub fn test_predicate_block_cast() -> PolarsResult<()> {
     let lf1 = df
         .clone()
         .lazy()
-        .with_column(col("value").cast(DataType::Int16) * lit(0.1f32))
+        .with_column(col("value").cast(DataType::Int16) * lit(0.1).cast(DataType::Float32))
         .filter(col("value").lt(lit(2.5f32)));
 
     let lf2 = df
         .lazy()
-        .select([col("value").cast(DataType::Int16) * lit(0.1f32)])
+        .select([col("value").cast(DataType::Int16) * lit(0.1).cast(DataType::Float32)])
         .filter(col("value").lt(lit(2.5f32)));
 
     for lf in [lf1, lf2] {
@@ -308,7 +295,10 @@ pub fn test_predicate_block_cast() -> PolarsResult<()> {
 
         let out = lf.collect()?;
         let s = out.column("value").unwrap();
-        assert_eq!(s, &Series::new("value", [1.0f32, 2.0]));
+        assert_eq!(
+            s,
+            &Column::new(PlSmallStr::from_static("value"), [1.0f32, 2.0])
+        );
     }
 
     Ok(())
@@ -320,9 +310,9 @@ fn test_lazy_filter_and_rename() {
     let lf = df
         .clone()
         .lazy()
-        .rename(["a"], ["x"])
+        .rename(["a"], ["x"], true)
         .filter(col("x").map(
-            |s: Series| Ok(Some(s.gt(3)?.into_series())),
+            |s: Column| Ok(Some(s.as_materialized_series().gt(3)?.into_column())),
             GetOutput::from_type(DataType::Boolean),
         ))
         .select([col("x")]);
@@ -334,8 +324,8 @@ fn test_lazy_filter_and_rename() {
     assert!(lf.collect().unwrap().equals(&correct));
 
     // now we check if the column is rename or added when we don't select
-    let lf = df.lazy().rename(["a"], ["x"]).filter(col("x").map(
-        |s: Series| Ok(Some(s.gt(3)?.into_series())),
+    let lf = df.lazy().rename(["a"], ["x"], true).filter(col("x").map(
+        |s: Column| Ok(Some(s.as_materialized_series().gt(3)?.into_column())),
         GetOutput::from_type(DataType::Boolean),
     ));
     // the rename function should not interfere with the predicate pushdown
@@ -470,11 +460,10 @@ fn test_with_column_prune() -> PolarsResult<()> {
     (&lp_arena).iter(lp).for_each(|(_, lp)| {
         use IR::*;
         match lp {
-            DataFrameScan { projection, .. } => {
-                let projection = projection.as_ref().unwrap();
-                let projection = projection.as_slice();
+            DataFrameScan { output_schema, .. } => {
+                let projection = output_schema.as_ref().unwrap();
                 assert_eq!(projection.len(), 1);
-                let name = &projection[0];
+                let name = projection.get_at_index(0).unwrap().0;
                 assert_eq!(name, "c1");
             },
             HStack { exprs, .. } => {
@@ -485,7 +474,7 @@ fn test_with_column_prune() -> PolarsResult<()> {
     });
 
     // whole `with_columns` pruned
-    let q = df.lazy().with_column(col("c0")).select([col("c1")]);
+    let mut q = df.lazy().with_column(col("c0")).select([col("c1")]);
 
     let lp = q.clone().optimize(&mut lp_arena, &mut expr_arena).unwrap();
 
@@ -493,11 +482,11 @@ fn test_with_column_prune() -> PolarsResult<()> {
     assert!((&lp_arena).iter(lp).all(|(_, lp)| {
         use IR::*;
 
-        matches!(lp, IR::SimpleProjection { .. } | DataFrameScan { .. })
+        matches!(lp, SimpleProjection { .. } | DataFrameScan { .. })
     }));
     assert_eq!(
-        q.schema().unwrap().as_ref(),
-        &Schema::from_iter([Field::new("c1", DataType::Int32)])
+        q.collect_schema().unwrap().as_ref(),
+        &Schema::from_iter([Field::new(PlSmallStr::from_static("c1"), DataType::Int32)])
     );
     Ok(())
 }
@@ -546,5 +535,149 @@ fn test_flatten_unions() -> PolarsResult<()> {
         },
         _ => panic!(),
     }
+    Ok(())
+}
+
+fn num_occurrences(s: &str, needle: &str) -> usize {
+    let mut i = 0;
+    let mut num = 0;
+
+    while let Some(n) = s[i..].find(needle) {
+        i += n + 1;
+        num += 1;
+    }
+
+    num
+}
+
+#[test]
+fn test_cluster_with_columns() -> Result<(), Box<dyn std::error::Error>> {
+    use polars_core::prelude::*;
+
+    let df = df!("foo" => &[0.5, 1.7, 3.2],
+                 "bar" => &[4.1, 1.5, 9.2])?;
+
+    let df = df
+        .lazy()
+        .without_optimizations()
+        .with_cluster_with_columns(true)
+        .with_columns([col("foo") * lit(2.0)])
+        .with_columns([col("bar") / lit(1.5)]);
+
+    let unoptimized = df.clone().to_alp().unwrap();
+    let optimized = df.clone().to_alp_optimized().unwrap();
+
+    let unoptimized = unoptimized.describe();
+    let optimized = optimized.describe();
+
+    println!("\n---\n");
+
+    println!("Unoptimized:\n{unoptimized}",);
+    println!("\n---\n");
+    println!("Optimized:\n{optimized}");
+
+    assert_eq!(num_occurrences(&unoptimized, "WITH_COLUMNS"), 2);
+    assert_eq!(num_occurrences(&optimized, "WITH_COLUMNS"), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_cluster_with_columns_dependency() -> Result<(), Box<dyn std::error::Error>> {
+    use polars_core::prelude::*;
+
+    let df = df!("foo" => &[0.5, 1.7, 3.2],
+                 "bar" => &[4.1, 1.5, 9.2])?;
+
+    let df = df
+        .lazy()
+        .without_optimizations()
+        .with_cluster_with_columns(true)
+        .with_columns([col("foo").alias("buzz")])
+        .with_columns([col("buzz")]);
+
+    let unoptimized = df.clone().to_alp().unwrap();
+    let optimized = df.clone().to_alp_optimized().unwrap();
+
+    let unoptimized = unoptimized.describe();
+    let optimized = optimized.describe();
+
+    println!("\n---\n");
+
+    println!("Unoptimized:\n{unoptimized}",);
+    println!("\n---\n");
+    println!("Optimized:\n{optimized}");
+
+    assert_eq!(num_occurrences(&unoptimized, "WITH_COLUMNS"), 2);
+    assert_eq!(num_occurrences(&optimized, "WITH_COLUMNS"), 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_cluster_with_columns_partial() -> Result<(), Box<dyn std::error::Error>> {
+    use polars_core::prelude::*;
+
+    let df = df!("foo" => &[0.5, 1.7, 3.2],
+                 "bar" => &[4.1, 1.5, 9.2])?;
+
+    let df = df
+        .lazy()
+        .without_optimizations()
+        .with_cluster_with_columns(true)
+        .with_columns([col("foo").alias("buzz")])
+        .with_columns([col("buzz"), col("foo") * lit(2.0)]);
+
+    let unoptimized = df.clone().to_alp().unwrap();
+    let optimized = df.clone().to_alp_optimized().unwrap();
+
+    let unoptimized = unoptimized.describe();
+    let optimized = optimized.describe();
+
+    println!("\n---\n");
+
+    println!("Unoptimized:\n{unoptimized}",);
+    println!("\n---\n");
+    println!("Optimized:\n{optimized}");
+
+    assert!(unoptimized.contains(r#"[col("buzz"), [(col("foo")) * (2.0)]]"#));
+    assert!(unoptimized.contains(r#"[col("foo").alias("buzz")]"#));
+    assert!(optimized.contains(r#"[col("buzz")]"#));
+    assert!(optimized.contains(r#"[col("foo").alias("buzz"), [(col("foo")) * (2.0)]]"#));
+
+    Ok(())
+}
+
+#[test]
+fn test_cluster_with_columns_chain() -> Result<(), Box<dyn std::error::Error>> {
+    use polars_core::prelude::*;
+
+    let df = df!("foo" => &[0.5, 1.7, 3.2],
+                 "bar" => &[4.1, 1.5, 9.2])?;
+
+    let df = df
+        .lazy()
+        .without_optimizations()
+        .with_cluster_with_columns(true)
+        .with_columns([col("foo").alias("foo1")])
+        .with_columns([col("foo").alias("foo2")])
+        .with_columns([col("foo").alias("foo3")])
+        .with_columns([col("foo").alias("foo4")]);
+
+    let unoptimized = df.clone().to_alp().unwrap();
+    let optimized = df.clone().to_alp_optimized().unwrap();
+
+    let unoptimized = unoptimized.describe();
+    let optimized = optimized.describe();
+
+    println!("\n---\n");
+
+    println!("Unoptimized:\n{unoptimized}",);
+    println!("\n---\n");
+    println!("Optimized:\n{optimized}");
+
+    assert_eq!(num_occurrences(&unoptimized, "WITH_COLUMNS"), 4);
+    assert_eq!(num_occurrences(&optimized, "WITH_COLUMNS"), 1);
+
     Ok(())
 }

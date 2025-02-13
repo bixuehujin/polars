@@ -1,12 +1,54 @@
-use arrow::legacy::kernels::concatenate::concatenate_owned_unchecked;
+use std::borrow::Cow;
+use std::cell::Cell;
+
+use arrow::bitmap::{Bitmap, BitmapBuilder};
+use arrow::compute::concatenate::concatenate_unchecked;
 use polars_error::constants::LENGTH_LIMIT_MSG;
 
 use super::*;
+use crate::chunked_array::flags::StatisticsFlags;
 #[cfg(feature = "object")]
 use crate::chunked_array::object::builder::ObjectChunkedBuilder;
 use crate::utils::slice_offsets;
 
-#[inline]
+pub(crate) fn split_at(
+    chunks: &[ArrayRef],
+    offset: i64,
+    own_length: usize,
+) -> (Vec<ArrayRef>, Vec<ArrayRef>) {
+    let mut new_chunks_left = Vec::with_capacity(1);
+    let mut new_chunks_right = Vec::with_capacity(1);
+    let (raw_offset, _) = slice_offsets(offset, 0, own_length);
+
+    let mut remaining_offset = raw_offset;
+    let mut iter = chunks.iter();
+
+    for chunk in &mut iter {
+        let chunk_len = chunk.len();
+        if remaining_offset > 0 && remaining_offset >= chunk_len {
+            remaining_offset -= chunk_len;
+            new_chunks_left.push(chunk.clone());
+            continue;
+        }
+
+        let (l, r) = chunk.split_at_boxed(remaining_offset);
+        new_chunks_left.push(l);
+        new_chunks_right.push(r);
+        break;
+    }
+
+    for chunk in iter {
+        new_chunks_right.push(chunk.clone())
+    }
+    if new_chunks_left.is_empty() {
+        new_chunks_left.push(chunks[0].sliced(0, 0));
+    }
+    if new_chunks_right.is_empty() {
+        new_chunks_right.push(chunks[0].sliced(0, 0));
+    }
+    (new_chunks_left, new_chunks_right)
+}
+
 pub(crate) fn slice(
     chunks: &[ArrayRef],
     offset: i64,
@@ -51,17 +93,31 @@ pub(crate) fn slice(
     (new_chunks, new_len)
 }
 
+// When we deal with arrays and lists we can easily exceed the limit if
+// we take the underlying values array as a Series. This call stack
+// is hard to follow, so for this one case we make an exception
+// and use a thread local.
+thread_local!(static CHECK_LENGTH: Cell<bool> = const { Cell::new(true) });
+
+/// Meant for internal use. In very rare conditions this can be turned off.
+/// # Safety
+/// The caller must ensure the Series that exceeds the length get's deconstructed
+/// into array values or list values before and never is used.
+pub unsafe fn _set_check_length(check: bool) {
+    CHECK_LENGTH.set(check)
+}
+
 impl<T: PolarsDataType> ChunkedArray<T> {
     /// Get the length of the ChunkedArray
     #[inline]
     pub fn len(&self) -> usize {
-        self.length as usize
+        self.length
     }
 
     /// Return the number of null values in the ChunkedArray.
     #[inline]
     pub fn null_count(&self) -> usize {
-        self.null_count as usize
+        self.null_count
     }
 
     /// Set the null count directly.
@@ -72,7 +128,7 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     /// # Safety
     /// The new null count must match the total null count of the underlying
     /// arrays.
-    pub unsafe fn set_null_count(&mut self, null_count: IdxSize) {
+    pub unsafe fn set_null_count(&mut self, null_count: usize) {
         self.null_count = null_count;
     }
 
@@ -92,34 +148,90 @@ impl<T: PolarsDataType> ChunkedArray<T> {
         }
         let len = inner(&self.chunks);
         // Length limit is `IdxSize::MAX - 1`. We use `IdxSize::MAX` to indicate `NULL` in indexing.
-        assert!(len < IdxSize::MAX as usize, "{}", LENGTH_LIMIT_MSG);
-        self.length = len as IdxSize;
+        if len >= (IdxSize::MAX as usize) && CHECK_LENGTH.get() {
+            panic!("{}", LENGTH_LIMIT_MSG);
+        }
+        self.length = len;
         self.null_count = self
             .chunks
             .iter()
             .map(|arr| arr.null_count())
-            .sum::<usize>() as IdxSize;
+            .sum::<usize>();
     }
 
-    pub fn rechunk(&self) -> Self {
+    /// Rechunks this ChunkedArray, returning a new Cow::Owned ChunkedArray if it was
+    /// rechunked or simply a Cow::Borrowed of itself if it was already a single chunk.
+    pub fn rechunk(&self) -> Cow<'_, Self> {
         match self.dtype() {
             #[cfg(feature = "object")]
             DataType::Object(_, _) => {
                 panic!("implementation error")
             },
             _ => {
-                fn inner_rechunk(chunks: &[ArrayRef]) -> Vec<ArrayRef> {
-                    vec![concatenate_owned_unchecked(chunks).unwrap()]
-                }
-
                 if self.chunks.len() == 1 {
-                    self.clone()
+                    Cow::Borrowed(self)
                 } else {
-                    let chunks = inner_rechunk(&self.chunks);
-                    unsafe { self.copy_with_chunks(chunks, true, true) }
+                    let chunks = vec![concatenate_unchecked(&self.chunks).unwrap()];
+
+                    let mut ca = unsafe { self.copy_with_chunks(chunks) };
+                    use StatisticsFlags as F;
+                    ca.retain_flags_from(self, F::IS_SORTED_ANY | F::CAN_FAST_EXPLODE_LIST);
+                    Cow::Owned(ca)
                 }
             },
         }
+    }
+
+    /// Rechunks this ChunkedArray in-place.
+    pub fn rechunk_mut(&mut self) {
+        if self.chunks.len() > 1 {
+            let rechunked = concatenate_unchecked(&self.chunks).unwrap();
+            if self.chunks.capacity() <= 8 {
+                // Reuse chunk allocation if not excessive.
+                self.chunks.clear();
+                self.chunks.push(rechunked);
+            } else {
+                self.chunks = vec![rechunked];
+            }
+        }
+    }
+
+    pub fn rechunk_validity(&self) -> Option<Bitmap> {
+        if self.chunks.len() == 1 {
+            return self.chunks[0].validity().cloned();
+        }
+
+        if !self.has_nulls() || self.is_empty() {
+            return None;
+        }
+
+        let mut bm = BitmapBuilder::with_capacity(self.len());
+        for arr in self.downcast_iter() {
+            if let Some(v) = arr.validity() {
+                bm.extend_from_bitmap(v);
+            } else {
+                bm.extend_constant(arr.len(), true);
+            }
+        }
+        bm.into_opt_validity()
+    }
+
+    /// Split the array. The chunks are reallocated the underlying data slices are zero copy.
+    ///
+    /// When offset is negative it will be counted from the end of the array.
+    /// This method will never error,
+    /// and will slice the best match when offset, or length is out of bounds
+    pub fn split_at(&self, offset: i64) -> (Self, Self) {
+        // A normal slice, slice the buffers and thus keep the whole memory allocated.
+        let (l, r) = split_at(&self.chunks, offset, self.len());
+        let mut out_l = unsafe { self.copy_with_chunks(l) };
+        let mut out_r = unsafe { self.copy_with_chunks(r) };
+
+        use StatisticsFlags as F;
+        out_l.retain_flags_from(self, F::IS_SORTED_ANY | F::CAN_FAST_EXPLODE_LIST);
+        out_r.retain_flags_from(self, F::IS_SORTED_ANY | F::CAN_FAST_EXPLODE_LIST);
+
+        (out_l, out_r)
     }
 
     /// Slice the array. The chunks are reallocated the underlying data slices are zero copy.
@@ -127,14 +239,17 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     /// When offset is negative it will be counted from the end of the array.
     /// This method will never error,
     /// and will slice the best match when offset, or length is out of bounds
-    #[inline]
     pub fn slice(&self, offset: i64, length: usize) -> Self {
         // The len: 0 special cases ensure we release memory.
         // A normal slice, slice the buffers and thus keep the whole memory allocated.
         let exec = || {
             let (chunks, len) = slice(&self.chunks, offset, length, self.len());
-            let mut out = unsafe { self.copy_with_chunks(chunks, true, true) };
-            out.length = len as IdxSize;
+            let mut out = unsafe { self.copy_with_chunks(chunks) };
+
+            use StatisticsFlags as F;
+            out.retain_flags_from(self, F::IS_SORTED_ANY | F::CAN_FAST_EXPLODE_LIST);
+            out.length = len;
+
             out
         };
 
@@ -206,12 +321,12 @@ impl<T: PolarsObject> ObjectChunked<T> {
         if self.chunks.len() == 1 {
             self.clone()
         } else {
-            let mut builder = ObjectChunkedBuilder::new(self.name(), self.len());
+            let mut builder = ObjectChunkedBuilder::new(self.name().clone(), self.len());
             let chunks = self.downcast_iter();
 
             // todo! use iterators once implemented
             // no_null path
-            if !self.has_validity() {
+            if !self.has_nulls() {
                 for arr in chunks {
                     for idx in 0..arr.len() {
                         builder.append_value(arr.value(idx).clone())
@@ -241,7 +356,7 @@ mod test {
     #[test]
     #[cfg(feature = "dtype-categorical")]
     fn test_categorical_map_after_rechunk() {
-        let s = Series::new("", &["foo", "bar", "spam"]);
+        let s = Series::new(PlSmallStr::EMPTY, &["foo", "bar", "spam"]);
         let mut a = s
             .cast(&DataType::Categorical(None, Default::default()))
             .unwrap();

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import contextlib
 from datetime import date
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
-from polars._utils.parse_expr_input import parse_as_expression
+from polars._utils.parse import parse_into_expression
 from polars._utils.wrap import wrap_expr
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from polars import Expr
-    from polars.type_aliases import IntoExprColumn
+    from polars._typing import IntoExprColumn
 
 
 def business_day_count(
@@ -110,8 +112,8 @@ def business_day_count(
     │ 2020-01-02 ┆ 2020-01-10 ┆ 5                  │
     └────────────┴────────────┴────────────────────┘
     """
-    start_pyexpr = parse_as_expression(start)
-    end_pyexpr = parse_as_expression(end)
+    start_pyexpr = parse_into_expression(start)
+    end_pyexpr = parse_into_expression(end)
     unix_epoch = date(1970, 1, 1)
     return wrap_expr(
         plr.business_day_count(

@@ -101,6 +101,7 @@ impl SortSource {
                     nulls_last: self.nulls_last,
                     multithreaded: true,
                     maintain_order: false,
+                    limit: None,
                 },
             ),
             Some((offset, len)) => {
@@ -119,6 +120,7 @@ impl SortSource {
                             nulls_last: self.nulls_last,
                             multithreaded: true,
                             maintain_order: false,
+                            limit: None,
                         },
                     );
                     *len = len.saturating_sub(df_len);
@@ -133,7 +135,7 @@ impl SortSource {
         }?;
 
         // convert to chunks
-        let dfs = split_df(&mut df, self.n_threads)?;
+        let dfs = split_df(&mut df, self.n_threads, true);
         Ok(SourceResult::GotMoreData(self.finish_batch(dfs)))
     }
     fn print_verbose(&self, verbose: bool) {

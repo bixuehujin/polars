@@ -1,14 +1,13 @@
-use std::sync::Arc;
-
+use super::CowBuffer;
 use crate::parquet::compression::Compression;
 use crate::parquet::encoding::{get_length, Encoding};
-use crate::parquet::error::{Error, Result};
-use crate::parquet::indexes::Interval;
+use crate::parquet::error::{ParquetError, ParquetResult};
 use crate::parquet::metadata::Descriptor;
 pub use crate::parquet::parquet_bridge::{DataPageHeaderExt, PageType};
-use crate::parquet::statistics::{deserialize_statistics, Statistics};
+use crate::parquet::statistics::Statistics;
 pub use crate::parquet::thrift_format::{
-    DataPageHeader as DataPageHeaderV1, DataPageHeaderV2, PageHeader as ParquetPageHeader,
+    DataPageHeader as DataPageHeaderV1, DataPageHeaderV2, Encoding as FormatEncoding,
+    PageHeader as ParquetPageHeader,
 };
 
 pub enum PageResult {
@@ -21,43 +20,22 @@ pub enum PageResult {
 #[derive(Debug)]
 pub struct CompressedDataPage {
     pub(crate) header: DataPageHeader,
-    pub(crate) buffer: Vec<u8>,
+    pub(crate) buffer: CowBuffer,
     pub(crate) compression: Compression,
     uncompressed_page_size: usize,
     pub(crate) descriptor: Descriptor,
-
-    // The offset and length in rows
-    pub(crate) selected_rows: Option<Vec<Interval>>,
+    pub num_rows: Option<usize>,
 }
 
 impl CompressedDataPage {
     /// Returns a new [`CompressedDataPage`].
     pub fn new(
         header: DataPageHeader,
-        buffer: Vec<u8>,
+        buffer: CowBuffer,
         compression: Compression,
         uncompressed_page_size: usize,
         descriptor: Descriptor,
-        rows: Option<usize>,
-    ) -> Self {
-        Self::new_read(
-            header,
-            buffer,
-            compression,
-            uncompressed_page_size,
-            descriptor,
-            rows.map(|x| vec![Interval::new(0, x)]),
-        )
-    }
-
-    /// Returns a new [`CompressedDataPage`].
-    pub(crate) fn new_read(
-        header: DataPageHeader,
-        buffer: Vec<u8>,
-        compression: Compression,
-        uncompressed_page_size: usize,
-        descriptor: Descriptor,
-        selected_rows: Option<Vec<Interval>>,
+        num_rows: usize,
     ) -> Self {
         Self {
             header,
@@ -65,7 +43,25 @@ impl CompressedDataPage {
             compression,
             uncompressed_page_size,
             descriptor,
-            selected_rows,
+            num_rows: Some(num_rows),
+        }
+    }
+
+    /// Returns a new [`CompressedDataPage`].
+    pub(crate) fn new_read(
+        header: DataPageHeader,
+        buffer: CowBuffer,
+        compression: Compression,
+        uncompressed_page_size: usize,
+        descriptor: Descriptor,
+    ) -> Self {
+        Self {
+            header,
+            buffer,
+            compression,
+            uncompressed_page_size,
+            descriptor,
+            num_rows: None,
         }
     }
 
@@ -88,33 +84,30 @@ impl CompressedDataPage {
         self.compression
     }
 
-    /// the rows to be selected by this page.
-    /// When `None`, all rows are to be considered.
-    pub fn selected_rows(&self) -> Option<&[Interval]> {
-        self.selected_rows.as_deref()
-    }
-
     pub fn num_values(&self) -> usize {
         self.header.num_values()
     }
 
+    pub fn num_rows(&self) -> Option<usize> {
+        self.num_rows
+    }
+
     /// Decodes the raw statistics into a statistics
-    pub fn statistics(&self) -> Option<Result<Arc<dyn Statistics>>> {
+    pub fn statistics(&self) -> Option<ParquetResult<Statistics>> {
         match &self.header {
             DataPageHeader::V1(d) => d
                 .statistics
                 .as_ref()
-                .map(|x| deserialize_statistics(x, self.descriptor.primitive_type.clone())),
+                .map(|x| Statistics::deserialize(x, self.descriptor.primitive_type.clone())),
             DataPageHeader::V2(d) => d
                 .statistics
                 .as_ref()
-                .map(|x| deserialize_statistics(x, self.descriptor.primitive_type.clone())),
+                .map(|x| Statistics::deserialize(x, self.descriptor.primitive_type.clone())),
         }
     }
 
-    #[inline]
-    pub fn select_rows(&mut self, selected_rows: Vec<Interval>) {
-        self.selected_rows = Some(selected_rows);
+    pub fn slice_mut(&mut self) -> &mut CowBuffer {
+        &mut self.buffer
     }
 }
 
@@ -131,6 +124,24 @@ impl DataPageHeader {
             DataPageHeader::V2(d) => d.num_values as usize,
         }
     }
+
+    pub fn null_count(&self) -> Option<usize> {
+        match &self {
+            DataPageHeader::V1(_) => None,
+            DataPageHeader::V2(d) => Some(d.num_nulls as usize),
+        }
+    }
+
+    pub fn encoding(&self) -> FormatEncoding {
+        match self {
+            DataPageHeader::V1(d) => d.encoding,
+            DataPageHeader::V2(d) => d.encoding,
+        }
+    }
+
+    pub fn is_dictionary_encoded(&self) -> bool {
+        matches!(self.encoding(), FormatEncoding::RLE_DICTIONARY)
+    }
 }
 
 /// A [`DataPage`] is an uncompressed, encoded representation of a Parquet data page. It holds actual data
@@ -138,37 +149,36 @@ impl DataPageHeader {
 #[derive(Debug, Clone)]
 pub struct DataPage {
     pub(super) header: DataPageHeader,
-    pub(super) buffer: Vec<u8>,
+    pub(super) buffer: CowBuffer,
     pub descriptor: Descriptor,
-    pub selected_rows: Option<Vec<Interval>>,
+    pub num_rows: Option<usize>,
 }
 
 impl DataPage {
     pub fn new(
         header: DataPageHeader,
-        buffer: Vec<u8>,
+        buffer: CowBuffer,
         descriptor: Descriptor,
-        rows: Option<usize>,
-    ) -> Self {
-        Self::new_read(
-            header,
-            buffer,
-            descriptor,
-            rows.map(|x| vec![Interval::new(0, x)]),
-        )
-    }
-
-    pub(crate) fn new_read(
-        header: DataPageHeader,
-        buffer: Vec<u8>,
-        descriptor: Descriptor,
-        selected_rows: Option<Vec<Interval>>,
+        num_rows: usize,
     ) -> Self {
         Self {
             header,
             buffer,
             descriptor,
-            selected_rows,
+            num_rows: Some(num_rows),
+        }
+    }
+
+    pub(crate) fn new_read(
+        header: DataPageHeader,
+        buffer: CowBuffer,
+        descriptor: Descriptor,
+    ) -> Self {
+        Self {
+            header,
+            buffer,
+            descriptor,
+            num_rows: None,
         }
     }
 
@@ -180,20 +190,22 @@ impl DataPage {
         &self.buffer
     }
 
-    /// the rows to be selected by this page.
-    /// When `None`, all rows are to be considered.
-    pub fn selected_rows(&self) -> Option<&[Interval]> {
-        self.selected_rows.as_deref()
-    }
-
     /// Returns a mutable reference to the internal buffer.
     /// Useful to recover the buffer after the page has been decoded.
     pub fn buffer_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buffer
+        self.buffer.to_mut()
     }
 
     pub fn num_values(&self) -> usize {
         self.header.num_values()
+    }
+
+    pub fn null_count(&self) -> Option<usize> {
+        self.header.null_count()
+    }
+
+    pub fn num_rows(&self) -> Option<usize> {
+        self.num_rows
     }
 
     pub fn encoding(&self) -> Encoding {
@@ -218,16 +230,16 @@ impl DataPage {
     }
 
     /// Decodes the raw statistics into a statistics
-    pub fn statistics(&self) -> Option<Result<Arc<dyn Statistics>>> {
+    pub fn statistics(&self) -> Option<ParquetResult<Statistics>> {
         match &self.header {
             DataPageHeader::V1(d) => d
                 .statistics
                 .as_ref()
-                .map(|x| deserialize_statistics(x, self.descriptor.primitive_type.clone())),
+                .map(|x| Statistics::deserialize(x, self.descriptor.primitive_type.clone())),
             DataPageHeader::V2(d) => d
                 .statistics
                 .as_ref()
-                .map(|x| deserialize_statistics(x, self.descriptor.primitive_type.clone())),
+                .map(|x| Statistics::deserialize(x, self.descriptor.primitive_type.clone())),
         }
     }
 }
@@ -244,12 +256,13 @@ pub enum Page {
 }
 
 impl Page {
-    pub(crate) fn buffer(&mut self) -> &mut Vec<u8> {
+    pub(crate) fn buffer_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            Self::Data(page) => &mut page.buffer,
-            Self::Dict(page) => &mut page.buffer,
+            Self::Data(page) => page.buffer.to_mut(),
+            Self::Dict(page) => page.buffer.to_mut(),
         }
     }
+
     pub(crate) fn unwrap_data(self) -> DataPage {
         match self {
             Self::Data(page) => page,
@@ -268,10 +281,10 @@ pub enum CompressedPage {
 }
 
 impl CompressedPage {
-    pub(crate) fn buffer(&mut self) -> &mut Vec<u8> {
+    pub(crate) fn buffer_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            CompressedPage::Data(page) => &mut page.buffer,
-            CompressedPage::Dict(page) => &mut page.buffer,
+            CompressedPage::Data(page) => page.buffer.to_mut(),
+            CompressedPage::Dict(page) => page.buffer.to_mut(),
         }
     }
 
@@ -289,31 +302,24 @@ impl CompressedPage {
         }
     }
 
-    pub(crate) fn selected_rows(&self) -> Option<&[Interval]> {
+    pub(crate) fn num_rows(&self) -> Option<usize> {
         match self {
-            CompressedPage::Data(page) => page.selected_rows(),
-            CompressedPage::Dict(_) => None,
-        }
-    }
-
-    pub(crate) fn uncompressed_size(&self) -> usize {
-        match self {
-            CompressedPage::Data(page) => page.uncompressed_page_size,
-            CompressedPage::Dict(page) => page.uncompressed_page_size,
+            CompressedPage::Data(page) => page.num_rows(),
+            CompressedPage::Dict(_) => Some(0),
         }
     }
 }
 
 /// An uncompressed, encoded dictionary page.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DictPage {
-    pub buffer: Vec<u8>,
+    pub buffer: CowBuffer,
     pub num_values: usize,
     pub is_sorted: bool,
 }
 
 impl DictPage {
-    pub fn new(buffer: Vec<u8>, num_values: usize, is_sorted: bool) -> Self {
+    pub fn new(buffer: CowBuffer, num_values: usize, is_sorted: bool) -> Self {
         Self {
             buffer,
             num_values,
@@ -325,7 +331,7 @@ impl DictPage {
 /// A compressed, encoded dictionary page.
 #[derive(Debug)]
 pub struct CompressedDictPage {
-    pub(crate) buffer: Vec<u8>,
+    pub(crate) buffer: CowBuffer,
     compression: Compression,
     pub(crate) num_values: usize,
     pub(crate) uncompressed_page_size: usize,
@@ -334,7 +340,7 @@ pub struct CompressedDictPage {
 
 impl CompressedDictPage {
     pub fn new(
-        buffer: Vec<u8>,
+        buffer: CowBuffer,
         compression: Compression,
         uncompressed_page_size: usize,
         num_values: usize,
@@ -355,54 +361,63 @@ impl CompressedDictPage {
     }
 }
 
+pub struct EncodedSplitBuffer<'a> {
+    /// Encoded Repetition Levels
+    pub rep: &'a [u8],
+    /// Encoded Definition Levels
+    pub def: &'a [u8],
+    /// Encoded Values
+    pub values: &'a [u8],
+}
+
 /// Splits the page buffer into 3 slices corresponding to (encoded rep levels, encoded def levels, encoded values) for v1 pages.
 #[inline]
 pub fn split_buffer_v1(
     buffer: &[u8],
     has_rep: bool,
     has_def: bool,
-) -> Result<(&[u8], &[u8], &[u8])> {
+) -> ParquetResult<EncodedSplitBuffer> {
     let (rep, buffer) = if has_rep {
         let level_buffer_length = get_length(buffer).ok_or_else(|| {
-            Error::oos("The number of bytes declared in v1 rep levels is higher than the page size")
+            ParquetError::oos(
+                "The number of bytes declared in v1 rep levels is higher than the page size",
+            )
         })?;
-        (
-            buffer.get(4..4 + level_buffer_length).ok_or_else(|| {
-                Error::oos(
-                    "The number of bytes declared in v1 rep levels is higher than the page size",
-                )
-            })?,
-            buffer.get(4 + level_buffer_length..).ok_or_else(|| {
-                Error::oos(
-                    "The number of bytes declared in v1 rep levels is higher than the page size",
-                )
-            })?,
-        )
+
+        if buffer.len() < level_buffer_length + 4 {
+            return Err(ParquetError::oos(
+                "The number of bytes declared in v1 rep levels is higher than the page size",
+            ));
+        }
+
+        buffer[4..].split_at(level_buffer_length)
     } else {
         (&[] as &[u8], buffer)
     };
 
     let (def, buffer) = if has_def {
         let level_buffer_length = get_length(buffer).ok_or_else(|| {
-            Error::oos("The number of bytes declared in v1 rep levels is higher than the page size")
+            ParquetError::oos(
+                "The number of bytes declared in v1 def levels is higher than the page size",
+            )
         })?;
-        (
-            buffer.get(4..4 + level_buffer_length).ok_or_else(|| {
-                Error::oos(
-                    "The number of bytes declared in v1 def levels is higher than the page size",
-                )
-            })?,
-            buffer.get(4 + level_buffer_length..).ok_or_else(|| {
-                Error::oos(
-                    "The number of bytes declared in v1 def levels is higher than the page size",
-                )
-            })?,
-        )
+
+        if buffer.len() < level_buffer_length + 4 {
+            return Err(ParquetError::oos(
+                "The number of bytes declared in v1 def levels is higher than the page size",
+            ));
+        }
+
+        buffer[4..].split_at(level_buffer_length)
     } else {
         (&[] as &[u8], buffer)
     };
 
-    Ok((rep, def, buffer))
+    Ok(EncodedSplitBuffer {
+        rep,
+        def,
+        values: buffer,
+    })
 }
 
 /// Splits the page buffer into 3 slices corresponding to (encoded rep levels, encoded def levels, encoded values) for v2 pages.
@@ -410,16 +425,15 @@ pub fn split_buffer_v2(
     buffer: &[u8],
     rep_level_buffer_length: usize,
     def_level_buffer_length: usize,
-) -> Result<(&[u8], &[u8], &[u8])> {
-    Ok((
-        &buffer[..rep_level_buffer_length],
-        &buffer[rep_level_buffer_length..rep_level_buffer_length + def_level_buffer_length],
-        &buffer[rep_level_buffer_length + def_level_buffer_length..],
-    ))
+) -> ParquetResult<EncodedSplitBuffer> {
+    let (rep, buffer) = buffer.split_at(rep_level_buffer_length);
+    let (def, values) = buffer.split_at(def_level_buffer_length);
+
+    Ok(EncodedSplitBuffer { rep, def, values })
 }
 
 /// Splits the page buffer into 3 slices corresponding to (encoded rep levels, encoded def levels, encoded values).
-pub fn split_buffer(page: &DataPage) -> Result<(&[u8], &[u8], &[u8])> {
+pub fn split_buffer(page: &DataPage) -> ParquetResult<EncodedSplitBuffer> {
     match page.header() {
         DataPageHeader::V1(_) => split_buffer_v1(
             page.buffer(),

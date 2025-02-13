@@ -14,6 +14,10 @@ This page gives an overview of all public LazyFrame methods.
    group_by
    modify_select
    miscellaneous
+   in_process
+   gpu_engine
+
+.. _lazyframe:
 
 .. currentmodule:: polars
 

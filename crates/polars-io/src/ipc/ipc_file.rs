@@ -1,6 +1,6 @@
 //! # (De)serializing Arrows IPC format.
 //!
-//! Arrow IPC is a [binary format format](https://arrow.apache.org/docs/python/ipc.html).
+//! Arrow IPC is a [binary format](https://arrow.apache.org/docs/python/ipc.html).
 //! It is the recommended way to serialize and deserialize Polars DataFrames as this is most true
 //! to the data schema.
 //!
@@ -12,8 +12,8 @@
 //! use std::io::Cursor;
 //!
 //!
-//! let s0 = Series::new("days", &[0, 1, 2, 3, 4]);
-//! let s1 = Series::new("temp", &[22.1, 19.9, 7., 2., 3.]);
+//! let s0 = Column::new("days".into(), &[0, 1, 2, 3, 4]);
+//! let s1 = Column::new("temp".into(), &[22.1, 19.9, 7., 2., 3.]);
 //! let mut df = DataFrame::new(vec![s0, s1]).unwrap();
 //!
 //! // Create an in memory file handler.
@@ -33,17 +33,25 @@
 //! assert!(df.equals(&df_read));
 //! ```
 use std::io::{Read, Seek};
+use std::path::PathBuf;
 
-use arrow::datatypes::ArrowSchemaRef;
-use arrow::io::ipc::read;
-use polars_core::frame::ArrowChunk;
+use arrow::datatypes::{ArrowSchemaRef, Metadata};
+use arrow::io::ipc::read::{self, get_row_count};
+use arrow::record_batch::RecordBatch;
 use polars_core::prelude::*;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
-use super::{finish_reader, ArrowReader};
+use crate::hive::materialize_hive_partitions;
 use crate::mmap::MmapBytesReader;
 use crate::predicates::PhysicalIoExpr;
 use crate::prelude::*;
+use crate::shared::{finish_reader, ArrowReader};
 use crate::RowIndex;
+
+#[derive(Clone, Debug, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct IpcScanOptions;
 
 /// Read Arrows IPC format into a DataFrame
 ///
@@ -70,8 +78,11 @@ pub struct IpcReader<R: MmapBytesReader> {
     pub(super) n_rows: Option<usize>,
     pub(super) projection: Option<Vec<usize>>,
     pub(crate) columns: Option<Vec<String>>,
+    hive_partition_columns: Option<Vec<Series>>,
+    include_file_path: Option<(PlSmallStr, Arc<str>)>,
     pub(super) row_index: Option<RowIndex>,
-    memory_map: bool,
+    // Stores the as key semaphore to make sure we don't write to the memory mapped file.
+    pub(super) memory_map: Option<PathBuf>,
     metadata: Option<read::FileMetadata>,
     schema: Option<ArrowSchemaRef>,
 }
@@ -104,6 +115,16 @@ impl<R: MmapBytesReader> IpcReader<R> {
         self.get_metadata()?;
         Ok(self.schema.as_ref().unwrap().clone())
     }
+
+    /// Get schema-level custom metadata of the Ipc file
+    pub fn custom_metadata(&mut self) -> PolarsResult<Option<Arc<Metadata>>> {
+        self.get_metadata()?;
+        Ok(self
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.custom_schema_metadata.clone()))
+    }
+
     /// Stop reading when `n` rows are read.
     pub fn with_n_rows(mut self, num_rows: Option<usize>) -> Self {
         self.n_rows = num_rows;
@@ -113,6 +134,19 @@ impl<R: MmapBytesReader> IpcReader<R> {
     /// Columns to select/ project
     pub fn with_columns(mut self, columns: Option<Vec<String>>) -> Self {
         self.columns = columns;
+        self
+    }
+
+    pub fn with_hive_partition_columns(mut self, columns: Option<Vec<Series>>) -> Self {
+        self.hive_partition_columns = columns;
+        self
+    }
+
+    pub fn with_include_file_path(
+        mut self,
+        include_file_path: Option<(PlSmallStr, Arc<str>)>,
+    ) -> Self {
+        self.include_file_path = include_file_path;
         self
     }
 
@@ -130,8 +164,9 @@ impl<R: MmapBytesReader> IpcReader<R> {
     }
 
     /// Set if the file is to be memory_mapped. Only works with uncompressed files.
-    pub fn memory_mapped(mut self, toggle: bool) -> Self {
-        self.memory_map = toggle;
+    /// The file name must be passed to register the memory mapped file.
+    pub fn memory_mapped(mut self, path_buf: Option<PathBuf>) -> Self {
+        self.memory_map = path_buf;
         self
     }
 
@@ -142,7 +177,7 @@ impl<R: MmapBytesReader> IpcReader<R> {
         predicate: Option<Arc<dyn PhysicalIoExpr>>,
         verbose: bool,
     ) -> PolarsResult<DataFrame> {
-        if self.memory_map && self.reader.to_file().is_some() {
+        if self.memory_map.is_some() && self.reader.to_file().is_some() {
             if verbose {
                 eprintln!("memory map ipc file")
             }
@@ -177,7 +212,7 @@ impl<R: MmapBytesReader> ArrowReader for read::FileReader<R>
 where
     R: Read + Seek,
 {
-    fn next_record_batch(&mut self) -> PolarsResult<Option<ArrowChunk>> {
+    fn next_record_batch(&mut self) -> PolarsResult<Option<RecordBatch>> {
         self.next().map_or(Ok(None), |v| v.map(Some))
     }
 }
@@ -189,9 +224,11 @@ impl<R: MmapBytesReader> SerReader<R> for IpcReader<R> {
             rechunk: true,
             n_rows: None,
             columns: None,
+            hive_partition_columns: None,
+            include_file_path: None,
             projection: None,
             row_index: None,
-            memory_map: true,
+            memory_map: None,
             metadata: None,
             schema: None,
         }
@@ -203,29 +240,85 @@ impl<R: MmapBytesReader> SerReader<R> for IpcReader<R> {
     }
 
     fn finish(mut self) -> PolarsResult<DataFrame> {
-        if self.memory_map && self.reader.to_file().is_some() {
-            match self.finish_memmapped(None) {
-                Ok(df) => return Ok(df),
-                Err(err) => check_mmap_err(err)?,
-            }
-        }
-        let rechunk = self.rechunk;
-        let metadata = read::read_file_metadata(&mut self.reader)?;
-        let schema = &metadata.schema;
-
-        if let Some(columns) = &self.columns {
-            let prj = columns_to_projection(columns, schema)?;
-            self.projection = Some(prj);
-        }
-
-        let schema = if let Some(projection) = &self.projection {
-            Arc::new(apply_projection(&metadata.schema, projection))
+        let reader_schema = if let Some(ref schema) = self.schema {
+            schema.clone()
         } else {
-            metadata.schema.clone()
+            self.get_metadata()?.schema.clone()
+        };
+        let reader_schema = reader_schema.as_ref();
+
+        let hive_partition_columns = self.hive_partition_columns.take();
+        let include_file_path = self.include_file_path.take();
+
+        // In case only hive columns are projected, the df would be empty, but we need the row count
+        // of the file in order to project the correct number of rows for the hive columns.
+        let (mut df, row_count) = (|| {
+            if self.projection.as_ref().is_some_and(|x| x.is_empty()) {
+                let row_count = if let Some(v) = self.n_rows {
+                    v
+                } else {
+                    get_row_count(&mut self.reader)? as usize
+                };
+                let mut df = DataFrame::empty();
+                unsafe { df.set_height(row_count) };
+
+                return PolarsResult::Ok((df, row_count));
+            }
+
+            if self.memory_map.is_some() && self.reader.to_file().is_some() {
+                match self.finish_memmapped(None) {
+                    Ok(df) => {
+                        let n = df.height();
+                        return Ok((df, n));
+                    },
+                    Err(err) => check_mmap_err(err)?,
+                }
+            }
+            let rechunk = self.rechunk;
+            let schema = self.get_metadata()?.schema.clone();
+
+            if let Some(columns) = &self.columns {
+                let prj = columns_to_projection(columns, schema.as_ref())?;
+                self.projection = Some(prj);
+            }
+
+            let schema = if let Some(projection) = &self.projection {
+                Arc::new(apply_projection(schema.as_ref(), projection))
+            } else {
+                schema
+            };
+
+            let metadata = self.get_metadata()?.clone();
+
+            let ipc_reader =
+                read::FileReader::new(self.reader, metadata, self.projection, self.n_rows);
+            let df = finish_reader(ipc_reader, rechunk, None, None, &schema, self.row_index)?;
+            let n = df.height();
+            Ok((df, n))
+        })()?;
+
+        if let Some(hive_cols) = hive_partition_columns {
+            materialize_hive_partitions(
+                &mut df,
+                reader_schema,
+                Some(hive_cols.as_slice()),
+                row_count,
+            );
         };
 
-        let ipc_reader =
-            read::FileReader::new(self.reader, metadata.clone(), self.projection, self.n_rows);
-        finish_reader(ipc_reader, rechunk, None, None, &schema, self.row_index)
+        if let Some((col, value)) = include_file_path {
+            unsafe {
+                df.with_column_unchecked(Column::new_scalar(
+                    col,
+                    Scalar::new(
+                        DataType::String,
+                        AnyValue::StringOwned(value.as_ref().into()),
+                    ),
+                    row_count,
+                ))
+            };
+        }
+
+        Ok(df)
     }
 }

@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
-use polars_utils::slice::GetSaferUnchecked;
-
 use super::{make_growable, Growable};
 use crate::array::growable::utils::{extend_validity, prepare_validity};
 use crate::array::{Array, DictionaryArray, DictionaryKey, PrimitiveArray};
-use crate::bitmap::MutableBitmap;
+use crate::bitmap::BitmapBuilder;
 use crate::datatypes::ArrowDataType;
 
 /// Concrete [`Growable`] for the [`DictionaryArray`].
@@ -13,10 +11,10 @@ use crate::datatypes::ArrowDataType;
 /// This growable does not perform collision checks and instead concatenates
 /// the values of each [`DictionaryArray`] one after the other.
 pub struct GrowableDictionary<'a, K: DictionaryKey> {
-    data_type: ArrowDataType,
+    dtype: ArrowDataType,
     keys: Vec<&'a PrimitiveArray<K>>,
     key_values: Vec<K>,
-    validity: Option<MutableBitmap>,
+    validity: Option<BitmapBuilder>,
     offsets: Vec<usize>,
     values: Box<dyn Array>,
 }
@@ -41,7 +39,7 @@ impl<'a, T: DictionaryKey> GrowableDictionary<'a, T> {
     /// # Panics
     /// If `arrays` is empty.
     pub fn new(arrays: &[&'a DictionaryArray<T>], mut use_validity: bool, capacity: usize) -> Self {
-        let data_type = arrays[0].data_type().clone();
+        let dtype = arrays[0].dtype().clone();
 
         // if any of the arrays has nulls, insertions from any array requires setting bits
         // as there is at least one array with nulls.
@@ -58,7 +56,7 @@ impl<'a, T: DictionaryKey> GrowableDictionary<'a, T> {
         let (values, offsets) = concatenate_values(&arrays_keys, &arrays_values, capacity);
 
         Self {
-            data_type,
+            dtype,
             offsets,
             values,
             keys: arrays_keys,
@@ -79,17 +77,13 @@ impl<'a, T: DictionaryKey> GrowableDictionary<'a, T> {
         let keys = PrimitiveArray::<T>::new(
             T::PRIMITIVE.into(),
             key_values.into(),
-            validity.map(|v| v.into()),
+            validity.map(|v| v.freeze()),
         );
 
         // SAFETY: the invariant of this struct ensures that this is up-held
         unsafe {
-            DictionaryArray::<T>::try_new_unchecked(
-                self.data_type.clone(),
-                keys,
-                self.values.clone(),
-            )
-            .unwrap()
+            DictionaryArray::<T>::try_new_unchecked(self.dtype.clone(), keys, self.values.clone())
+                .unwrap()
         }
     }
 }
@@ -97,13 +91,11 @@ impl<'a, T: DictionaryKey> GrowableDictionary<'a, T> {
 impl<'a, T: DictionaryKey> Growable<'a> for GrowableDictionary<'a, T> {
     #[inline]
     unsafe fn extend(&mut self, index: usize, start: usize, len: usize) {
-        let keys_array = *self.keys.get_unchecked_release(index);
+        let keys_array = *self.keys.get_unchecked(index);
         extend_validity(&mut self.validity, keys_array, start, len);
 
-        let values = &keys_array
-            .values()
-            .get_unchecked_release(start..start + len);
-        let offset = self.offsets.get_unchecked_release(index);
+        let values = &keys_array.values().get_unchecked(start..start + len);
+        let offset = self.offsets.get_unchecked(index);
         self.key_values.extend(
             values
                 .iter()

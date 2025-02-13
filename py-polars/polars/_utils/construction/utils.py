@@ -1,30 +1,49 @@
 from __future__ import annotations
 
-import sys
 from functools import lru_cache
-from typing import Any, Callable, Sequence, get_type_hints
+from typing import TYPE_CHECKING, Any, Callable, get_type_hints
 
 from polars.dependencies import _check_for_pydantic, pydantic
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import pandas as pd
+
+PANDAS_SIMPLE_NUMPY_DTYPES = {
+    "int64",
+    "int32",
+    "int16",
+    "int8",
+    "uint64",
+    "uint32",
+    "uint16",
+    "uint8",
+    "float64",
+    "float32",
+    "datetime64[ms]",
+    "datetime64[us]",
+    "datetime64[ns]",
+    "timedelta64[ms]",
+    "timedelta64[us]",
+    "timedelta64[ns]",
+    "bool",
+}
 
 
 def _get_annotations(obj: type) -> dict[str, Any]:
     return getattr(obj, "__annotations__", {})
 
 
-if sys.version_info >= (3, 10):
-
-    def try_get_type_hints(obj: type) -> dict[str, Any]:
-        try:
-            # often the same as obj.__annotations__, but handles forward references
-            # encoded as string literals, adds Optional[t] if a default value equal
-            # to None is set and recursively replaces 'Annotated[T, ...]' with 'T'.
-            return get_type_hints(obj)
-        except TypeError:
-            # fallback on edge-cases (eg: InitVar inference on python 3.10).
-            return _get_annotations(obj)
-
-else:
-    try_get_type_hints = _get_annotations
+def try_get_type_hints(obj: type) -> dict[str, Any]:
+    try:
+        # often the same as obj.__annotations__, but handles forward references
+        # encoded as string literals, adds Optional[t] if a default value equal
+        # to None is set and recursively replaces 'Annotated[T, ...]' with 'T'.
+        return get_type_hints(obj)
+    except TypeError:
+        # fallback on edge-cases (eg: InitVar inference on python 3.10).
+        return _get_annotations(obj)
 
 
 @lru_cache(64)
@@ -40,6 +59,11 @@ def is_namedtuple(cls: Any, *, annotated: bool = False) -> bool:
 def is_pydantic_model(value: Any) -> bool:
     """Check whether value derives from a pydantic.BaseModel."""
     return _check_for_pydantic(value) and isinstance(value, pydantic.BaseModel)
+
+
+def is_sqlalchemy(value: Any) -> bool:
+    """Check whether value is an instance of a SQLAlchemy object."""
+    return getattr(value, "__module__", "").startswith("sqlalchemy.")
 
 
 def get_first_non_none(values: Sequence[Any | None]) -> Any:
@@ -75,3 +99,19 @@ def contains_nested(value: Any, is_nested: Callable[[Any], bool]) -> bool:
     elif isinstance(value, (list, tuple)):
         return any(contains_nested(v, is_nested) for v in value)
     return False
+
+
+def is_simple_numpy_backed_pandas_series(
+    series: pd.Series[Any] | pd.Index[Any] | pd.DatetimeIndex,
+) -> bool:
+    if len(series.shape) > 1:
+        # Pandas Series is actually a Pandas DataFrame when the original DataFrame
+        # contains duplicated columns and a duplicated column is requested with df["a"].
+        msg = f"duplicate column names found: {series.columns.tolist()!s}"  # type: ignore[union-attr]
+        raise ValueError(msg)
+    return (str(series.dtype) in PANDAS_SIMPLE_NUMPY_DTYPES) or (
+        series.dtype == "object"
+        and not series.hasnans
+        and not series.empty
+        and isinstance(next(iter(series)), str)
+    )

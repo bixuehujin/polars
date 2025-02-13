@@ -1,16 +1,14 @@
 use std::sync::Arc;
 
-use polars_utils::slice::GetSaferUnchecked;
-
 use super::Growable;
 use crate::array::growable::utils::{extend_validity, prepare_validity};
 use crate::array::{Array, FixedSizeBinaryArray};
-use crate::bitmap::MutableBitmap;
+use crate::bitmap::BitmapBuilder;
 
 /// Concrete [`Growable`] for the [`FixedSizeBinaryArray`].
 pub struct GrowableFixedSizeBinary<'a> {
     arrays: Vec<&'a FixedSizeBinaryArray>,
-    validity: Option<MutableBitmap>,
+    validity: Option<BitmapBuilder>,
     values: Vec<u8>,
     size: usize, // just a cache
 }
@@ -30,7 +28,7 @@ impl<'a> GrowableFixedSizeBinary<'a> {
             use_validity = true;
         };
 
-        let size = FixedSizeBinaryArray::get_size(arrays[0].data_type());
+        let size = FixedSizeBinaryArray::get_size(arrays[0].dtype());
         Self {
             arrays,
             values: Vec::with_capacity(0),
@@ -44,22 +42,22 @@ impl<'a> GrowableFixedSizeBinary<'a> {
         let values = std::mem::take(&mut self.values);
 
         FixedSizeBinaryArray::new(
-            self.arrays[0].data_type().clone(),
+            self.arrays[0].dtype().clone(),
             values.into(),
-            validity.map(|v| v.into()),
+            validity.map(|v| v.freeze()),
         )
     }
 }
 
 impl<'a> Growable<'a> for GrowableFixedSizeBinary<'a> {
     unsafe fn extend(&mut self, index: usize, start: usize, len: usize) {
-        let array = *self.arrays.get_unchecked_release(index);
+        let array = *self.arrays.get_unchecked(index);
         extend_validity(&mut self.validity, array, start, len);
 
         let values = array.values();
 
         self.values.extend_from_slice(
-            values.get_unchecked_release(start * self.size..start * self.size + len * self.size),
+            values.get_unchecked(start * self.size..start * self.size + len * self.size),
         );
     }
 
@@ -88,9 +86,9 @@ impl<'a> Growable<'a> for GrowableFixedSizeBinary<'a> {
 impl<'a> From<GrowableFixedSizeBinary<'a>> for FixedSizeBinaryArray {
     fn from(val: GrowableFixedSizeBinary<'a>) -> Self {
         FixedSizeBinaryArray::new(
-            val.arrays[0].data_type().clone(),
+            val.arrays[0].dtype().clone(),
             val.values.into(),
-            val.validity.map(|v| v.into()),
+            val.validity.map(|v| v.freeze()),
         )
     }
 }

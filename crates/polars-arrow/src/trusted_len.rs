@@ -1,8 +1,9 @@
 //! Declares [`TrustedLen`].
 use std::iter::Scan;
-use std::slice::Iter;
+use std::slice::{Iter, IterMut};
 
 /// An iterator of known, fixed size.
+///
 /// A trait denoting Rusts' unstable [TrustedLen](https://doc.rust-lang.org/std/iter/trait.TrustedLen.html).
 /// This is re-defined here and implemented for some iterators until `std::iter::TrustedLen`
 /// is stabilized.
@@ -13,6 +14,7 @@ use std::slice::Iter;
 pub unsafe trait TrustedLen: Iterator {}
 
 unsafe impl<T> TrustedLen for Iter<'_, T> {}
+unsafe impl<T> TrustedLen for IterMut<'_, T> {}
 
 unsafe impl<'a, I, T: 'a> TrustedLen for std::iter::Copied<I>
 where
@@ -71,7 +73,7 @@ unsafe impl<A: TrustedLen> TrustedLen for std::iter::StepBy<A> {}
 unsafe impl<I, St, F, B> TrustedLen for Scan<I, St, F>
 where
     F: FnMut(&mut St, I::Item) -> Option<B>,
-    I: TrustedLen + Iterator<Item = B>,
+    I: TrustedLen,
 {
 }
 
@@ -87,9 +89,22 @@ impl<I, J> TrustMyLength<I, J>
 where
     I: Iterator<Item = J>,
 {
+    /// Create a new `TrustMyLength` iterator
+    ///
+    /// # Safety
+    ///
+    /// This is safe if the iterator always has the exact length given by `len`.
     #[inline]
-    pub fn new(iter: I, len: usize) -> Self {
+    pub unsafe fn new(iter: I, len: usize) -> Self {
         Self { iter, len }
+    }
+}
+
+impl<J: Clone> TrustMyLength<std::iter::Take<std::iter::Repeat<J>>, J> {
+    /// Create a new `TrustMyLength` iterator that repeats `value` `len` times.
+    pub fn new_repeat_n(value: J, len: usize) -> Self {
+        // SAFETY: This is always safe since repeat(..).take(n) always repeats exactly `n` times`.
+        unsafe { Self::new(std::iter::repeat(value).take(len), len) }
     }
 }
 
@@ -104,6 +119,7 @@ where
         self.iter.next()
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.len, Some(self.len))
     }

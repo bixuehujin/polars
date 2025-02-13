@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path("../..").resolve()))
 
 project = "Polars"
 author = "Ritchie Vink"
-copyright = f"2020, {author}"
+copyright = f"2025, {author}"
 
 
 # -- General configuration ---------------------------------------------------
@@ -71,7 +71,7 @@ exclude_patterns = ["Thumbs.db", ".DS_Store"]
 overloads_location = ["bottom"]
 
 
-# -- Extension settings  -----------------------------------------------------
+# -- Extension settings ------------------------------------------------------
 
 # sphinx.ext.intersphinx - link to other projects' documentation
 # https://www.sphinx-doc.org/en/master/usage/extensions/intersphinx.html
@@ -116,7 +116,7 @@ web_root = "https://docs.pola.rs"
 
 # Specify version for version switcher dropdown menu
 git_ref = os.environ.get("POLARS_VERSION", "main")
-version_match = re.fullmatch(r"py-(\d+\.\d+)\.\d+.*", git_ref)
+version_match = re.fullmatch(r"py-(\d+)\.\d+\.\d+.*", git_ref)
 switcher_version = version_match.group(1) if version_match is not None else "dev"
 
 html_js_files = [
@@ -130,7 +130,7 @@ html_theme_options = {
     "external_links": [
         {
             "name": "User guide",
-            "url": f"{web_root}/user-guide/",
+            "url": f"{web_root}/",
         },
     ],
     "icon_links": [
@@ -155,7 +155,7 @@ html_theme_options = {
         "image_dark": f"{static_assets_root}/logos/polars-logo-dimmed-medium.png",
     },
     "switcher": {
-        "json_url": f"{web_root}/docs/python/dev/_static/version_switcher.json",
+        "json_url": f"{web_root}/api/python/dev/_static/version_switcher.json",
         "version_match": switcher_version,
     },
     "show_version_warning_banner": False,
@@ -205,7 +205,7 @@ def linkcode_resolve(domain: str, info: dict[str, Any]) -> str | None:
                 # Accessing deprecated objects will generate noisy warnings
                 warnings.simplefilter("ignore", FutureWarning)
                 obj = getattr(obj, part)
-        except AttributeError:
+        except AttributeError:  # noqa: PERF203
             return None
 
     try:
@@ -264,14 +264,22 @@ def _minify_classpaths(s: str) -> str:
     )
 
 
-def process_signature(app, what, name, obj, opts, sig, ret):  # noqa: D103
+def process_signature(  # noqa: D103
+    app: object,
+    what: object,
+    name: object,
+    obj: object,
+    opts: object,
+    sig: str,
+    ret: str,
+) -> tuple[str, str]:
     return (
         _minify_classpaths(sig) if sig else sig,
         _minify_classpaths(ret) if ret else ret,
     )
 
 
-def setup(app):  # noqa: D103
+def setup(app: Any) -> None:  # noqa: D103
     # TODO: a handful of methods do not seem to trigger the event for
     #  some reason (possibly @overloads?) - investigate further...
     app.connect("autodoc-process-signature", process_signature)

@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use crate::parquet::error::{Error, Result};
+use crate::parquet::error::{ParquetError, ParquetResult};
 use crate::parquet::schema::types::PhysicalType;
 use crate::parquet::statistics::*;
 use crate::parquet::types::NativeType;
@@ -25,15 +23,14 @@ fn reduce_vec8(lhs: Option<Vec<u8>>, rhs: &Option<Vec<u8>>, max: bool) -> Option
     }
 }
 
-pub fn reduce(stats: &[&Option<Arc<dyn Statistics>>]) -> Result<Option<Arc<dyn Statistics>>> {
+pub fn reduce(stats: &[&Option<Statistics>]) -> ParquetResult<Option<Statistics>> {
     if stats.is_empty() {
         return Ok(None);
     }
     let stats = stats
         .iter()
         .filter_map(|x| x.as_ref())
-        .map(|x| x.as_ref())
-        .collect::<Vec<&dyn Statistics>>();
+        .collect::<Vec<&Statistics>>();
     if stats.is_empty() {
         return Ok(None);
     };
@@ -43,39 +40,26 @@ pub fn reduce(stats: &[&Option<Arc<dyn Statistics>>]) -> Result<Option<Arc<dyn S
         .skip(1)
         .all(|x| x.physical_type() == stats[0].physical_type());
     if !same_type {
-        return Err(Error::oos("The statistics do not have the same data_type"));
+        return Err(ParquetError::oos(
+            "The statistics do not have the same dtype",
+        ));
     };
-    Ok(match stats[0].physical_type() {
-        PhysicalType::Boolean => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_boolean(stats)))
-        },
-        PhysicalType::Int32 => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_primitive::<i32, _>(stats)))
-        },
-        PhysicalType::Int64 => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_primitive::<i64, _>(stats)))
-        },
-        PhysicalType::Float => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_primitive::<f32, _>(stats)))
-        },
-        PhysicalType::Double => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_primitive::<f64, _>(stats)))
-        },
-        PhysicalType::ByteArray => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_binary(stats)))
-        },
-        PhysicalType::FixedLenByteArray(_) => {
-            let stats = stats.iter().map(|x| x.as_any().downcast_ref().unwrap());
-            Some(Arc::new(reduce_fix_len_binary(stats)))
+
+    use PhysicalType as T;
+    let stats = match stats[0].physical_type() {
+        T::Boolean => reduce_boolean(stats.iter().map(|x| x.expect_as_boolean())).into(),
+        T::Int32 => reduce_primitive::<i32, _>(stats.iter().map(|x| x.expect_as_int32())).into(),
+        T::Int64 => reduce_primitive(stats.iter().map(|x| x.expect_as_int64())).into(),
+        T::Float => reduce_primitive(stats.iter().map(|x| x.expect_as_float())).into(),
+        T::Double => reduce_primitive(stats.iter().map(|x| x.expect_as_double())).into(),
+        T::ByteArray => reduce_binary(stats.iter().map(|x| x.expect_as_binary())).into(),
+        T::FixedLenByteArray(_) => {
+            reduce_fix_len_binary(stats.iter().map(|x| x.expect_as_fixedlen())).into()
         },
         _ => todo!(),
-    })
+    };
+
+    Ok(Some(stats))
 }
 
 fn reduce_binary<'a, I: Iterator<Item = &'a BinaryStatistics>>(mut stats: I) -> BinaryStatistics {
@@ -177,23 +161,17 @@ mod tests {
     use crate::parquet::schema::types::PrimitiveType;
 
     #[test]
-    fn binary() -> Result<()> {
+    fn binary() -> ParquetResult<()> {
         let iter = vec![
             BinaryStatistics {
-                primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
-                    PhysicalType::ByteArray,
-                ),
+                primitive_type: PrimitiveType::from_physical("bla".into(), PhysicalType::ByteArray),
                 null_count: Some(0),
                 distinct_count: None,
                 min_value: Some(vec![1, 2]),
                 max_value: Some(vec![3, 4]),
             },
             BinaryStatistics {
-                primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
-                    PhysicalType::ByteArray,
-                ),
+                primitive_type: PrimitiveType::from_physical("bla".into(), PhysicalType::ByteArray),
                 null_count: Some(0),
                 distinct_count: None,
                 min_value: Some(vec![4, 5]),
@@ -205,10 +183,7 @@ mod tests {
         assert_eq!(
             a,
             BinaryStatistics {
-                primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
-                    PhysicalType::ByteArray,
-                ),
+                primitive_type: PrimitiveType::from_physical("bla".into(), PhysicalType::ByteArray,),
                 null_count: Some(0),
                 distinct_count: None,
                 min_value: Some(vec![1, 2]),
@@ -220,11 +195,11 @@ mod tests {
     }
 
     #[test]
-    fn fixed_len_binary() -> Result<()> {
+    fn fixed_len_binary() -> ParquetResult<()> {
         let iter = vec![
             FixedLenStatistics {
                 primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
+                    "bla".into(),
                     PhysicalType::FixedLenByteArray(2),
                 ),
                 null_count: Some(0),
@@ -234,7 +209,7 @@ mod tests {
             },
             FixedLenStatistics {
                 primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
+                    "bla".into(),
                     PhysicalType::FixedLenByteArray(2),
                 ),
                 null_count: Some(0),
@@ -249,7 +224,7 @@ mod tests {
             a,
             FixedLenStatistics {
                 primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
+                    "bla".into(),
                     PhysicalType::FixedLenByteArray(2),
                 ),
                 null_count: Some(0),
@@ -263,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn boolean() -> Result<()> {
+    fn boolean() -> ParquetResult<()> {
         let iter = [
             BooleanStatistics {
                 null_count: Some(0),
@@ -294,13 +269,13 @@ mod tests {
     }
 
     #[test]
-    fn primitive() -> Result<()> {
+    fn primitive() -> ParquetResult<()> {
         let iter = [PrimitiveStatistics {
             null_count: Some(2),
             distinct_count: None,
             min_value: Some(30),
             max_value: Some(70),
-            primitive_type: PrimitiveType::from_physical("bla".to_string(), PhysicalType::Int32),
+            primitive_type: PrimitiveType::from_physical("bla".into(), PhysicalType::Int32),
         }];
         let a = reduce_primitive(iter.iter());
 
@@ -311,10 +286,7 @@ mod tests {
                 distinct_count: None,
                 min_value: Some(30),
                 max_value: Some(70),
-                primitive_type: PrimitiveType::from_physical(
-                    "bla".to_string(),
-                    PhysicalType::Int32,
-                ),
+                primitive_type: PrimitiveType::from_physical("bla".into(), PhysicalType::Int32,),
             },
         );
 

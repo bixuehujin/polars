@@ -23,7 +23,7 @@ pub fn has_inner_nulls(ca: &ArrayChunked) -> bool {
 fn get_agg(ca: &ArrayChunked, agg_type: AggType) -> Series {
     let values = ca.get_inner();
     let width = ca.width();
-    min_max::array_dispatch(ca.name(), &values, width, agg_type)
+    min_max::array_dispatch(ca.name().clone(), &values, width, agg_type)
 }
 
 pub trait ArrayNameSpace: AsArray {
@@ -41,13 +41,13 @@ pub trait ArrayNameSpace: AsArray {
         let ca = self.as_array();
 
         if has_inner_nulls(ca) {
-            return sum_with_nulls(ca, &ca.inner_dtype());
+            return sum_with_nulls(ca, ca.inner_dtype());
         };
 
         match ca.inner_dtype() {
             DataType::Boolean => Ok(count_boolean_bits(ca).into_series()),
-            dt if dt.is_numeric() => Ok(sum_array_numerical(ca, &dt)),
-            dt => sum_with_nulls(ca, &dt),
+            dt if dt.is_primitive_numeric() => Ok(sum_array_numerical(ca, dt)),
+            dt => sum_with_nulls(ca, dt),
         }
     }
 
@@ -149,9 +149,9 @@ pub trait ArrayNameSpace: AsArray {
                     unsafe { ca.apply_amortized_same_type(|s| s.as_ref().shift(n)) }
                 } else {
                     ArrayChunked::full_null_with_dtype(
-                        ca.name(),
+                        ca.name().clone(),
                         ca.len(),
-                        &ca.inner_dtype(),
+                        ca.inner_dtype(),
                         ca.width(),
                     )
                 }

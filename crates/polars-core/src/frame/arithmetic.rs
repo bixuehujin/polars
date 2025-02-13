@@ -15,21 +15,25 @@ fn get_supertype_all(df: &DataFrame, rhs: &Series) -> PolarsResult<DataType> {
 }
 
 macro_rules! impl_arithmetic {
-    ($self:expr, $rhs:expr, $operand: tt) => {{
+    ($self:expr, $rhs:expr, $operand:expr) => {{
         let st = get_supertype_all($self, $rhs)?;
         let rhs = $rhs.cast(&st)?;
-        let cols = POOL.install(|| {$self.columns.par_iter().map(|s| {
-            Ok(&s.cast(&st)? $operand &rhs)
-        }).collect::<PolarsResult<_>>()})?;
-        Ok(unsafe { DataFrame::new_no_checks(cols) })
-    }}
+        let cols = POOL.install(|| {
+            $self
+                .par_materialized_column_iter()
+                .map(|s| $operand(&s.cast(&st)?, &rhs))
+                .map(|s| s.map(Column::from))
+                .collect::<PolarsResult<_>>()
+        })?;
+        Ok(unsafe { DataFrame::new_no_checks($self.height(), cols) })
+    }};
 }
 
 impl Add<&Series> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn add(self, rhs: &Series) -> Self::Output {
-        impl_arithmetic!(self, rhs, +)
+        impl_arithmetic!(self, rhs, std::ops::Add::add)
     }
 }
 
@@ -45,7 +49,7 @@ impl Sub<&Series> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn sub(self, rhs: &Series) -> Self::Output {
-        impl_arithmetic!(self, rhs, -)
+        impl_arithmetic!(self, rhs, std::ops::Sub::sub)
     }
 }
 
@@ -61,7 +65,7 @@ impl Mul<&Series> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn mul(self, rhs: &Series) -> Self::Output {
-        impl_arithmetic!(self, rhs, *)
+        impl_arithmetic!(self, rhs, std::ops::Mul::mul)
     }
 }
 
@@ -77,7 +81,7 @@ impl Div<&Series> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn div(self, rhs: &Series) -> Self::Output {
-        impl_arithmetic!(self, rhs, /)
+        impl_arithmetic!(self, rhs, std::ops::Div::div)
     }
 }
 
@@ -93,7 +97,7 @@ impl Rem<&Series> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn rem(self, rhs: &Series) -> Self::Output {
-        impl_arithmetic!(self, rhs, %)
+        impl_arithmetic!(self, rhs, std::ops::Rem::rem)
     }
 }
 
@@ -118,6 +122,9 @@ impl DataFrame {
             .par_iter()
             .zip(other.get_columns().par_iter())
             .map(|(l, r)| {
+                let l = l.as_materialized_series();
+                let r = r.as_materialized_series();
+
                 let diff_l = max_len - l.len();
                 let diff_r = max_len - r.len();
 
@@ -132,7 +139,7 @@ impl DataFrame {
                     r = r.extend_constant(AnyValue::Null, diff_r)?;
                 };
 
-                f(&l, &r)
+                f(&l, &r).map(Column::from)
             });
         let mut cols = POOL.install(|| cols.collect::<PolarsResult<Vec<_>>>())?;
 
@@ -141,14 +148,14 @@ impl DataFrame {
             let df = if col_len < self.width() { self } else { other };
 
             for i in col_len..max_len {
-                let s = &df.get_columns()[i];
+                let s = &df.get_columns().get(i).ok_or_else(|| polars_err!(InvalidOperation: "cannot do arithmetic on DataFrames with shapes: {:?} and {:?}", self.shape(), other.shape()))?;
                 let name = s.name();
                 let dtype = s.dtype();
 
                 // trick to fill a series with nulls
                 let vals: &[Option<i32>] = &[None];
-                let s = Series::new(name, vals).cast(dtype)?;
-                cols.push(s.new_from_index(0, max_len))
+                let s = Series::new(name.clone(), vals).cast(dtype)?;
+                cols.push(s.new_from_index(0, max_len).into())
             }
         }
         DataFrame::new(cols)
@@ -159,7 +166,7 @@ impl Add<&DataFrame> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn add(self, rhs: &DataFrame) -> Self::Output {
-        self.binary_aligned(rhs, &|a, b| Ok(a + b))
+        self.binary_aligned(rhs, &|a, b| a + b)
     }
 }
 
@@ -167,7 +174,7 @@ impl Sub<&DataFrame> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn sub(self, rhs: &DataFrame) -> Self::Output {
-        self.binary_aligned(rhs, &|a, b| Ok(a - b))
+        self.binary_aligned(rhs, &|a, b| a - b)
     }
 }
 
@@ -175,7 +182,7 @@ impl Div<&DataFrame> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn div(self, rhs: &DataFrame) -> Self::Output {
-        self.binary_aligned(rhs, &|a, b| Ok(a / b))
+        self.binary_aligned(rhs, &|a, b| a / b)
     }
 }
 
@@ -183,7 +190,7 @@ impl Mul<&DataFrame> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn mul(self, rhs: &DataFrame) -> Self::Output {
-        self.binary_aligned(rhs, &|a, b| Ok(a * b))
+        self.binary_aligned(rhs, &|a, b| a * b)
     }
 }
 
@@ -191,6 +198,6 @@ impl Rem<&DataFrame> for &DataFrame {
     type Output = PolarsResult<DataFrame>;
 
     fn rem(self, rhs: &DataFrame) -> Self::Output {
-        self.binary_aligned(rhs, &|a, b| Ok(a % b))
+        self.binary_aligned(rhs, &|a, b| a % b)
     }
 }

@@ -9,9 +9,10 @@ fn data() -> FixedSizeListArray {
 
     FixedSizeListArray::try_new(
         ArrowDataType::FixedSizeList(
-            Box::new(Field::new("a", values.data_type().clone(), true)),
+            Box::new(Field::new("a".into(), values.dtype().clone(), true)),
             2,
         ),
+        2,
         values.boxed(),
         Some([true, false].into()),
     )
@@ -34,6 +35,14 @@ fn basics() {
 }
 
 #[test]
+fn split_at() {
+    let (lhs, rhs) = data().split_at(1);
+
+    assert_eq!(lhs.value(0).as_ref(), Int32Array::from_slice([10, 20]));
+    assert_eq!(rhs.value(0).as_ref(), Int32Array::from_slice([0, 0]));
+}
+
+#[test]
 fn with_validity() {
     let array = data();
 
@@ -51,7 +60,7 @@ fn debug() {
 #[test]
 fn empty() {
     let array = FixedSizeListArray::new_empty(ArrowDataType::FixedSizeList(
-        Box::new(Field::new("a", ArrowDataType::Int32, true)),
+        Box::new(Field::new("a".into(), ArrowDataType::Int32, true)),
         2,
     ));
     assert_eq!(array.values().len(), 0);
@@ -61,7 +70,10 @@ fn empty() {
 #[test]
 fn null() {
     let array = FixedSizeListArray::new_null(
-        ArrowDataType::FixedSizeList(Box::new(Field::new("a", ArrowDataType::Int32, true)), 2),
+        ArrowDataType::FixedSizeList(
+            Box::new(Field::new("a".into(), ArrowDataType::Int32, true)),
+            2,
+        ),
         2,
     );
     assert_eq!(array.values().len(), 4);
@@ -72,7 +84,11 @@ fn null() {
 fn wrong_size() {
     let values = Int32Array::from_slice([10, 20, 0]);
     assert!(FixedSizeListArray::try_new(
-        ArrowDataType::FixedSizeList(Box::new(Field::new("a", ArrowDataType::Int32, true)), 2),
+        ArrowDataType::FixedSizeList(
+            Box::new(Field::new("a".into(), ArrowDataType::Int32, true)),
+            2
+        ),
+        2,
         values.boxed(),
         None
     )
@@ -81,9 +97,13 @@ fn wrong_size() {
 
 #[test]
 fn wrong_len() {
-    let values = Int32Array::from_slice([10, 20, 0]);
+    let values = Int32Array::from_slice([10, 20, 0, 0]);
     assert!(FixedSizeListArray::try_new(
-        ArrowDataType::FixedSizeList(Box::new(Field::new("a", ArrowDataType::Int32, true)), 2),
+        ArrowDataType::FixedSizeList(
+            Box::new(Field::new("a".into(), ArrowDataType::Int32, true)),
+            2
+        ),
+        2,
         values.boxed(),
         Some([true, false, false].into()), // it should be 2
     )
@@ -91,12 +111,13 @@ fn wrong_len() {
 }
 
 #[test]
-fn wrong_data_type() {
-    let values = Int32Array::from_slice([10, 20, 0]);
+fn wrong_dtype() {
+    let values = Int32Array::from_slice([10, 20, 0, 0]);
     assert!(FixedSizeListArray::try_new(
         ArrowDataType::Binary,
+        2,
         values.boxed(),
-        Some([true, false, false].into()), // it should be 2
+        Some([true, false, false, false].into()),
     )
     .is_err());
 }

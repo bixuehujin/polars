@@ -1,48 +1,39 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any, Iterable, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
-from polars._utils.deprecation import issue_deprecation_warning
 from polars.datatypes import N_INFER_DEFAULT
-from polars.exceptions import InvalidOperationError
+from polars.dependencies import import_optional
 from polars.io.database._cursor_proxies import ODBCCursorProxy
 from polars.io.database._executor import ConnectionExecutor
 
 if TYPE_CHECKING:
-    import sys
+    from collections.abc import Iterator
 
-    if sys.version_info >= (3, 10):
-        from typing import TypeAlias
-    else:
-        from typing_extensions import TypeAlias
+    from sqlalchemy.sql.elements import TextClause
+    from sqlalchemy.sql.expression import Selectable
 
     from polars import DataFrame
-    from polars.type_aliases import ConnectionOrCursor, DbReadEngine, SchemaDict
-
-    try:
-        from sqlalchemy.sql.expression import Selectable
-    except ImportError:
-        Selectable: TypeAlias = Any  # type: ignore[no-redef]
+    from polars._typing import ConnectionOrCursor, DbReadEngine, SchemaDict
 
 
 @overload
 def read_database(
-    query: str | Selectable,
+    query: str | TextClause | Selectable,
     connection: ConnectionOrCursor | str,
     *,
-    iter_batches: Literal[False] = False,
+    iter_batches: Literal[False] = ...,
     batch_size: int | None = ...,
     schema_overrides: SchemaDict | None = ...,
     infer_schema_length: int | None = ...,
     execute_options: dict[str, Any] | None = ...,
-    **kwargs: Any,
 ) -> DataFrame: ...
 
 
 @overload
 def read_database(
-    query: str | Selectable,
+    query: str | TextClause | Selectable,
     connection: ConnectionOrCursor | str,
     *,
     iter_batches: Literal[True],
@@ -50,12 +41,24 @@ def read_database(
     schema_overrides: SchemaDict | None = ...,
     infer_schema_length: int | None = ...,
     execute_options: dict[str, Any] | None = ...,
-    **kwargs: Any,
-) -> Iterable[DataFrame]: ...
+) -> Iterator[DataFrame]: ...
 
 
-def read_database(  # noqa: D417
-    query: str | Selectable,
+@overload
+def read_database(
+    query: str | TextClause | Selectable,
+    connection: ConnectionOrCursor | str,
+    *,
+    iter_batches: bool,
+    batch_size: int | None = ...,
+    schema_overrides: SchemaDict | None = ...,
+    infer_schema_length: int | None = ...,
+    execute_options: dict[str, Any] | None = ...,
+) -> DataFrame | Iterator[DataFrame]: ...
+
+
+def read_database(
+    query: str | TextClause | Selectable,
     connection: ConnectionOrCursor | str,
     *,
     iter_batches: bool = False,
@@ -63,8 +66,7 @@ def read_database(  # noqa: D417
     schema_overrides: SchemaDict | None = None,
     infer_schema_length: int | None = N_INFER_DEFAULT,
     execute_options: dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> DataFrame | Iterable[DataFrame]:
+) -> DataFrame | Iterator[DataFrame]:
     """
     Read the results of a SQL query into a DataFrame, given a connection object.
 
@@ -89,16 +91,17 @@ def read_database(  # noqa: D417
         data returned by the query; this can be useful for processing large resultsets
         in a memory-efficient manner. If supported by the backend, this value is passed
         to the underlying query execution method (note that very low values will
-        typically result in poor performance as it will result in many round-trips to
-        the database as the data is returned). If the backend does not support changing
+        typically result in poor performance as it will cause many round-trips to the
+        database as the data is returned). If the backend does not support changing
         the batch size then a single DataFrame is yielded from the iterator.
     batch_size
         Indicate the size of each batch when `iter_batches` is True (note that you can
         still set this when `iter_batches` is False, in which case the resulting
         DataFrame is constructed internally using batched return before being returned
-        to you. Note that some backends may support batched operation but not allow for
-        an explicit size; in this case you will still receive batches, but their exact
-        size will be determined by the backend (so may not equal the value set here).
+        to you. Note that some backends (such as Snowflake) may support batch operation
+        but not allow for an explicit size to be set; in this case you will still
+        receive batches but their size is determined by the backend (in which case any
+        value set here will be ignored).
     schema_overrides
         A dictionary mapping column names to dtypes, used to override the schema
         inferred from the query cursor or given by the incoming Arrow data (depending
@@ -132,7 +135,7 @@ def read_database(  # noqa: D417
 
     * The `read_database_uri` function can be noticeably faster than `read_database`
       if you are using a SQLAlchemy or DBAPI2 connection, as `connectorx` and `adbc`
-      optimises translation of the result set into Arrow format. Note that you can
+      optimise translation of the result set into Arrow format. Note that you can
       determine a connection's URI from a SQLAlchemy engine object by calling
       `conn.engine.url.render_as_string(hide_password=False)`.
 
@@ -140,9 +143,10 @@ def read_database(  # noqa: D417
       query then that cursor will be automatically closed when the query completes;
       however, Polars will *never* close any other open connection or cursor.
 
-    * We are able to support more than just relational databases and SQL queries
-      through this function. For example, we can load graph database results from
-      a `KùzuDB` connection in conjunction with a Cypher query.
+    * Polars is able to support more than just relational databases and SQL queries
+      through this function. For example, you can load local graph database results
+      from a `KùzuDB` connection in conjunction with a Cypher query, or use SurrealQL
+      with SurrealDB.
 
     See Also
     --------
@@ -205,18 +209,19 @@ def read_database(  # noqa: D417
     ...     connection=async_engine,
     ... )  # doctest: +SKIP
 
-    Load data from an asynchronous SurrealDB client connection object; note that
-    both the WS (`Surreal`) and HTTP (`SurrealHTTP`) clients are supported:
+    Load data from an `AsyncSurrealDB` client connection object; note that both the "ws"
+    and "http" protocols are supported, as is the synchronous `SurrealDB` client. The
+    async loop can be run with standard `asyncio` or with `uvloop`:
 
-    >>> import asyncio
+    >>> import asyncio  # (or uvloop)
     >>> async def surreal_query_to_frame(query: str, url: str):
-    ...     async with Surreal(url) as client:
+    ...     async with AsyncSurrealDB(url) as client:
     ...         await client.use(namespace="test", database="test")
     ...         return pl.read_database(query=query, connection=client)
     >>> df = asyncio.run(
     ...     surreal_query_to_frame(
-    ...         query="SELECT * FROM test_data",
-    ...         url="ws://localhost:8000/rpc",
+    ...         query="SELECT * FROM test",
+    ...         url="http://localhost:8000",
     ...     )
     ... )  # doctest: +SKIP
 
@@ -224,40 +229,19 @@ def read_database(  # noqa: D417
     if isinstance(connection, str):
         # check for odbc connection string
         if re.search(r"\bdriver\s*=\s*{[^}]+?}", connection, re.IGNORECASE):
-            try:
-                import arrow_odbc  # noqa: F401
-            except ModuleNotFoundError:
-                msg = (
-                    "use of an ODBC connection string requires the `arrow-odbc` package"
-                    "\n\nPlease run: pip install arrow-odbc"
-                )
-                raise ModuleNotFoundError(msg) from None
-
+            _ = import_optional(
+                module_name="arrow_odbc",
+                err_prefix="use of ODBC connection string requires the",
+                err_suffix="package",
+            )
             connection = ODBCCursorProxy(connection)
+        elif "://" in connection:
+            # otherwise looks like a mistaken call to read_database_uri
+            msg = "string URI is invalid here; call `read_database_uri` instead"
+            raise ValueError(msg)
         else:
-            # otherwise looks like a call to read_database_uri
-            issue_deprecation_warning(
-                message="Use of a string URI with 'read_database' is deprecated; use `read_database_uri` instead",
-                version="0.19.0",
-            )
-            if iter_batches or batch_size:
-                msg = "Batch parameters are not supported for `read_database_uri`"
-                raise InvalidOperationError(msg)
-            if not isinstance(query, (list, str)):
-                msg = f"`read_database_uri` expects one or more string queries; found {type(query)}"
-                raise TypeError(msg)
-            return read_database_uri(
-                query,
-                uri=connection,
-                schema_overrides=schema_overrides,
-                **kwargs,
-            )
-
-    # note: can remove this check (and **kwargs) once we drop the
-    # pass-through deprecation support for read_database_uri
-    if kwargs:
-        msg = f"`read_database` **kwargs only exist for passthrough to `read_database_uri`: found {kwargs!r}"
-        raise ValueError(msg)
+            msg = "unable to identify string connection as valid ODBC (no driver)"
+            raise ValueError(msg)
 
     # return frame from arbitrary connections using the executor abstraction
     with ConnectionExecutor(connection) as cx:
@@ -270,6 +254,51 @@ def read_database(  # noqa: D417
             schema_overrides=schema_overrides,
             infer_schema_length=infer_schema_length,
         )
+
+
+@overload
+def read_database_uri(
+    query: str,
+    uri: str,
+    *,
+    partition_on: str | None = None,
+    partition_range: tuple[int, int] | None = None,
+    partition_num: int | None = None,
+    protocol: str | None = None,
+    engine: Literal["adbc"],
+    schema_overrides: SchemaDict | None = None,
+    execute_options: dict[str, Any] | None = None,
+) -> DataFrame: ...
+
+
+@overload
+def read_database_uri(
+    query: list[str] | str,
+    uri: str,
+    *,
+    partition_on: str | None = None,
+    partition_range: tuple[int, int] | None = None,
+    partition_num: int | None = None,
+    protocol: str | None = None,
+    engine: Literal["connectorx"] | None = None,
+    schema_overrides: SchemaDict | None = None,
+    execute_options: None = None,
+) -> DataFrame: ...
+
+
+@overload
+def read_database_uri(
+    query: str,
+    uri: str,
+    *,
+    partition_on: str | None = None,
+    partition_range: tuple[int, int] | None = None,
+    partition_num: int | None = None,
+    protocol: str | None = None,
+    engine: DbReadEngine | None = None,
+    schema_overrides: None = None,
+    execute_options: dict[str, Any] | None = None,
+) -> DataFrame: ...
 
 
 def read_database_uri(
@@ -317,15 +346,12 @@ def read_database_uri(
           Supports a range of databases, such as PostgreSQL, Redshift, MySQL, MariaDB,
           Clickhouse, Oracle, BigQuery, SQL Server, and so on. For an up-to-date list
           please see the connectorx docs:
-
-          * https://github.com/sfu-db/connector-x#supported-sources--destinations
-
+          https://github.com/sfu-db/connector-x#supported-sources--destinations
         * `'adbc'`
           Currently there is limited support for this engine, with a relatively small
           number of drivers available, most of which are still in development. For
           an up-to-date list of drivers please see the ADBC docs:
-
-          * https://arrow.apache.org/adbc/
+          https://arrow.apache.org/adbc/
     schema_overrides
         A dictionary mapping column names to dtypes, used to override the schema
         given in the data returned by the query.

@@ -1,4 +1,6 @@
-use arrow::temporal_conversions::{MILLISECONDS, SECONDS_IN_DAY};
+use arrow::temporal_conversions::{EPOCH_DAYS_FROM_CE, MILLISECONDS, SECONDS_IN_DAY};
+use chrono::{Datelike, NaiveDate};
+use polars_core::utils::CustomIterTools;
 
 use super::*;
 
@@ -49,13 +51,6 @@ pub trait DateMethods: AsDate {
         ca.apply_kernel_cast::<Int8Type>(&date_to_month)
     }
 
-    /// Extract ISO weekday from underlying NaiveDate representation.
-    /// Returns the weekday number where monday = 1 and sunday = 7
-    fn weekday(&self) -> Int8Chunked {
-        let ca = self.as_date();
-        ca.apply_kernel_cast::<Int8Type>(&date_to_iso_weekday)
-    }
-
     /// Returns the ISO week number starting from 1.
     /// The return value ranges from 1 to 53. (The last week of year differs by years.)
     fn week(&self) -> Int8Chunked {
@@ -80,11 +75,35 @@ pub trait DateMethods: AsDate {
         ca.apply_kernel_cast::<Int16Type>(&date_to_ordinal)
     }
 
-    fn parse_from_str_slice(name: &str, v: &[&str], fmt: &str) -> DateChunked;
+    fn parse_from_str_slice(name: PlSmallStr, v: &[&str], fmt: &str) -> DateChunked;
+
+    /// Construct a date ChunkedArray from individual time components.
+    fn new_from_parts(
+        year: &Int32Chunked,
+        month: &Int8Chunked,
+        day: &Int8Chunked,
+        name: PlSmallStr,
+    ) -> PolarsResult<DateChunked> {
+        let mut ca: Int32Chunked = year
+            .into_iter()
+            .zip(month)
+            .zip(day)
+            .map(|((y, m), d)| {
+                if let (Some(y), Some(m), Some(d)) = (y, m, d) {
+                    NaiveDate::from_ymd_opt(y, m as u32, d as u32)
+                        .map(|t| t.num_days_from_ce() - EPOCH_DAYS_FROM_CE)
+                } else {
+                    None
+                }
+            })
+            .collect_trusted();
+        ca.rename(name);
+        Ok(ca.into_date())
+    }
 }
 
 impl DateMethods for DateChunked {
-    fn parse_from_str_slice(name: &str, v: &[&str], fmt: &str) -> DateChunked {
+    fn parse_from_str_slice(name: PlSmallStr, v: &[&str], fmt: &str) -> DateChunked {
         Int32Chunked::from_iter_options(
             name,
             v.iter().map(|s| {

@@ -15,18 +15,25 @@ Computation
     Series.arctanh
     Series.arg_true
     Series.arg_unique
+    Series.approx_n_unique
+    Series.bitwise_count_ones
+    Series.bitwise_count_zeros
+    Series.bitwise_leading_ones
+    Series.bitwise_leading_zeros
+    Series.bitwise_trailing_ones
+    Series.bitwise_trailing_zeros
+    Series.bitwise_and
+    Series.bitwise_or
+    Series.bitwise_xor
     Series.cbrt
     Series.cos
     Series.cosh
     Series.cot
+    Series.cum_count
     Series.cum_max
     Series.cum_min
     Series.cum_prod
     Series.cum_sum
-    Series.cummax
-    Series.cummin
-    Series.cumprod
-    Series.cumsum
     Series.cumulative_eval
     Series.diff
     Series.dot
@@ -36,20 +43,22 @@ Computation
     Series.ewm_std
     Series.ewm_var
     Series.exp
+    Series.first
     Series.hash
     Series.hist
+    Series.index_of
     Series.is_between
     Series.kurtosis
+    Series.last
     Series.log
     Series.log10
     Series.log1p
-    Series.map_dict
     Series.pct_change
     Series.peak_max
     Series.peak_min
     Series.rank
     Series.replace
-    Series.rolling_apply
+    Series.replace_strict
     Series.rolling_map
     Series.rolling_max
     Series.rolling_mean

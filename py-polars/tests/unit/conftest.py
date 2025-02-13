@@ -1,19 +1,53 @@
 from __future__ import annotations
 
 import gc
+import os
 import random
 import string
 import sys
+import time
 import tracemalloc
-from typing import Any, Generator, List, cast
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 
 import polars as pl
+from polars.testing.parametric import load_profile
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from types import ModuleType
+    from typing import Any
+
+    FixtureRequest = Any
+
+load_profile(
+    profile=os.environ.get("POLARS_HYPOTHESIS_PROFILE", "fast"),  # type: ignore[arg-type]
+)
+
+# Data type groups
+SIGNED_INTEGER_DTYPES = [pl.Int8(), pl.Int16(), pl.Int32(), pl.Int64(), pl.Int128()]
+UNSIGNED_INTEGER_DTYPES = [pl.UInt8(), pl.UInt16(), pl.UInt32(), pl.UInt64()]
+INTEGER_DTYPES = SIGNED_INTEGER_DTYPES + UNSIGNED_INTEGER_DTYPES
+FLOAT_DTYPES = [pl.Float32(), pl.Float64()]
+NUMERIC_DTYPES = INTEGER_DTYPES + FLOAT_DTYPES
+
+DATETIME_DTYPES = [pl.Datetime("ms"), pl.Datetime("us"), pl.Datetime("ns")]
+DURATION_DTYPES = [pl.Duration("ms"), pl.Duration("us"), pl.Duration("ns")]
+TEMPORAL_DTYPES = [*DATETIME_DTYPES, *DURATION_DTYPES, pl.Date(), pl.Time()]
+
+NESTED_DTYPES = [pl.List, pl.Struct, pl.Array]
 
 
-@pytest.fixture()
+@pytest.fixture
+def partition_limit() -> int:
+    """The limit at which Polars will start partitioning in debug builds."""
+    return 15
+
+
+@pytest.fixture
 def df() -> pl.DataFrame:
     df = pl.DataFrame(
         {
@@ -35,24 +69,22 @@ def df() -> pl.DataFrame:
         }
     )
     return df.with_columns(
-        [
-            pl.col("date").cast(pl.Date),
-            pl.col("datetime").cast(pl.Datetime),
-            pl.col("strings").cast(pl.Categorical).alias("cat"),
-            pl.col("strings").cast(pl.Enum(["foo", "ham", "bar"])).alias("enum"),
-            pl.col("time").cast(pl.Time),
-        ]
+        pl.col("date").cast(pl.Date),
+        pl.col("datetime").cast(pl.Datetime),
+        pl.col("strings").cast(pl.Categorical).alias("cat"),
+        pl.col("strings").cast(pl.Enum(["foo", "ham", "bar"])).alias("enum"),
+        pl.col("time").cast(pl.Time),
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def df_no_lists(df: pl.DataFrame) -> pl.DataFrame:
     return df.select(
         pl.all().exclude(["list_str", "list_int", "list_bool", "list_int", "list_flt"])
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def fruits_cars() -> pl.DataFrame:
     return pl.DataFrame(
         {
@@ -65,7 +97,7 @@ def fruits_cars() -> pl.DataFrame:
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def str_ints_df() -> pl.DataFrame:
     n = 1000
 
@@ -105,7 +137,7 @@ for T in ["T", " "]:
 
 @pytest.fixture(params=ISO8601_FORMATS_DATETIME)
 def iso8601_format_datetime(request: pytest.FixtureRequest) -> list[str]:
-    return cast(List[str], request.param)
+    return cast(list[str], request.param)
 
 
 ISO8601_TZ_AWARE_FORMATS_DATETIME = []
@@ -128,7 +160,7 @@ for T in ["T", " "]:
 
 @pytest.fixture(params=ISO8601_TZ_AWARE_FORMATS_DATETIME)
 def iso8601_tz_aware_format_datetime(request: pytest.FixtureRequest) -> list[str]:
-    return cast(List[str], request.param)
+    return cast(list[str], request.param)
 
 
 ISO8601_FORMATS_DATE = []
@@ -140,7 +172,7 @@ for date_sep in ("/", "-"):
 
 @pytest.fixture(params=ISO8601_FORMATS_DATE)
 def iso8601_format_date(request: pytest.FixtureRequest) -> list[str]:
-    return cast(List[str], request.param)
+    return cast(list[str], request.param)
 
 
 class MemoryUsage:
@@ -176,7 +208,11 @@ class MemoryUsage:
         return tracemalloc.get_traced_memory()[1]
 
 
-@pytest.fixture()
+# The bizarre syntax is from
+# https://github.com/pytest-dev/pytest/issues/1368#issuecomment-2344450259 - we
+# need to mark any test using this fixture as slow because we have a sleep
+# added to work around a CPython bug, see the end of the function.
+@pytest.fixture(params=[pytest.param(0, marks=pytest.mark.slow)])
 def memory_usage_without_pyarrow() -> Generator[MemoryUsage, Any, Any]:
     """
     Provide an API for measuring peak memory usage.
@@ -186,8 +222,11 @@ def memory_usage_without_pyarrow() -> Generator[MemoryUsage, Any, Any]:
 
     Memory usage from PyArrow is not tracked.
     """
-    if not pl.build_info()["build"]["debug"]:
+    if not pl.polars._debug:  # type: ignore[attr-defined]
         pytest.skip("Memory usage only available in debug/dev builds.")
+
+    if os.getenv("POLARS_FORCE_ASYNC", "0") == "1":
+        pytest.skip("Hangs when combined with async glob")
 
     if sys.platform == "win32":
         # abi3 wheels don't have the tracemalloc C APIs, which breaks linking
@@ -199,4 +238,57 @@ def memory_usage_without_pyarrow() -> Generator[MemoryUsage, Any, Any]:
     try:
         yield MemoryUsage()
     finally:
+        # Workaround for https://github.com/python/cpython/issues/128679
+        time.sleep(1)
+        gc.collect()
+
         tracemalloc.stop()
+
+
+@pytest.fixture(params=[True, False])
+def test_global_and_local(
+    request: FixtureRequest,
+) -> Generator[Any, Any, Any]:
+    """
+    Setup fixture which runs each test with and without global string cache.
+
+    Usage: @pytest.mark.usefixtures("test_global_and_local")
+    """
+    use_global = request.param
+    if use_global:
+        with pl.StringCache():
+            # Pre-fill some global items to ensure physical repr isn't 0..n.
+            pl.Series(["eapioejf", "2m4lmv", "3v3v9dlf"], dtype=pl.Categorical)
+            yield
+    else:
+        yield
+
+
+@contextmanager
+def mock_module_import(
+    name: str, module: ModuleType, *, replace_if_exists: bool = False
+) -> Generator[None, None, None]:
+    """
+    Mock an optional module import for the duration of a context.
+
+    Parameters
+    ----------
+    name
+        The name of the module to mock.
+    module
+        A ModuleType instance representing the mocked module.
+    replace_if_exists
+        Whether to replace the module if it already exists in `sys.modules` (defaults to
+        False, meaning that if the module is already imported, it will not be replaced).
+    """
+    if (original := sys.modules.get(name, None)) is not None and not replace_if_exists:
+        yield
+    else:
+        sys.modules[name] = module
+        try:
+            yield
+        finally:
+            if original is not None:
+                sys.modules[name] = original
+            else:
+                del sys.modules[name]

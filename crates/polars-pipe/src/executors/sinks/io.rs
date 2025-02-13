@@ -40,7 +40,7 @@ fn get_spill_dir(operation_name: &'static str) -> PolarsResult<PathBuf> {
     let id = uuid::Uuid::new_v4();
 
     let mut dir = std::path::PathBuf::from(get_base_temp_dir());
-    dir.push(&format!("polars/{operation_name}/{id}"));
+    dir.push(format!("polars/{operation_name}/{id}"));
 
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|err| {
@@ -77,7 +77,7 @@ fn gc_thread(operation_name: &'static str, rx: Receiver<PathBuf>) {
     let _ = std::thread::spawn(move || {
         // First clean all existing
         let mut dir = std::path::PathBuf::from(get_base_temp_dir());
-        dir.push(&format!("polars/{operation_name}"));
+        dir.push(format!("polars/{operation_name}"));
 
         // if the directory does not exist, there is nothing to clean
         let rd = match std::fs::read_dir(&dir) {
@@ -170,6 +170,7 @@ impl IOThread {
                 if let Some(partitions) = partitions {
                     for (part, mut df) in partitions.into_no_null_iter().zip(iter) {
                         df.shrink_to_fit();
+                        df.align_chunks_par();
                         let mut path = dir2.clone();
                         path.push(format!("{part}"));
 
@@ -177,7 +178,7 @@ impl IOThread {
                         path.push(format!("{count}.ipc"));
 
                         let file = File::create(path).unwrap();
-                        let writer = IpcWriter::new(file).with_pl_flavor(true);
+                        let writer = IpcWriter::new(file).with_compat_level(CompatLevel::newest());
                         let mut writer = writer.batched(&schema).unwrap();
                         writer.write_batch(&df).unwrap();
                         writer.finish().unwrap();
@@ -188,11 +189,12 @@ impl IOThread {
                     path.push(format!("{count}_0_pass.ipc"));
 
                     let file = File::create(path).unwrap();
-                    let writer = IpcWriter::new(file).with_pl_flavor(true);
+                    let writer = IpcWriter::new(file).with_compat_level(CompatLevel::newest());
                     let mut writer = writer.batched(&schema).unwrap();
 
                     for mut df in iter {
                         df.shrink_to_fit();
+                        df.align_chunks_par();
                         writer.write_batch(&df).unwrap();
                     }
                     writer.finish().unwrap();
@@ -227,7 +229,7 @@ impl IOThread {
             path.push(format!("_{count}_full.ipc"));
 
             let file = File::create(path).unwrap();
-            let mut writer = IpcWriter::new(file).with_pl_flavor(true);
+            let mut writer = IpcWriter::new(file).with_compat_level(CompatLevel::newest());
             writer.finish(&mut df).unwrap();
         } else {
             let iter = Box::new(std::iter::once(df));
@@ -240,7 +242,7 @@ impl IOThread {
     }
 
     pub(in crate::executors::sinks) fn dump_partition(&self, partition_no: IdxSize, df: DataFrame) {
-        let partition = Some(IdxCa::from_vec("", vec![partition_no]));
+        let partition = Some(IdxCa::from_vec(PlSmallStr::EMPTY, vec![partition_no]));
         let iter = Box::new(std::iter::once(df));
         self.dump_iter(partition, iter)
     }
@@ -250,17 +252,17 @@ impl IOThread {
         partition_no: IdxSize,
         mut df: DataFrame,
     ) {
-        df.shrink_to_fit();
+        df.align_chunks();
         let count = self.thread_local_count.fetch_add(1, Ordering::Relaxed);
         let mut path = self.dir.clone();
         path.push(format!("{partition_no}"));
 
         let _ = std::fs::create_dir(&path);
-        // thread local name we start with an underscore to ensure we don't get
+        // Thread local name we start with an underscore to ensure we don't get
         // duplicates
         path.push(format!("_{count}.ipc"));
         let file = File::create(path).unwrap();
-        let writer = IpcWriter::new(file).with_pl_flavor(true);
+        let writer = IpcWriter::new(file).with_compat_level(CompatLevel::newest());
         let mut writer = writer.batched(&self.schema).unwrap();
         writer.write_batch(&df).unwrap();
         writer.finish().unwrap();

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import enum
 import sys
 from collections import OrderedDict
-from typing import Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import polars as pl
+from polars.exceptions import DataOrientationWarning, InvalidOperationError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def test_df_mixed_dtypes_string() -> None:
@@ -36,16 +42,16 @@ def test_df_object() -> None:
         def __init__(self, value: int) -> None:
             self._value = value
 
-        def __eq__(self, other: Any) -> bool:
+        def __eq__(self, other: object) -> bool:
             return issubclass(other.__class__, self.__class__) and (
-                self._value == other._value
+                self._value == other._value  # type: ignore[attr-defined]
             )
 
         def __repr__(self) -> str:
             return f"{self.__class__.__name__}({self._value})"
 
     df = pl.DataFrame({"a": [Foo(1), Foo(2)]})
-    assert df["a"].dtype == pl.Object
+    assert df["a"].dtype.is_object()
     assert df.rows() == [(Foo(1),), (Foo(2),)]
 
 
@@ -54,7 +60,7 @@ def test_df_init_from_generator_dict_view() -> None:
     data = {
         "keys": d.keys(),
         "vals": d.values(),
-        "itms": d.items(),
+        "items": d.items(),
     }
     with pytest.raises(TypeError, match="unexpected value"):
         pl.DataFrame(data, strict=True)
@@ -63,12 +69,12 @@ def test_df_init_from_generator_dict_view() -> None:
     assert df.schema == {
         "keys": pl.Int64,
         "vals": pl.String,
-        "itms": pl.List(pl.String),
+        "items": pl.List(pl.String),
     }
     assert df.to_dict(as_series=False) == {
         "keys": [0, 1, 2],
         "vals": ["x", "y", "z"],
-        "itms": [["0", "x"], ["1", "y"], ["2", "z"]],
+        "items": [["0", "x"], ["1", "y"], ["2", "z"]],
     }
 
 
@@ -81,19 +87,19 @@ def test_df_init_from_generator_reversed_dict_view() -> None:
     data = {
         "rev_keys": reversed(d.keys()),
         "rev_vals": reversed(d.values()),
-        "rev_itms": reversed(d.items()),
+        "rev_items": reversed(d.items()),
     }
-    df = pl.DataFrame(data, schema_overrides={"rev_itms": pl.Object})
+    df = pl.DataFrame(data, schema_overrides={"rev_items": pl.Object})
 
     assert df.schema == {
         "rev_keys": pl.Int64,
         "rev_vals": pl.String,
-        "rev_itms": pl.Object,
+        "rev_items": pl.Object,
     }
     assert df.to_dict(as_series=False) == {
         "rev_keys": [2, 1, 0],
         "rev_vals": ["z", "y", "x"],
-        "rev_itms": [(2, "z"), (1, "y"), (0, "x")],
+        "rev_items": [(2, "z"), (1, "y"), (0, "x")],
     }
 
 
@@ -105,17 +111,14 @@ def test_df_init_strict() -> None:
 
     df = pl.DataFrame(data, schema=schema, strict=False)
 
-    # TODO: This should result in a Float Series without nulls
-    # https://github.com/pola-rs/polars/issues/14427
-    assert df["a"].to_list() == [1, 2, None]
-
+    assert df["a"].to_list() == [1, 2, 3]
     assert df["a"].dtype == pl.Int8
 
 
 def test_df_init_from_series_strict() -> None:
     s = pl.Series("a", [-1, 0, 1])
     schema = {"a": pl.UInt8}
-    with pytest.raises(pl.ComputeError):
+    with pytest.raises(InvalidOperationError):
         pl.DataFrame(s, schema=schema, strict=True)
 
     df = pl.DataFrame(s, schema=schema, strict=False)
@@ -147,3 +150,58 @@ def test_df_init_nested_mixed_types() -> None:
 
     assert df.schema == {"key": pl.List(pl.Struct({"value": pl.Float64}))}
     assert df.to_dicts() == [{"key": [{"value": 1.0}, {"value": 1.0}]}]
+
+
+class CustomSchema(Mapping[str, Any]):
+    """Dummy schema object for testing compatibility with Mapping."""
+
+    _entries: dict[str, Any]
+
+    def __init__(self, **named_entries: Any) -> None:
+        self._items = OrderedDict(named_entries.items())
+
+    def __getitem__(self, key: str) -> Any:
+        return self._items[key]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._items
+
+
+def test_custom_schema() -> None:
+    df = pl.DataFrame(schema=CustomSchema(bool=pl.Boolean, misc=pl.UInt8))
+    assert df.schema == OrderedDict([("bool", pl.Boolean), ("misc", pl.UInt8)])
+
+    with pytest.raises(TypeError):
+        pl.DataFrame(schema=CustomSchema(bool="boolean", misc="unsigned int"))
+
+
+def test_list_null_constructor_schema() -> None:
+    expected = pl.List(pl.Null)
+    assert pl.DataFrame({"a": [[]]}).dtypes[0] == expected
+    assert pl.DataFrame(schema={"a": pl.List}).dtypes[0] == expected
+
+
+def test_df_init_schema_object() -> None:
+    schema = pl.Schema({"a": pl.Int8(), "b": pl.String()})
+    df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}, schema=schema)
+
+    assert df.columns == schema.names()
+    assert df.dtypes == schema.dtypes()
+
+
+def test_df_init_data_orientation_inference_warning() -> None:
+    with pytest.warns(DataOrientationWarning):
+        pl.from_records([[1, 2, 3], [4, 5, 6]], schema=["a", "b", "c"])
+
+
+def test_df_init_enum_dtype() -> None:
+    class PythonEnum(str, enum.Enum):
+        A = "A"
+        B = "B"
+        C = "C"
+
+    df = pl.DataFrame({"Col 1": ["A", "B", "C"]}, schema={"Col 1": PythonEnum})
+    assert df.dtypes[0] == pl.Enum(["A", "B", "C"])

@@ -3,27 +3,28 @@ use std::cell::Cell;
 use std::hash::Hash;
 use std::mem::MaybeUninit;
 
-use ahash::RandomState;
 use bytemuck::allocation::zeroed_vec;
 use bytemuck::Zeroable;
 
-use crate::aliases::PlHashMap;
+use crate::aliases::PlRandomState;
 
-pub struct CachedFunc<T, R, F> {
+/// A cached function that use `FastFixedCache` for access speed.
+/// It is important that the key is relatively cheap to compute.
+pub struct FastCachedFunc<T, R, F> {
     func: F,
-    cache: PlHashMap<T, R>,
+    cache: FastFixedCache<T, R>,
 }
 
-impl<T, R, F> CachedFunc<T, R, F>
+impl<T, R, F> FastCachedFunc<T, R, F>
 where
     F: FnMut(T) -> R,
     T: std::hash::Hash + Eq + Clone,
     R: Copy,
 {
-    pub fn new(func: F) -> Self {
+    pub fn new(func: F, size: usize) -> Self {
         Self {
             func,
-            cache: PlHashMap::with_capacity_and_hasher(0, Default::default()),
+            cache: FastFixedCache::new(size),
         }
     }
 
@@ -31,8 +32,7 @@ where
         if use_cache {
             *self
                 .cache
-                .entry(x)
-                .or_insert_with_key(|xr| (self.func)(xr.clone()))
+                .get_or_insert_with(&x, |xr| (self.func)(xr.clone()))
         } else {
             (self.func)(x)
         }
@@ -50,7 +50,7 @@ pub struct FastFixedCache<K, V> {
     slots: Vec<CacheSlot<K, V>>,
     access_ctr: Cell<u32>,
     shift: u32,
-    hash_builder: RandomState,
+    random_state: PlRandomState,
 }
 
 impl<K: Hash + Eq, V> Default for FastFixedCache<K, V> {
@@ -66,7 +66,7 @@ impl<K: Hash + Eq, V> FastFixedCache<K, V> {
             slots: zeroed_vec(n),
             access_ctr: Cell::new(1),
             shift: 64 - n.ilog2(),
-            hash_builder: RandomState::new(),
+            random_state: PlRandomState::default(),
         }
     }
 
@@ -213,7 +213,7 @@ impl<K: Hash + Eq, V> FastFixedCache<K, V> {
         // An instantiation of Dietzfelbinger's multiply-shift, see 2.3 of
         // https://arxiv.org/pdf/1504.06804.pdf.
         // The magic constants are just two randomly chosen odd 64-bit numbers.
-        let h = self.hash_builder.hash_one(key);
+        let h = self.random_state.hash_one(key);
         let tag = h as u32;
         let i1 = (h.wrapping_mul(0x2e623b55bc0c9073) >> self.shift) as usize;
         let i2 = (h.wrapping_mul(0x921932b06a233d39) >> self.shift) as usize;

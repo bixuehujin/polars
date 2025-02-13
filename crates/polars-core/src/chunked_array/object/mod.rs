@@ -3,7 +3,8 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
 use arrow::bitmap::utils::{BitmapIter, ZipValidity};
-use arrow::bitmap::{Bitmap, MutableBitmap};
+use arrow::bitmap::Bitmap;
+use arrow::buffer::Buffer;
 use polars_utils::total_ord::TotalHash;
 
 use crate::prelude::*;
@@ -15,15 +16,15 @@ mod is_valid;
 mod iterator;
 pub mod registry;
 
+pub use extension::set_polars_allow_extension;
+
 #[derive(Debug, Clone)]
 pub struct ObjectArray<T>
 where
     T: PolarsObject,
 {
-    pub(crate) values: Arc<Vec<T>>,
-    pub(crate) null_bitmap: Option<Bitmap>,
-    pub(crate) offset: usize,
-    pub(crate) len: usize,
+    values: Buffer<T>,
+    validity: Option<Bitmap>,
 }
 
 /// Trimmed down object safe polars object
@@ -78,23 +79,18 @@ impl<T> ObjectArray<T>
 where
     T: PolarsObject,
 {
-    /// Get a reference to the underlying data
-    pub fn values(&self) -> &Arc<Vec<T>> {
-        &self.values
-    }
-
     pub fn values_iter(&self) -> ObjectValueIter<'_, T> {
         self.values.iter()
     }
 
     /// Returns an iterator of `Option<&T>` over every element of this array.
     pub fn iter(&self) -> ZipValidity<&T, ObjectValueIter<'_, T>, BitmapIter> {
-        ZipValidity::new_with_validity(self.values_iter(), self.null_bitmap.as_ref())
+        ZipValidity::new_with_validity(self.values_iter(), self.validity.as_ref())
     }
 
     /// Get a value at a certain index location
     pub fn value(&self, index: usize) -> &T {
-        &self.values[self.offset + index]
+        &self.values[index]
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -121,7 +117,7 @@ where
     /// No bounds checks
     #[inline]
     pub unsafe fn is_valid_unchecked(&self, i: usize) -> bool {
-        if let Some(b) = &self.null_bitmap {
+        if let Some(b) = &self.validity {
             b.get_bit_unchecked(i)
         } else {
             true
@@ -149,13 +145,13 @@ where
 
     /// Sets the validity of this array.
     /// # Panics
-    /// This function panics iff `values.len() != self.len()`.
+    /// This function panics iff `validity.len() != self.len()`.
     #[inline]
     pub fn set_validity(&mut self, validity: Option<Bitmap>) {
         if matches!(&validity, Some(bitmap) if bitmap.len() != self.len()) {
             panic!("validity must be equal to the array's length")
         }
-        self.null_bitmap = validity;
+        self.validity = validity;
     }
 }
 
@@ -167,8 +163,8 @@ where
         self
     }
 
-    fn data_type(&self) -> &ArrowDataType {
-        &ArrowDataType::FixedSizeBinary(std::mem::size_of::<T>())
+    fn dtype(&self) -> &ArrowDataType {
+        &ArrowDataType::FixedSizeBinary(size_of::<T>())
     }
 
     fn slice(&mut self, offset: usize, length: usize) {
@@ -180,18 +176,30 @@ where
     }
 
     unsafe fn slice_unchecked(&mut self, offset: usize, length: usize) {
-        let len = std::cmp::min(self.len - offset, length);
+        self.validity = self
+            .validity
+            .take()
+            .map(|bitmap| bitmap.sliced_unchecked(offset, length))
+            .filter(|bitmap| bitmap.unset_bits() > 0);
+        self.values.slice_unchecked(offset, length);
+    }
 
-        self.len = len;
-        self.offset = offset;
+    fn split_at_boxed(&self, offset: usize) -> (Box<dyn Array>, Box<dyn Array>) {
+        let (lhs, rhs) = Splitable::split_at(self, offset);
+        (Box::new(lhs), Box::new(rhs))
+    }
+
+    unsafe fn split_at_boxed_unchecked(&self, offset: usize) -> (Box<dyn Array>, Box<dyn Array>) {
+        let (lhs, rhs) = unsafe { Splitable::split_at_unchecked(self, offset) };
+        (Box::new(lhs), Box::new(rhs))
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.values.len()
     }
 
     fn validity(&self) -> Option<&Bitmap> {
-        self.null_bitmap.as_ref()
+        self.validity.as_ref()
     }
 
     fn with_validity(&self, validity: Option<Bitmap>) -> Box<dyn Array> {
@@ -207,10 +215,31 @@ where
     }
 
     fn null_count(&self) -> usize {
-        match &self.null_bitmap {
+        match &self.validity {
             None => 0,
             Some(validity) => validity.unset_bits(),
         }
+    }
+}
+
+impl<T: PolarsObject> Splitable for ObjectArray<T> {
+    fn check_bound(&self, offset: usize) -> bool {
+        offset <= self.len()
+    }
+
+    unsafe fn _split_at_unchecked(&self, offset: usize) -> (Self, Self) {
+        let (left_values, right_values) = unsafe { self.values.split_at_unchecked(offset) };
+        let (left_validity, right_validity) = unsafe { self.validity.split_at_unchecked(offset) };
+        (
+            Self {
+                values: left_values,
+                validity: left_validity,
+            },
+            Self {
+                values: right_values,
+                validity: right_validity,
+            },
+        )
     }
 }
 
@@ -238,17 +267,15 @@ impl<T: PolarsObject> StaticArray for ObjectArray<T> {
 
     fn full_null(length: usize, _dtype: ArrowDataType) -> Self {
         ObjectArray {
-            values: Arc::new(vec![T::default(); length]),
-            null_bitmap: Some(Bitmap::new_with_value(false, length)),
-            offset: 0,
-            len: length,
+            values: vec![T::default(); length].into(),
+            validity: Some(Bitmap::new_with_value(false, length)),
         }
     }
 }
 
 impl<T: PolarsObject> ParameterFreeDtypeStaticArray for ObjectArray<T> {
     fn get_dtype() -> ArrowDataType {
-        ArrowDataType::FixedSizeBinary(std::mem::size_of::<T>())
+        ArrowDataType::FixedSizeBinary(size_of::<T>())
     }
 }
 
@@ -286,6 +313,15 @@ where
             unsafe { self.get_object_unchecked(index) }
         } else {
             None
+        }
+    }
+}
+
+impl<T: PolarsObject> From<Vec<T>> for ObjectArray<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self {
+            values: values.into(),
+            validity: None,
         }
     }
 }

@@ -5,6 +5,7 @@ use polars_utils::sync::SyncPtr;
 use crate::chunked_array::object::extension::polars_extension::PolarsExtension;
 use crate::prelude::*;
 use crate::series::implementations::null::NullChunked;
+use crate::utils::index_to_chunked_index;
 
 #[inline]
 #[allow(unused_variables)]
@@ -43,17 +44,22 @@ pub(crate) unsafe fn arr_to_any_value<'a>(
         DataType::Int16 => downcast_and_pack!(Int16Array, Int16),
         DataType::Int32 => downcast_and_pack!(Int32Array, Int32),
         DataType::Int64 => downcast_and_pack!(Int64Array, Int64),
+        DataType::Int128 => downcast_and_pack!(Int128Array, Int128),
         DataType::Float32 => downcast_and_pack!(Float32Array, Float32),
         DataType::Float64 => downcast_and_pack!(Float64Array, Float64),
         DataType::List(dt) => {
             let v: ArrayRef = downcast!(LargeListArray);
             if dt.is_primitive() {
-                let s = Series::from_chunks_and_dtype_unchecked("", vec![v], dt);
+                let s = Series::from_chunks_and_dtype_unchecked(PlSmallStr::EMPTY, vec![v], dt);
                 AnyValue::List(s)
             } else {
-                let s = Series::from_chunks_and_dtype_unchecked("", vec![v], &dt.to_physical())
-                    .cast_unchecked(dt)
-                    .unwrap();
+                let s = Series::from_chunks_and_dtype_unchecked(
+                    PlSmallStr::EMPTY,
+                    vec![v],
+                    &dt.to_physical(),
+                )
+                .from_physical_unchecked(dt)
+                .unwrap();
                 AnyValue::List(s)
             }
         },
@@ -61,12 +67,16 @@ pub(crate) unsafe fn arr_to_any_value<'a>(
         DataType::Array(dt, width) => {
             let v: ArrayRef = downcast!(FixedSizeListArray);
             if dt.is_primitive() {
-                let s = Series::from_chunks_and_dtype_unchecked("", vec![v], dt);
+                let s = Series::from_chunks_and_dtype_unchecked(PlSmallStr::EMPTY, vec![v], dt);
                 AnyValue::Array(s, *width)
             } else {
-                let s = Series::from_chunks_and_dtype_unchecked("", vec![v], &dt.to_physical())
-                    .cast_unchecked(dt)
-                    .unwrap();
+                let s = Series::from_chunks_and_dtype_unchecked(
+                    PlSmallStr::EMPTY,
+                    vec![v],
+                    &dt.to_physical(),
+                )
+                .from_physical_unchecked(dt)
+                .unwrap();
                 AnyValue::Array(s, *width)
             }
         },
@@ -91,7 +101,7 @@ pub(crate) unsafe fn arr_to_any_value<'a>(
         DataType::Datetime(tu, tz) => {
             let arr = &*(arr as *const dyn Array as *const Int64Array);
             let v = arr.value_unchecked(idx);
-            AnyValue::Datetime(v, *tu, tz)
+            AnyValue::Datetime(v, *tu, tz.as_ref())
         },
         #[cfg(feature = "dtype-date")]
         DataType::Date => {
@@ -152,7 +162,7 @@ impl<'a> AnyValue<'a> {
 
                                 if arr.is_valid_unchecked(idx) {
                                     let v = arr.value_unchecked(idx);
-                                    match fld.data_type() {
+                                    match fld.dtype() {
                                         DataType::Categorical(Some(rev_map), _) => {
                                             AnyValue::Categorical(
                                                 v,
@@ -169,13 +179,13 @@ impl<'a> AnyValue<'a> {
                                     AnyValue::Null
                                 }
                             } else {
-                                arr_to_any_value(&**arr, idx, fld.data_type())
+                                arr_to_any_value(&**arr, idx, fld.dtype())
                             }
                         }
 
                         #[cfg(not(feature = "dtype-categorical"))]
                         {
-                            arr_to_any_value(&**arr, idx, fld.data_type())
+                            arr_to_any_value(&**arr, idx, fld.dtype())
                         }
                     })
                 }
@@ -315,5 +325,34 @@ impl ChunkAnyValue for NullChunked {
 
     fn get_any_value(&self, _index: usize) -> PolarsResult<AnyValue> {
         Ok(AnyValue::Null)
+    }
+}
+
+#[cfg(feature = "dtype-struct")]
+impl ChunkAnyValue for StructChunked {
+    /// Gets AnyValue from LogicalType
+    fn get_any_value(&self, i: usize) -> PolarsResult<AnyValue<'_>> {
+        polars_ensure!(i < self.len(), oob = i, self.len());
+        unsafe { Ok(self.get_any_value_unchecked(i)) }
+    }
+
+    unsafe fn get_any_value_unchecked(&self, i: usize) -> AnyValue<'_> {
+        let (chunk_idx, idx) = index_to_chunked_index(self.chunks.iter().map(|c| c.len()), i);
+        if let DataType::Struct(flds) = self.dtype() {
+            // SAFETY: we already have a single chunk and we are
+            // guarded by the type system.
+            unsafe {
+                let arr = &**self.chunks.get_unchecked(chunk_idx);
+                let arr = &*(arr as *const dyn Array as *const StructArray);
+
+                if arr.is_null_unchecked(idx) {
+                    AnyValue::Null
+                } else {
+                    AnyValue::Struct(idx, arr, flds)
+                }
+            }
+        } else {
+            unreachable!()
+        }
     }
 }

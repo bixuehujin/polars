@@ -1,48 +1,70 @@
+use std::io::Cursor;
+use std::sync::Arc;
+
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::io::avro::avro_schema::file::{Block, CompressedBlock, Compression};
 use arrow::io::avro::avro_schema::write::{compress, write_block, write_metadata};
 use arrow::io::avro::write;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::RecordBatchT;
 use avro_schema::schema::{Field as AvroField, Record, Schema as AvroSchema};
+use polars::io::avro::{AvroReader, AvroWriter};
+use polars::io::{SerReader, SerWriter};
+use polars::prelude::df;
 use polars_error::PolarsResult;
 
 use super::read::read_avro;
 
 pub(super) fn schema() -> ArrowSchema {
-    ArrowSchema::from(vec![
-        Field::new("int64", ArrowDataType::Int64, false),
-        Field::new("int64 nullable", ArrowDataType::Int64, true),
-        Field::new("utf8", ArrowDataType::Utf8, false),
-        Field::new("utf8 nullable", ArrowDataType::Utf8, true),
-        Field::new("int32", ArrowDataType::Int32, false),
-        Field::new("int32 nullable", ArrowDataType::Int32, true),
-        Field::new("date", ArrowDataType::Date32, false),
-        Field::new("date nullable", ArrowDataType::Date32, true),
-        Field::new("binary", ArrowDataType::Binary, false),
-        Field::new("binary nullable", ArrowDataType::Binary, true),
-        Field::new("float32", ArrowDataType::Float32, false),
-        Field::new("float32 nullable", ArrowDataType::Float32, true),
-        Field::new("float64", ArrowDataType::Float64, false),
-        Field::new("float64 nullable", ArrowDataType::Float64, true),
-        Field::new("boolean", ArrowDataType::Boolean, false),
-        Field::new("boolean nullable", ArrowDataType::Boolean, true),
+    ArrowSchema::from_iter([
+        Field::new("int64".into(), ArrowDataType::Int64, false),
+        Field::new("int64 nullable".into(), ArrowDataType::Int64, true),
+        Field::new("utf8".into(), ArrowDataType::Utf8, false),
+        Field::new("utf8 nullable".into(), ArrowDataType::Utf8, true),
+        Field::new("int32".into(), ArrowDataType::Int32, false),
+        Field::new("int32 nullable".into(), ArrowDataType::Int32, true),
+        Field::new("date".into(), ArrowDataType::Date32, false),
+        Field::new("date nullable".into(), ArrowDataType::Date32, true),
+        Field::new("binary".into(), ArrowDataType::Binary, false),
+        Field::new("binary nullable".into(), ArrowDataType::Binary, true),
+        Field::new("float32".into(), ArrowDataType::Float32, false),
+        Field::new("float32 nullable".into(), ArrowDataType::Float32, true),
+        Field::new("float64".into(), ArrowDataType::Float64, false),
+        Field::new("float64 nullable".into(), ArrowDataType::Float64, true),
+        Field::new("boolean".into(), ArrowDataType::Boolean, false),
+        Field::new("boolean nullable".into(), ArrowDataType::Boolean, true),
         Field::new(
-            "list",
-            ArrowDataType::List(Box::new(Field::new("item", ArrowDataType::Int32, true))),
+            "list".into(),
+            ArrowDataType::List(Box::new(Field::new(
+                "item".into(),
+                ArrowDataType::Int32,
+                true,
+            ))),
             false,
         ),
         Field::new(
-            "list nullable",
-            ArrowDataType::List(Box::new(Field::new("item", ArrowDataType::Int32, true))),
+            "list nullable".into(),
+            ArrowDataType::List(Box::new(Field::new(
+                "item".into(),
+                ArrowDataType::Int32,
+                true,
+            ))),
             true,
         ),
     ])
 }
 
-pub(super) fn data() -> RecordBatch<Box<dyn Array>> {
-    let list_dt = ArrowDataType::List(Box::new(Field::new("item", ArrowDataType::Int32, true)));
-    let list_dt1 = ArrowDataType::List(Box::new(Field::new("item", ArrowDataType::Int32, true)));
+pub(super) fn data() -> RecordBatchT<Box<dyn Array>> {
+    let list_dt = ArrowDataType::List(Box::new(Field::new(
+        "item".into(),
+        ArrowDataType::Int32,
+        true,
+    )));
+    let list_dt1 = ArrowDataType::List(Box::new(Field::new(
+        "item".into(),
+        ArrowDataType::Int32,
+        true,
+    )));
 
     let columns = vec![
         Box::new(Int64Array::from_slice([27, 47])) as Box<dyn Array>,
@@ -80,12 +102,13 @@ pub(super) fn data() -> RecordBatch<Box<dyn Array>> {
             Some([true, false].into()),
         )),
     ];
+    let schema = schema();
 
-    RecordBatch::new(columns)
+    RecordBatchT::new(2, Arc::new(schema), columns)
 }
 
 pub(super) fn serialize_to_block<R: AsRef<dyn Array>>(
-    columns: &RecordBatch<R>,
+    columns: &RecordBatchT<R>,
     schema: &ArrowSchema,
     compression: Option<Compression>,
 ) -> PolarsResult<CompressedBlock> {
@@ -110,7 +133,7 @@ pub(super) fn serialize_to_block<R: AsRef<dyn Array>>(
 }
 
 fn write_avro<R: AsRef<dyn Array>>(
-    columns: &RecordBatch<R>,
+    columns: &RecordBatchT<R>,
     schema: &ArrowSchema,
     compression: Option<Compression>,
 ) -> PolarsResult<Vec<u8>> {
@@ -146,54 +169,60 @@ fn no_compression() -> PolarsResult<()> {
     roundtrip(None)
 }
 
-#[cfg(feature = "io_avro_compression")]
 #[test]
 fn snappy() -> PolarsResult<()> {
     roundtrip(Some(Compression::Snappy))
 }
 
-#[cfg(feature = "io_avro_compression")]
 #[test]
 fn deflate() -> PolarsResult<()> {
     roundtrip(Some(Compression::Deflate))
 }
 
 fn large_format_schema() -> ArrowSchema {
-    ArrowSchema::from(vec![
-        Field::new("large_utf8", ArrowDataType::LargeUtf8, false),
-        Field::new("large_utf8_nullable", ArrowDataType::LargeUtf8, true),
-        Field::new("large_binary", ArrowDataType::LargeBinary, false),
-        Field::new("large_binary_nullable", ArrowDataType::LargeBinary, true),
+    ArrowSchema::from_iter([
+        Field::new("large_utf8".into(), ArrowDataType::LargeUtf8, false),
+        Field::new("large_utf8_nullable".into(), ArrowDataType::LargeUtf8, true),
+        Field::new("large_binary".into(), ArrowDataType::LargeBinary, false),
+        Field::new(
+            "large_binary_nullable".into(),
+            ArrowDataType::LargeBinary,
+            true,
+        ),
     ])
 }
 
-fn large_format_data() -> RecordBatch<Box<dyn Array>> {
+fn large_format_data() -> RecordBatchT<Box<dyn Array>> {
     let columns = vec![
         Box::new(Utf8Array::<i64>::from_slice(["a", "b"])) as Box<dyn Array>,
         Box::new(Utf8Array::<i64>::from([Some("a"), None])),
         Box::new(BinaryArray::<i64>::from_slice([b"foo", b"bar"])),
         Box::new(BinaryArray::<i64>::from([Some(b"foo"), None])),
     ];
-    RecordBatch::new(columns)
+    let schema = large_format_schema();
+
+    RecordBatchT::new(2, Arc::new(schema), columns)
 }
 
 fn large_format_expected_schema() -> ArrowSchema {
-    ArrowSchema::from(vec![
-        Field::new("large_utf8", ArrowDataType::Utf8, false),
-        Field::new("large_utf8_nullable", ArrowDataType::Utf8, true),
-        Field::new("large_binary", ArrowDataType::Binary, false),
-        Field::new("large_binary_nullable", ArrowDataType::Binary, true),
+    ArrowSchema::from_iter([
+        Field::new("large_utf8".into(), ArrowDataType::Utf8, false),
+        Field::new("large_utf8_nullable".into(), ArrowDataType::Utf8, true),
+        Field::new("large_binary".into(), ArrowDataType::Binary, false),
+        Field::new("large_binary_nullable".into(), ArrowDataType::Binary, true),
     ])
 }
 
-fn large_format_expected_data() -> RecordBatch<Box<dyn Array>> {
+fn large_format_expected_data() -> RecordBatchT<Box<dyn Array>> {
     let columns = vec![
         Box::new(Utf8Array::<i32>::from_slice(["a", "b"])) as Box<dyn Array>,
         Box::new(Utf8Array::<i32>::from([Some("a"), None])),
         Box::new(BinaryArray::<i32>::from_slice([b"foo", b"bar"])),
         Box::new(BinaryArray::<i32>::from([Some(b"foo"), None])),
     ];
-    RecordBatch::new(columns)
+    let schema = large_format_expected_schema();
+
+    RecordBatchT::new(2, Arc::new(schema), columns)
 }
 
 #[test]
@@ -216,50 +245,57 @@ fn check_large_format() -> PolarsResult<()> {
 }
 
 fn struct_schema() -> ArrowSchema {
-    ArrowSchema::from(vec![
+    ArrowSchema::from_iter([
         Field::new(
-            "struct",
+            "struct".into(),
             ArrowDataType::Struct(vec![
-                Field::new("item1", ArrowDataType::Int32, false),
-                Field::new("item2", ArrowDataType::Int32, true),
+                Field::new("item1".into(), ArrowDataType::Int32, false),
+                Field::new("item2".into(), ArrowDataType::Int32, true),
             ]),
             false,
         ),
         Field::new(
-            "struct nullable",
+            "struct nullable".into(),
             ArrowDataType::Struct(vec![
-                Field::new("item1", ArrowDataType::Int32, false),
-                Field::new("item2", ArrowDataType::Int32, true),
+                Field::new("item1".into(), ArrowDataType::Int32, false),
+                Field::new("item2".into(), ArrowDataType::Int32, true),
             ]),
             true,
         ),
     ])
 }
 
-fn struct_data() -> RecordBatch<Box<dyn Array>> {
+fn struct_data() -> RecordBatchT<Box<dyn Array>> {
     let struct_dt = ArrowDataType::Struct(vec![
-        Field::new("item1", ArrowDataType::Int32, false),
-        Field::new("item2", ArrowDataType::Int32, true),
+        Field::new("item1".into(), ArrowDataType::Int32, false),
+        Field::new("item2".into(), ArrowDataType::Int32, true),
     ]);
+    let schema = struct_schema();
 
-    RecordBatch::new(vec![
-        Box::new(StructArray::new(
-            struct_dt.clone(),
-            vec![
-                Box::new(PrimitiveArray::<i32>::from_slice([1, 2])),
-                Box::new(PrimitiveArray::<i32>::from([None, Some(1)])),
-            ],
-            None,
-        )),
-        Box::new(StructArray::new(
-            struct_dt,
-            vec![
-                Box::new(PrimitiveArray::<i32>::from_slice([1, 2])),
-                Box::new(PrimitiveArray::<i32>::from([None, Some(1)])),
-            ],
-            Some([true, false].into()),
-        )),
-    ])
+    RecordBatchT::new(
+        2,
+        Arc::new(schema),
+        vec![
+            Box::new(StructArray::new(
+                struct_dt.clone(),
+                2,
+                vec![
+                    Box::new(PrimitiveArray::<i32>::from_slice([1, 2])),
+                    Box::new(PrimitiveArray::<i32>::from([None, Some(1)])),
+                ],
+                None,
+            )),
+            Box::new(StructArray::new(
+                struct_dt,
+                2,
+                vec![
+                    Box::new(PrimitiveArray::<i32>::from_slice([1, 2])),
+                    Box::new(PrimitiveArray::<i32>::from([None, Some(1)])),
+                ],
+                Some([true, false].into()),
+            )),
+        ],
+    )
 }
 
 fn avro_record() -> Record {
@@ -367,6 +403,85 @@ fn struct_() -> PolarsResult<()> {
     for (c1, c2) in result.columns().iter().zip(expected_data.columns().iter()) {
         assert_eq!(c1.as_ref(), c2.as_ref());
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_write_and_read_with_compression() -> PolarsResult<()> {
+    let mut write_df = df!(
+        "i64" => &[1, 2],
+        "f64" => &[0.1, 0.2],
+        "string" => &["a", "b"]
+    )?;
+
+    let compressions = vec![None, Some(Compression::Deflate), Some(Compression::Snappy)];
+
+    for compression in compressions.into_iter() {
+        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+
+        AvroWriter::new(&mut buf)
+            .with_compression(compression)
+            .finish(&mut write_df)?;
+        buf.set_position(0);
+
+        let read_df = AvroReader::new(buf).finish()?;
+        assert!(write_df.equals(&read_df));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_with_projection() -> PolarsResult<()> {
+    let mut df = df!(
+        "i64" => &[1, 2],
+        "f64" => &[0.1, 0.2],
+        "string" => &["a", "b"]
+    )?;
+
+    let expected_df = df!(
+        "i64" => &[1, 2],
+        "f64" => &[0.1, 0.2]
+    )?;
+
+    let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+
+    AvroWriter::new(&mut buf).finish(&mut df)?;
+    buf.set_position(0);
+
+    let read_df = AvroReader::new(buf)
+        .with_projection(Some(vec![0, 1]))
+        .finish()?;
+
+    assert!(expected_df.equals(&read_df));
+
+    Ok(())
+}
+
+#[test]
+fn test_with_columns() -> PolarsResult<()> {
+    let mut df = df!(
+        "i64" => &[1, 2],
+        "f64" => &[0.1, 0.2],
+        "string" => &["a", "b"]
+    )?;
+
+    let expected_df = df!(
+        "i64" => &[1, 2],
+        "string" => &["a", "b"]
+    )?;
+
+    let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+
+    AvroWriter::new(&mut buf).finish(&mut df)?;
+    buf.set_position(0);
+
+    let read_df = AvroReader::new(buf)
+        .with_columns(Some(vec!["i64".to_string(), "string".to_string()]))
+        .finish()?;
+
+    assert!(expected_df.equals(&read_df));
 
     Ok(())
 }

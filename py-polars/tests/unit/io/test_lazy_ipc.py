@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.fixture()
+@pytest.fixture
 def foods_ipc_path(io_files_path: Path) -> Path:
     return io_files_path / "foods1.ipc"
 
@@ -88,6 +88,7 @@ def test_ipc_list_arg(io_files_path: Path) -> None:
     assert df.row(0) == ("vegetables", 45, 0.5, 2)
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_scan_ipc_local_with_async(
     capfd: Any,
     monkeypatch: Any,

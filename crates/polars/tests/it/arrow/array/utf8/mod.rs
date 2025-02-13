@@ -9,11 +9,15 @@ mod mutable;
 mod mutable_values;
 mod to_mutable;
 
+fn array() -> Utf8Array<i32> {
+    vec![Some("hello"), None, Some("hello2")]
+        .into_iter()
+        .collect()
+}
+
 #[test]
 fn basics() {
-    let data = vec![Some("hello"), None, Some("hello2")];
-
-    let array: Utf8Array<i32> = data.into_iter().collect();
+    let array = array();
 
     assert_eq!(array.value(0), "hello");
     assert_eq!(array.value(1), "");
@@ -43,6 +47,20 @@ fn basics() {
     // note how this keeps everything: the offsets were sliced
     assert_eq!(array.values().as_slice(), b"hellohello2");
     assert_eq!(array.offsets().as_slice(), &[5, 5, 11]);
+}
+
+#[test]
+fn split_at() {
+    let (lhs, rhs) = array().split_at(1);
+
+    assert_eq!(lhs.value(0), "hello");
+    assert_eq!(rhs.value(0), "");
+    assert_eq!(rhs.value(1), "hello2");
+    // note how this keeps everything: the offsets were sliced
+    assert_eq!(lhs.values().as_slice(), b"hellohello2");
+    assert_eq!(rhs.values().as_slice(), b"hellohello2");
+    assert_eq!(lhs.offsets().as_slice(), &[0, 5]);
+    assert_eq!(rhs.offsets().as_slice(), &[5, 5, 11]);
 }
 
 #[test]
@@ -130,7 +148,7 @@ fn not_utf8_individually() {
 }
 
 #[test]
-fn wrong_data_type() {
+fn wrong_dtype() {
     let offsets = vec![0, 4].try_into().unwrap();
     let values = b"abbb".to_vec().into();
     assert!(Utf8Array::<i32>::try_new(ArrowDataType::Int32, offsets, values, None).is_err());

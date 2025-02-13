@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 
 import polars as pl
-from polars.exceptions import InvalidOperationError
+from polars.exceptions import SQLSyntaxError
 from polars.testing import assert_frame_equal
 
 
-@pytest.fixture()
+@pytest.fixture
 def foods_ipc_path() -> Path:
     return Path(__file__).parent.parent / "io" / "files" / "foods1.ipc"
 
@@ -22,18 +22,36 @@ def test_case_when() -> None:
             "v2": [101, 202, 303, 404],
         }
     )
-    with pl.SQLContext(test_data=lf, eager_execution=True) as ctx:
+    with pl.SQLContext(test_data=lf, eager=True) as ctx:
         out = ctx.execute(
             """
             SELECT *, CASE WHEN COALESCE(v1, v2) % 2 != 0 THEN 'odd' ELSE 'even' END as "v3"
             FROM test_data
             """
         )
-    assert out.to_dict(as_series=False) == {
-        "v1": [None, 2, None, 4],
-        "v2": [101, 202, 303, 404],
-        "v3": ["odd", "even", "odd", "even"],
-    }
+        assert out.to_dict(as_series=False) == {
+            "v1": [None, 2, None, 4],
+            "v2": [101, 202, 303, 404],
+            "v3": ["odd", "even", "odd", "even"],
+        }
+
+
+@pytest.mark.parametrize("else_clause", ["ELSE NULL ", ""])
+def test_case_when_optional_else(else_clause: str) -> None:
+    df = pl.DataFrame(
+        {
+            "a": [1, 2, 3, 4, 5, 6, 7],
+            "b": [7, 6, 5, 4, 3, 2, 1],
+            "c": [3, 4, 0, 3, 4, 1, 1],
+        }
+    )
+    query = f"""
+        SELECT
+          AVG(CASE WHEN a <= b THEN c {else_clause}END) AS conditional_mean
+          FROM self
+    """
+    res = df.sql(query)
+    assert res.to_dict(as_series=False) == {"conditional_mean": [2.5]}
 
 
 def test_control_flow(foods_ipc_path: Path) -> None:
@@ -58,7 +76,6 @@ def test_control_flow(foods_ipc_path: Path) -> None:
         """,
         eager=True,
     )
-
     assert res.to_dict(as_series=False) == {
         "coalsc": [1, 4, 2, 3, 6, 4],
         "nullif x_y": [1, None, 2, None, None, 4],
@@ -68,9 +85,12 @@ def test_control_flow(foods_ipc_path: Path) -> None:
         "both": [1, None, 2, 3, None, 4],
         "x_eq_y": ["ne", "ne", "ne", "eq", "ne", "ne"],
     }
+
     for null_func in ("IFNULL", "NULLIF"):
-        # both functions expect only 2 arguments
-        with pytest.raises(InvalidOperationError):
+        with pytest.raises(
+            SQLSyntaxError,
+            match=r"(IFNULL|NULLIF) expects 2 arguments \(found 3\)",
+        ):
             pl.SQLContext(df=nums).execute(f"SELECT {null_func}(x,y,z) FROM df")
 
 

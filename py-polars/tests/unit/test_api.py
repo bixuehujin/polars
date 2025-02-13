@@ -11,7 +11,7 @@ from polars.testing import assert_frame_equal
 def test_custom_df_namespace() -> None:
     @pl.api.register_dataframe_namespace("split")
     class SplitFrame:
-        def __init__(self, df: pl.DataFrame):
+        def __init__(self, df: pl.DataFrame) -> None:
             self._df = df
 
         def by_first_letter_of_column_names(self) -> list[pl.DataFrame]:
@@ -47,7 +47,7 @@ def test_custom_df_namespace() -> None:
 def test_custom_expr_namespace() -> None:
     @pl.api.register_expr_namespace("power")
     class PowersOfN:
-        def __init__(self, expr: pl.Expr):
+        def __init__(self, expr: pl.Expr) -> None:
             self._expr = expr
 
         def next(self, p: int) -> pl.Expr:
@@ -61,12 +61,10 @@ def test_custom_expr_namespace() -> None:
 
     df = pl.DataFrame([1.4, 24.3, 55.0, 64.001], schema=["n"])
     assert df.select(
-        [
-            pl.col("n"),
-            pl.col("n").power.next(p=2).alias("next_pow2"),  # type: ignore[attr-defined]
-            pl.col("n").power.previous(p=2).alias("prev_pow2"),  # type: ignore[attr-defined]
-            pl.col("n").power.nearest(p=2).alias("nearest_pow2"),  # type: ignore[attr-defined]
-        ]
+        pl.col("n"),
+        pl.col("n").power.next(p=2).alias("next_pow2"),  # type: ignore[attr-defined]
+        pl.col("n").power.previous(p=2).alias("prev_pow2"),  # type: ignore[attr-defined]
+        pl.col("n").power.nearest(p=2).alias("nearest_pow2"),  # type: ignore[attr-defined]
     ).rows() == [
         (1.4, 2, 1, 1),
         (24.3, 32, 16, 32),
@@ -78,12 +76,13 @@ def test_custom_expr_namespace() -> None:
 def test_custom_lazy_namespace() -> None:
     @pl.api.register_lazyframe_namespace("split")
     class SplitFrame:
-        def __init__(self, ldf: pl.LazyFrame):
-            self._ldf = ldf
+        def __init__(self, lf: pl.LazyFrame) -> None:
+            self._lf = lf
 
         def by_column_dtypes(self) -> list[pl.LazyFrame]:
             return [
-                self._ldf.select(pl.col(tp)) for tp in dict.fromkeys(self._ldf.dtypes)
+                self._lf.select(pl.col(tp))
+                for tp in dict.fromkeys(self._lf.collect_schema().dtypes())
             ]
 
     ldf = pl.DataFrame(
@@ -94,12 +93,15 @@ def test_custom_lazy_namespace() -> None:
 
     df1, df2 = (d.collect() for d in ldf.split.by_column_dtypes())  # type: ignore[attr-defined]
     assert_frame_equal(
-        df1, pl.DataFrame([("xx",), ("xy",), ("yy",), ("yz",)], schema=["a1"])
+        df1,
+        pl.DataFrame([("xx",), ("xy",), ("yy",), ("yz",)], schema=["a1"], orient="row"),
     )
     assert_frame_equal(
         df2,
         pl.DataFrame(
-            [(2, 3, 4), (4, 5, 6), (5, 6, 7), (6, 7, 8)], schema=["a2", "b1", "b2"]
+            [(2, 3, 4), (4, 5, 6), (5, 6, 7), (6, 7, 8)],
+            schema=["a2", "b1", "b2"],
+            orient="row",
         ),
     )
 
@@ -107,7 +109,7 @@ def test_custom_lazy_namespace() -> None:
 def test_custom_series_namespace() -> None:
     @pl.api.register_series_namespace("math")
     class CustomMath:
-        def __init__(self, s: pl.Series):
+        def __init__(self, s: pl.Series) -> None:
             self._s = s
 
         def square(self) -> pl.Series:
@@ -122,7 +124,7 @@ def test_custom_series_namespace() -> None:
     ]
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 @pytest.mark.parametrize("pcls", [pl.Expr, pl.DataFrame, pl.LazyFrame, pl.Series])
 def test_class_namespaces_are_registered(pcls: Any) -> None:
     # confirm that existing (and new) namespaces
@@ -139,9 +141,9 @@ def test_class_namespaces_are_registered(pcls: Any) -> None:
 
                 if obj.__class__.__name__.endswith("NameSpace"):
                     ns = obj._accessor
-                    assert (
-                        ns in namespaces
-                    ), f"{ns!r} should be registered in {pcls.__name__}._accessors"
+                    assert ns in namespaces, (
+                        f"{ns!r} should be registered in {pcls.__name__}._accessors"
+                    )
 
 
 def test_namespace_cannot_override_builtin() -> None:
@@ -149,19 +151,19 @@ def test_namespace_cannot_override_builtin() -> None:
 
         @pl.api.register_dataframe_namespace("dt")
         class CustomDt:
-            def __init__(self, df: pl.DataFrame):
+            def __init__(self, df: pl.DataFrame) -> None:
                 self._df = df
 
 
 def test_namespace_warning_on_override() -> None:
     @pl.api.register_dataframe_namespace("math")
     class CustomMath:
-        def __init__(self, df: pl.DataFrame):
+        def __init__(self, df: pl.DataFrame) -> None:
             self._df = df
 
     with pytest.raises(UserWarning):
 
         @pl.api.register_dataframe_namespace("math")
         class CustomMath2:
-            def __init__(self, df: pl.DataFrame):
+            def __init__(self, df: pl.DataFrame) -> None:
                 self._df = df

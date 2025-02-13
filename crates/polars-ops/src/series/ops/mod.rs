@@ -1,10 +1,7 @@
 #[cfg(feature = "abs")]
 mod abs;
-#[cfg(feature = "approx_unique")]
-mod approx_algo;
-#[cfg(feature = "approx_unique")]
-mod approx_unique;
 mod arg_min_max;
+mod bitwise;
 #[cfg(feature = "business")]
 mod business;
 mod clip;
@@ -24,7 +21,11 @@ mod floor_divide;
 mod fused;
 mod horizontal;
 mod index;
+#[cfg(feature = "index_of")]
+mod index_of;
 mod int_range;
+#[cfg(any(feature = "interpolate_by", feature = "interpolate"))]
+mod interpolation;
 #[cfg(feature = "is_between")]
 mod is_between;
 #[cfg(feature = "is_first_distinct")]
@@ -35,6 +36,7 @@ mod is_in;
 mod is_last_distinct;
 #[cfg(feature = "is_unique")]
 mod is_unique;
+mod linear_space;
 #[cfg(feature = "log")]
 mod log;
 #[cfg(feature = "moment")]
@@ -64,11 +66,8 @@ mod various;
 
 #[cfg(feature = "abs")]
 pub use abs::*;
-#[cfg(feature = "approx_unique")]
-pub use approx_algo::*;
-#[cfg(feature = "approx_unique")]
-pub use approx_unique::*;
 pub use arg_min_max::ArgAgg;
+pub use bitwise::*;
 #[cfg(feature = "business")]
 pub use business::*;
 pub use clip::*;
@@ -88,7 +87,15 @@ pub use floor_divide::*;
 pub use fused::*;
 pub use horizontal::*;
 pub use index::*;
+#[cfg(feature = "index_of")]
+pub use index_of::*;
 pub use int_range::*;
+#[cfg(feature = "interpolate")]
+pub use interpolation::interpolate::*;
+#[cfg(feature = "interpolate_by")]
+pub use interpolation::interpolate_by::*;
+#[cfg(any(feature = "interpolate", feature = "interpolate_by"))]
+pub use interpolation::*;
 #[cfg(feature = "is_between")]
 pub use is_between::*;
 #[cfg(feature = "is_first_distinct")]
@@ -99,6 +106,7 @@ pub use is_in::*;
 pub use is_last_distinct::*;
 #[cfg(feature = "is_unique")]
 pub use is_unique::*;
+pub use linear_space::*;
 #[cfg(feature = "log")]
 pub use log::*;
 #[cfg(feature = "moment")]
@@ -128,6 +136,13 @@ pub use to_dummies::*;
 pub use unique::*;
 pub use various::*;
 mod not;
+
+#[cfg(feature = "dtype-array")]
+pub mod concat_arr;
+#[cfg(feature = "dtype-duration")]
+pub(crate) mod duration;
+#[cfg(feature = "dtype-duration")]
+pub use duration::*;
 pub use not::*;
 
 pub trait SeriesSealed {

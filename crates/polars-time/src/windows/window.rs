@@ -62,31 +62,16 @@ impl Window {
 
     /// Truncate the given ns timestamp by the window boundary.
     pub fn truncate_ns(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
-        let t = self.every.truncate_ns(t, tz)?;
-        self.offset.add_ns(t, tz)
-    }
-
-    pub fn truncate_no_offset_ns(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.every.truncate_ns(t, tz)
     }
 
     /// Truncate the given us timestamp by the window boundary.
     pub fn truncate_us(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
-        let t = self.every.truncate_us(t, tz)?;
-        self.offset.add_us(t, tz)
-    }
-
-    pub fn truncate_no_offset_us(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.every.truncate_us(t, tz)
     }
 
+    /// Truncate the given ms timestamp by the window boundary.
     pub fn truncate_ms(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
-        let t = self.every.truncate_ms(t, tz)?;
-        self.offset.add_ms(t, tz)
-    }
-
-    #[inline]
-    pub fn truncate_no_offset_ms(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.every.truncate_ms(t, tz)
     }
 
@@ -120,6 +105,7 @@ impl Window {
         tz: Option<&Tz>,
     ) -> PolarsResult<Bounds> {
         let start = self.truncate_ns(t, tz)?;
+        let start = self.offset.add_ns(start, tz)?;
         ensure_t_in_or_in_front_of_window(
             self.every,
             t,
@@ -138,6 +124,7 @@ impl Window {
         tz: Option<&Tz>,
     ) -> PolarsResult<Bounds> {
         let start = self.truncate_us(t, tz)?;
+        let start = self.offset.add_us(start, tz)?;
         ensure_t_in_or_in_front_of_window(
             self.every,
             t,
@@ -156,6 +143,7 @@ impl Window {
         tz: Option<&Tz>,
     ) -> PolarsResult<Bounds> {
         let start = self.truncate_ms(t, tz)?;
+        let start = self.offset.add_ms(start, tz)?;
         ensure_t_in_or_in_front_of_window(
             self.every,
             t,
@@ -189,7 +177,7 @@ impl Window {
         tu: TimeUnit,
         tz: Option<&'a Tz>,
         start_by: StartBy,
-    ) -> PolarsResult<BoundsIter> {
+    ) -> PolarsResult<BoundsIter<'a>> {
         BoundsIter::new(*self, closed_window, boundary, tu, tz, start_by)
     }
 }
@@ -328,7 +316,7 @@ impl<'a> BoundsIter<'a> {
     }
 }
 
-impl<'a> Iterator for BoundsIter<'a> {
+impl Iterator for BoundsIter<'_> {
     type Item = Bounds;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -339,15 +327,15 @@ impl<'a> Iterator for BoundsIter<'a> {
                 // Issue is that `next` needs to return `Option`.
                 TimeUnit::Nanoseconds => {
                     self.bi.start = self.window.every.add_ns(self.bi.start, self.tz).unwrap();
-                    self.bi.stop = self.window.every.add_ns(self.bi.stop, self.tz).unwrap();
+                    self.bi.stop = self.window.period.add_ns(self.bi.start, self.tz).unwrap();
                 },
                 TimeUnit::Microseconds => {
                     self.bi.start = self.window.every.add_us(self.bi.start, self.tz).unwrap();
-                    self.bi.stop = self.window.every.add_us(self.bi.stop, self.tz).unwrap();
+                    self.bi.stop = self.window.period.add_us(self.bi.start, self.tz).unwrap();
                 },
                 TimeUnit::Milliseconds => {
                     self.bi.start = self.window.every.add_ms(self.bi.start, self.tz).unwrap();
-                    self.bi.stop = self.window.every.add_ms(self.bi.stop, self.tz).unwrap();
+                    self.bi.stop = self.window.period.add_ms(self.bi.start, self.tz).unwrap();
                 },
             }
             Some(out)

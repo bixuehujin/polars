@@ -1,29 +1,18 @@
 use super::*;
 
-pub(super) fn fill_null(s: &[Series], super_type: &DataType) -> PolarsResult<Series> {
-    let series = &s[0];
-    let fill_value = &s[1];
+pub(super) fn fill_null(s: &[Column]) -> PolarsResult<Column> {
+    let series = s[0].clone();
 
-    let (series, fill_value) = if matches!(super_type, DataType::Unknown) {
-        let fill_value = fill_value.cast(series.dtype()).map_err(|_| {
-            polars_err!(
-                SchemaMismatch:
-                "`fill_null` supertype could not be determined; set correct literal value or \
-                ensure the type of the expression is known"
-            )
-        })?;
-        (series.clone(), fill_value)
-    } else {
-        (series.cast(super_type)?, fill_value.cast(super_type)?)
-    };
-    // nothing to fill, so return early
+    // Nothing to fill, so return early
     // this is done after casting as the output type must be correct
     if series.null_count() == 0 {
         return Ok(series);
     }
 
+    let fill_value = s[1].clone();
+
     // default branch
-    fn default(series: Series, fill_value: Series) -> PolarsResult<Series> {
+    fn default(series: Column, fill_value: Column) -> PolarsResult<Column> {
         let mask = series.is_not_null();
         series.zip_with_same_type(&mask, &fill_value)
     }
@@ -40,17 +29,24 @@ pub(super) fn fill_null(s: &[Series], super_type: &DataType) -> PolarsResult<Ser
                     let cats = series.to_physical_repr();
                     let mask = cats.is_not_null();
                     let out = cats
-                        .zip_with_same_type(&mask, &Series::new("", &[idx]))
+                        .zip_with_same_type(&mask, &Column::new(PlSmallStr::EMPTY, &[idx]))
                         .unwrap();
-                    unsafe { return out.cast_unchecked(series.dtype()) }
+                    unsafe { return out.from_physical_unchecked(series.dtype()) }
                 }
             }
+            let fill_value = if fill_value.dtype().is_string() {
+                fill_value
+                    .cast(&DataType::Categorical(None, Default::default()))
+                    .unwrap()
+            } else {
+                fill_value
+            };
             default(series, fill_value)
         },
         _ => default(series, fill_value),
     }
 }
 
-pub(super) fn coalesce(s: &mut [Series]) -> PolarsResult<Series> {
-    coalesce_series(s)
+pub(super) fn coalesce(s: &mut [Column]) -> PolarsResult<Column> {
+    coalesce_columns(s)
 }

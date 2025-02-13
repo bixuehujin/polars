@@ -4,8 +4,7 @@ import contextlib
 from typing import TYPE_CHECKING, overload
 
 from polars import functions as F
-from polars._utils.deprecation import deprecate_saturating
-from polars._utils.parse_expr_input import parse_as_expression
+from polars._utils.parse import parse_into_expression
 from polars._utils.wrap import wrap_expr
 from polars.functions.range._utils import parse_interval_argument
 
@@ -17,7 +16,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from polars import Expr, Series
-    from polars.type_aliases import ClosedInterval, IntoExprColumn, TimeUnit
+    from polars._typing import ClosedInterval, IntoExprColumn, TimeUnit
 
 
 @overload
@@ -96,6 +95,11 @@ def datetime_range(
     Expr or Series
         Column of data type :class:`Datetime`.
 
+    See Also
+    --------
+    datetime_ranges
+    date_range
+
     Notes
     -----
     `interval` is created according to the following string language:
@@ -173,14 +177,43 @@ def datetime_range(
         2022-02-01 00:00:00 EST
         2022-03-01 00:00:00 EST
     ]
+
+    Omit `eager=True` if you want to use `datetime_range` as an expression:
+
+    >>> df = pl.DataFrame(
+    ...     {
+    ...         "date": [
+    ...             date(2024, 1, 1),
+    ...             date(2024, 1, 2),
+    ...             date(2024, 1, 1),
+    ...             date(2024, 1, 3),
+    ...         ],
+    ...         "key": ["one", "one", "two", "two"],
+    ...     }
+    ... )
+    >>> result = (
+    ...     df.group_by("key")
+    ...     .agg(pl.datetime_range(pl.col("date").min(), pl.col("date").max()))
+    ...     .sort("key")
+    ... )
+    >>> with pl.Config(fmt_str_lengths=70):
+    ...     print(result)
+    shape: (2, 2)
+    ┌─────┬─────────────────────────────────────────────────────────────────┐
+    │ key ┆ date                                                            │
+    │ --- ┆ ---                                                             │
+    │ str ┆ list[datetime[μs]]                                              │
+    ╞═════╪═════════════════════════════════════════════════════════════════╡
+    │ one ┆ [2024-01-01 00:00:00, 2024-01-02 00:00:00]                      │
+    │ two ┆ [2024-01-01 00:00:00, 2024-01-02 00:00:00, 2024-01-03 00:00:00] │
+    └─────┴─────────────────────────────────────────────────────────────────┘
     """
-    interval = deprecate_saturating(interval)
     interval = parse_interval_argument(interval)
     if time_unit is None and "ns" in interval:
         time_unit = "ns"
 
-    start_pyexpr = parse_as_expression(start)
-    end_pyexpr = parse_as_expression(end)
+    start_pyexpr = parse_into_expression(start)
+    end_pyexpr = parse_into_expression(end)
     result = wrap_expr(
         plr.datetime_range(
             start_pyexpr, end_pyexpr, interval, closed, time_unit, time_zone
@@ -292,6 +325,11 @@ def datetime_ranges(
     Expr or Series
         Column of data type `List(Datetime)`.
 
+    See Also
+    --------
+    datetime_range
+    date_ranges
+
     Examples
     --------
     >>> from datetime import datetime
@@ -313,13 +351,12 @@ def datetime_ranges(
     │ [2022-01-02 00:00:00, 2022-01-03 00:00:00]                      │
     └─────────────────────────────────────────────────────────────────┘
     """
-    interval = deprecate_saturating(interval)
     interval = parse_interval_argument(interval)
     if time_unit is None and "ns" in interval:
         time_unit = "ns"
 
-    start_pyexpr = parse_as_expression(start)
-    end_pyexpr = parse_as_expression(end)
+    start_pyexpr = parse_into_expression(start)
+    end_pyexpr = parse_into_expression(end)
 
     result = wrap_expr(
         plr.datetime_ranges(

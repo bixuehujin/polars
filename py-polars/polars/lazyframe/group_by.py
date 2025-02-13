@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable
 
 from polars import functions as F
 from polars._utils.deprecation import deprecate_renamed_function
-from polars._utils.parse_expr_input import parse_as_list_of_expressions
+from polars._utils.parse import parse_into_list_of_expressions
 from polars._utils.wrap import wrap_ldf
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from polars import DataFrame, LazyFrame
+    from polars._typing import IntoExpr, RollingInterpolationMethod, SchemaDict
     from polars.polars import PyLazyGroupBy
-    from polars.type_aliases import IntoExpr, RollingInterpolationMethod, SchemaDict
 
 
 class LazyGroupBy:
@@ -142,7 +144,7 @@ class LazyGroupBy:
             )
             raise TypeError(msg)
 
-        pyexprs = parse_as_list_of_expressions(*aggs, **named_aggs)
+        pyexprs = parse_into_list_of_expressions(*aggs, **named_aggs)
         return wrap_ldf(self.lgb.agg(pyexprs))
 
     def map_groups(
@@ -439,7 +441,7 @@ class LazyGroupBy:
         >>> ldf = pl.DataFrame(
         ...     {
         ...         "a": [1, 2, 2, 3, 4, 5],
-        ...         "b": [0.5, 0.5, 4, 10, 13, 14],
+        ...         "b": [0.5, 0.5, 4, 10, 14, 13],
         ...         "c": [True, True, True, False, False, True],
         ...         "d": ["Apple", "Orange", "Apple", "Apple", "Banana", "Banana"],
         ...     }
@@ -453,7 +455,7 @@ class LazyGroupBy:
         ╞════════╪═════╪══════╪═══════╡
         │ Apple  ┆ 3   ┆ 10.0 ┆ false │
         │ Orange ┆ 2   ┆ 0.5  ┆ true  │
-        │ Banana ┆ 5   ┆ 14.0 ┆ true  │
+        │ Banana ┆ 5   ┆ 13.0 ┆ true  │
         └────────┴─────┴──────┴───────┘
         """
         return self.agg(F.all().last())
@@ -657,26 +659,3 @@ class LazyGroupBy:
         └────────┴─────┴──────┴─────┘
         """
         return self.agg(F.all().sum())
-
-    @deprecate_renamed_function("map_groups", version="0.19.0")
-    def apply(
-        self,
-        function: Callable[[DataFrame], DataFrame],
-        schema: SchemaDict | None,
-    ) -> LazyFrame:
-        """
-        Apply a custom/user-defined function (UDF) over the groups as a new DataFrame.
-
-        .. deprecated:: 0.19.0
-            This method has been renamed to :func:`LazyGroupBy.map_groups`.
-
-        Parameters
-        ----------
-        function
-            Function to apply over each group of the `LazyFrame`.
-        schema
-            Schema of the output function. This has to be known statically. If the
-            given schema is incorrect, this is a bug in the caller's query and may
-            lead to errors. If set to None, polars assumes the schema is unchanged.
-        """
-        return self.map_groups(function, schema)

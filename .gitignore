@@ -1,5 +1,7 @@
 *.iml
 *.so
+*.pyd
+*.pdb
 *.ipynb
 .ENV
 .env
@@ -8,7 +10,7 @@
 .yarn/
 coverage.lcov
 coverage.xml
-data/
+profile.json
 polars/vendor
 
 # OS
@@ -29,10 +31,14 @@ __pycache__/
 .coverage
 
 # Rust
-.cargo/
 target/
 
+# Data
+*.csv
+*.parquet
+*.feather
+*.tbl
+
 # Project
-/docs/data/
-/docs/images/
-/docs/people.md
+/docs/assets/data/
+/docs/assets/people.md

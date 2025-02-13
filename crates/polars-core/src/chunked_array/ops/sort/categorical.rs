@@ -15,16 +15,11 @@ impl CategoricalChunked {
                 .zip(self.iter_str())
                 .collect_trusted::<Vec<_>>();
 
-            sort_unstable_by_branch(
-                vals.as_mut_slice(),
-                options.descending,
-                |a, b| a.1.cmp(&b.1),
-                options.multithreaded,
-            );
+            sort_unstable_by_branch(vals.as_mut_slice(), options, |a, b| a.1.cmp(&b.1));
             let cats: UInt32Chunked = vals
                 .into_iter()
                 .map(|(idx, _v)| idx)
-                .collect_ca_trusted(self.name());
+                .collect_ca_trusted(self.name().clone());
 
             // SAFETY:
             // we only reordered the indexes so we are still in bounds
@@ -58,6 +53,7 @@ impl CategoricalChunked {
             descending,
             multithreaded: true,
             maintain_order: false,
+            limit: None,
         })
     }
 
@@ -66,26 +62,28 @@ impl CategoricalChunked {
         if self.uses_lexical_ordering() {
             let iters = [self.iter_str()];
             arg_sort::arg_sort(
-                self.name(),
+                self.name().clone(),
                 iters,
                 options,
                 self.physical().null_count(),
                 self.len(),
+                IsSorted::Not,
+                false,
             )
         } else {
             self.physical().arg_sort(options)
         }
     }
 
-    /// Retrieve the indexes need to sort this and the other arrays.
-
+    /// Retrieve the indices needed to sort this and the other arrays.
     pub(crate) fn arg_sort_multiple(
         &self,
-        by: &[Series],
+        by: &[Column],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
         if self.uses_lexical_ordering() {
-            args_validate(self.physical(), by, &options.descending)?;
+            args_validate(self.physical(), by, &options.descending, "descending")?;
+            args_validate(self.physical(), by, &options.nulls_last, "nulls_last")?;
             let mut count: IdxSize = 0;
 
             // we use bytes to save a monomorphisized str impl
@@ -128,7 +126,7 @@ mod test {
                 enable_string_cache();
             }
 
-            let s = Series::new("", init)
+            let s = Series::new(PlSmallStr::EMPTY, init)
                 .cast(&DataType::Categorical(None, CategoricalOrdering::Lexical))?;
             let ca = s.categorical()?;
             let ca_lexical = ca.clone();
@@ -136,7 +134,8 @@ mod test {
             let out = ca_lexical.sort(false);
             assert_order(&out, &["a", "b", "c", "d"]);
 
-            let s = Series::new("", init).cast(&DataType::Categorical(None, Default::default()))?;
+            let s = Series::new(PlSmallStr::EMPTY, init)
+                .cast(&DataType::Categorical(None, Default::default()))?;
             let ca = s.categorical()?;
 
             let out = ca.sort(false);
@@ -163,7 +162,7 @@ mod test {
                 enable_string_cache();
             }
 
-            let s = Series::new("", init)
+            let s = Series::new(PlSmallStr::EMPTY, init)
                 .cast(&DataType::Categorical(None, CategoricalOrdering::Lexical))?;
             let ca = s.categorical()?;
             let ca_lexical: CategoricalChunked = ca.clone();
@@ -177,18 +176,18 @@ mod test {
 
             let out = df.sort(
                 ["cat", "vals"],
-                SortMultipleOptions::default().with_order_descendings([false, false]),
+                SortMultipleOptions::default().with_order_descending_multi([false, false]),
             )?;
             let out = out.column("cat")?;
-            let cat = out.categorical()?;
+            let cat = out.as_materialized_series().categorical()?;
             assert_order(cat, &["a", "a", "b", "c"]);
 
             let out = df.sort(
                 ["vals", "cat"],
-                SortMultipleOptions::default().with_order_descendings([false, false]),
+                SortMultipleOptions::default().with_order_descending_multi([false, false]),
             )?;
             let out = out.column("cat")?;
-            let cat = out.categorical()?;
+            let cat = out.as_materialized_series().categorical()?;
             assert_order(cat, &["b", "c", "a", "a"]);
         }
         Ok(())

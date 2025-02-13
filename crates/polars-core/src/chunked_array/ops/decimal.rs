@@ -1,3 +1,4 @@
+use crate::chunked_array::cast::CastOptions;
 use crate::prelude::*;
 
 impl StringChunked {
@@ -21,7 +22,10 @@ impl StringChunked {
             }
         }
 
-        self.cast(&DataType::Decimal(None, Some(scale as usize)))
+        self.cast_with_options(
+            &DataType::Decimal(None, Some(scale as usize)),
+            CastOptions::NonStrict,
+        )
     }
 }
 
@@ -39,7 +43,7 @@ mod test {
             "5.104",
             "5.25251525353",
         ];
-        let s = StringChunked::from_slice("test", &vals);
+        let s = StringChunked::from_slice(PlSmallStr::from_str("test"), &vals);
         let s = s.to_decimal(6).unwrap();
         assert_eq!(s.dtype(), &DataType::Decimal(None, Some(5)));
         assert_eq!(s.len(), 7);

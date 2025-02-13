@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import pandas as pd
 import pyarrow as pa
@@ -13,7 +14,7 @@ import polars.selectors as cs
 from polars.testing import assert_frame_equal, assert_series_equal
 
 if TYPE_CHECKING:
-    from polars.datatypes import PolarsDataType
+    from polars._typing import PolarsDataType
 
 
 def test_struct_to_list() -> None:
@@ -66,11 +67,6 @@ def test_struct_equality() -> None:
     assert (s5 != s6).all()
     assert (~(s5 == s6)).all()
 
-    s7 = pl.Series("misc", [{"x": "a", "y": 0}, {"x": "b", "y": 0}])
-    s8 = pl.Series("misc", [{"x": "a", "y": 0}, {"x": "b", "y": 0}, {"x": "c", "y": 0}])
-    assert (s7 != s8).all()
-    assert (~(s7 == s8)).all()
-
 
 def test_struct_equality_strict() -> None:
     s1 = pl.Struct(
@@ -86,8 +82,6 @@ def test_struct_equality_strict() -> None:
 
     # strict
     assert s1.is_(s2) is False
-    with pytest.deprecated_call():
-        assert s1.is_not(s2) is True
 
     # permissive (default)
     assert s1 == s2
@@ -106,13 +100,11 @@ def test_struct_hashes() -> None:
 def test_struct_unnesting() -> None:
     df_base = pl.DataFrame({"a": [1, 2]})
     df = df_base.select(
-        [
-            pl.all().alias("a_original"),
-            pl.col("a")
-            .map_elements(lambda x: {"a": x, "b": x * 2, "c": x % 2 == 0})
-            .struct.rename_fields(["a", "a_squared", "mod2eq0"])
-            .alias("foo"),
-        ]
+        pl.all().alias("a_original"),
+        pl.col("a")
+        .map_elements(lambda x: {"a": x, "b": x * 2, "c": x % 2 == 0})
+        .struct.rename_fields(["a", "a_squared", "mod2eq0"])
+        .alias("foo"),
     )
     expected = pl.DataFrame(
         {
@@ -123,22 +115,20 @@ def test_struct_unnesting() -> None:
         }
     )
     for cols in ("foo", cs.ends_with("oo")):
-        out_eager = df.unnest(cols)  # type: ignore[arg-type]
+        out_eager = df.unnest(cols)
         assert_frame_equal(out_eager, expected)
 
-        out_lazy = df.lazy().unnest(cols)  # type: ignore[arg-type]
+        out_lazy = df.lazy().unnest(cols)
         assert_frame_equal(out_lazy, expected.lazy())
 
     out = (
         df_base.lazy()
         .select(
-            [
-                pl.all().alias("a_original"),
-                pl.col("a")
-                .map_elements(lambda x: {"a": x, "b": x * 2, "c": x % 2 == 0})
-                .struct.rename_fields(["a", "a_squared", "mod2eq0"])
-                .alias("foo"),
-            ]
+            pl.all().alias("a_original"),
+            pl.col("a")
+            .map_elements(lambda x: {"a": x, "b": x * 2, "c": x % 2 == 0})
+            .struct.rename_fields(["a", "a_squared", "mod2eq0"])
+            .alias("foo"),
         )
         .unnest("foo")
         .collect()
@@ -221,7 +211,7 @@ def test_struct_cols() -> None:
     # struct column
     df = build_struct_df([{"struct_col": {"inner": 1}}])
     assert df.columns == ["struct_col"]
-    assert df.schema == {"struct_col": pl.Struct}
+    assert df.schema == {"struct_col": pl.Struct({"inner": pl.Int64})}
     assert df["struct_col"].struct.field("inner").to_list() == [1]
 
     # struct in struct
@@ -248,7 +238,7 @@ def test_struct_with_validity() -> None:
     tbl = pa.Table.from_pylist(data)
     df = pl.from_arrow(tbl)
     assert isinstance(df, pl.DataFrame)
-    assert df["a"].to_list() == [{"b": 1}, {"b": None}]
+    assert df["a"].to_list() == [{"b": 1}, None]
 
 
 def test_from_dicts_struct() -> None:
@@ -271,34 +261,33 @@ def test_from_dicts_struct() -> None:
     ]
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_list_to_struct() -> None:
     df = pl.DataFrame({"a": [[1, 2, 3], [1, 2]]})
-    assert df.select([pl.col("a").list.to_struct()]).to_series().to_list() == [
+    assert df.to_series().list.to_struct().to_list() == [
         {"field_0": 1, "field_1": 2, "field_2": 3},
         {"field_0": 1, "field_1": 2, "field_2": None},
     ]
 
     df = pl.DataFrame({"a": [[1, 2], [1, 2, 3]]})
-    assert df.select(
-        [pl.col("a").list.to_struct(fields=lambda idx: f"col_name_{idx}")]
-    ).to_series().to_list() == [
+    assert df.to_series().list.to_struct(
+        fields=lambda idx: f"col_name_{idx}"
+    ).to_list() == [
         {"col_name_0": 1, "col_name_1": 2},
         {"col_name_0": 1, "col_name_1": 2},
     ]
 
     df = pl.DataFrame({"a": [[1, 2], [1, 2, 3]]})
-    assert df.select(
-        [pl.col("a").list.to_struct(n_field_strategy="max_width")]
-    ).to_series().to_list() == [
+    assert df.to_series().list.to_struct(n_field_strategy="max_width").to_list() == [
         {"field_0": 1, "field_1": 2, "field_2": None},
         {"field_0": 1, "field_1": 2, "field_2": 3},
     ]
 
     # set upper bound
     df = pl.DataFrame({"lists": [[1, 1, 1], [0, 1, 0], [1, 0, 0]]})
-    assert df.lazy().select(pl.col("lists").list.to_struct(upper_bound=3)).unnest(
-        "lists"
-    ).sum().collect().columns == ["field_0", "field_1", "field_2"]
+    assert df.lazy().select(
+        pl.col("lists").list.to_struct(upper_bound=3, _eager=True)
+    ).unnest("lists").sum().collect().columns == ["field_0", "field_1", "field_2"]
 
 
 def test_sort_df_with_list_struct() -> None:
@@ -319,10 +308,8 @@ def test_struct_list_head_tail() -> None:
             ]
         }
     ).with_columns(
-        [
-            pl.col("list_of_struct").list.head(1).alias("head"),
-            pl.col("list_of_struct").list.tail(1).alias("tail"),
-        ]
+        pl.col("list_of_struct").list.head(1).alias("head"),
+        pl.col("list_of_struct").list.tail(1).alias("tail"),
     ).to_dict(as_series=False) == {
         "list_of_struct": [
             [{"a": 1, "b": 4}, {"a": 3, "b": 6}],
@@ -403,9 +390,9 @@ def test_struct_concat_list() -> None:
                 [{"a": 6, "b": 7}],
             ],
         }
-    ).with_columns(
-        [pl.col("list_struct1").list.concat("list_struct2").alias("result")]
-    )["result"].to_list() == [
+    ).with_columns(pl.col("list_struct1").list.concat("list_struct2").alias("result"))[
+        "result"
+    ].to_list() == [
         [{"a": 1, "b": 2}, {"a": 3, "b": 4}, {"a": 6, "b": 7}, {"a": 8, "b": 9}],
         [{"a": 1, "b": 2}, {"a": 6, "b": 7}],
     ]
@@ -591,7 +578,7 @@ def test_struct_getitem() -> None:
     assert pl.Series([{"a": 1, "b": 2}]).struct[1].name == "b"
     assert pl.Series([{"a": 1, "b": 2}]).struct[-1].name == "b"
     assert pl.Series([{"a": 1, "b": 2}]).to_frame().select(
-        [pl.col("").struct[0]]
+        pl.col("").struct[0]
     ).to_dict(as_series=False) == {"a": [1]}
 
 
@@ -631,7 +618,7 @@ def test_struct_categorical_5843() -> None:
 def test_empty_struct() -> None:
     # List<struct>
     df = pl.DataFrame({"a": [[{}]]})
-    assert df.to_dict(as_series=False) == {"a": [[{"": None}]]}
+    assert df.to_dict(as_series=False) == {"a": [[{}]]}
 
     # Struct one not empty
     df = pl.DataFrame({"a": [[{}, {"a": 10}]]})
@@ -639,7 +626,7 @@ def test_empty_struct() -> None:
 
     # Empty struct
     df = pl.DataFrame({"a": [{}]})
-    assert df.to_dict(as_series=False) == {"a": [{"": None}]}
+    assert df.to_dict(as_series=False) == {"a": [{}]}
 
 
 @pytest.mark.parametrize(
@@ -650,7 +637,6 @@ def test_empty_struct() -> None:
         pl.List(pl.String),
         pl.Array(pl.Null, 32),
         pl.Array(pl.UInt8, 16),
-        pl.Struct,
         pl.Struct([pl.Field("", pl.Null)]),
         pl.Struct([pl.Field("x", pl.UInt32), pl.Field("y", pl.Float64)]),
     ],
@@ -662,7 +648,16 @@ def test_empty_series_nested_dtype(dtype: PolarsDataType) -> None:
     assert s.to_list() == []
 
 
-def test_empty_with_schema_struct() -> None:
+@pytest.mark.parametrize(
+    "data",
+    [
+        [{}, {}],
+        [{}, None],
+        [None, {}],
+        [None, None],
+    ],
+)
+def test_empty_with_schema_struct(data: list[dict[str, object] | None]) -> None:
     # Empty structs, with schema
     struct_schema = {"a": pl.Date, "b": pl.Boolean, "c": pl.Float64}
     frame_schema = {"x": pl.Int8, "y": pl.Struct(struct_schema)}
@@ -670,32 +665,31 @@ def test_empty_with_schema_struct() -> None:
     @dataclass
     class TestData:
         x: int
-        y: dict  # type: ignore[type-arg]
+        y: dict[str, object] | None
 
-    # validate empty struct, null, and a mix of both
-    for empty_structs in (
-        [{}, {}],
-        [{}, None],
-        [None, {}],
-        [None, None],
-    ):
-        # test init from rows, dicts, and dataclasses
-        dict_data = {"x": [10, 20], "y": empty_structs}
-        dataclass_data = [
-            TestData(10, empty_structs[0]),  # type: ignore[index]
-            TestData(20, empty_structs[1]),  # type: ignore[index]
+    # test init from rows, dicts, and dataclasses
+    dict_data = {"x": [10, 20], "y": data}
+    dataclass_data = [
+        TestData(10, data[0]),
+        TestData(20, data[1]),
+    ]
+    for frame_data in (dict_data, dataclass_data):
+        df = pl.DataFrame(
+            data=frame_data,
+            schema=frame_schema,  # type: ignore[arg-type]
+        )
+        assert df.schema == frame_schema
+        assert df.unnest("y").columns == ["x", "a", "b", "c"]
+        assert df.rows() == [
+            (
+                10,
+                {"a": None, "b": None, "c": None} if data[0] is not None else None,
+            ),
+            (
+                20,
+                {"a": None, "b": None, "c": None} if data[1] is not None else None,
+            ),
         ]
-        for frame_data in (dict_data, dataclass_data):
-            df = pl.DataFrame(
-                data=frame_data,
-                schema=frame_schema,  # type: ignore[arg-type]
-            )
-            assert df.schema == frame_schema
-            assert df.unnest("y").columns == ["x", "a", "b", "c"]
-            assert df.rows() == [
-                (10, {"a": None, "b": None, "c": None}),
-                (20, {"a": None, "b": None, "c": None}),
-            ]
 
 
 def test_struct_null_cast() -> None:
@@ -711,7 +705,7 @@ def test_struct_null_cast() -> None:
         .lazy()
         .select([pl.lit(None, dtype=pl.Null).cast(dtype, strict=True)])
         .collect()
-    ).to_dict(as_series=False) == {"literal": [{"a": None, "b": None, "c": None}]}
+    ).to_dict(as_series=False) == {"literal": [None]}
 
 
 def test_nested_struct_in_lists_cast() -> None:
@@ -735,13 +729,19 @@ def test_struct_concat_self_no_rechunk() -> None:
 
 
 def test_sort_structs() -> None:
-    assert pl.DataFrame(
-        {"sex": ["male", "female", "female"], "age": [22, 38, 26]}
-    ).select(pl.struct(["sex", "age"]).sort()).unnest("sex").to_dict(
-        as_series=False
-    ) == {
-        "sex": ["female", "female", "male"],
-        "age": [26, 38, 22],
+    df = pl.DataFrame(
+        {
+            "sex": ["m", "f", "f", "f", "m", "m", "f"],
+            "age": [22, 38, 26, 24, 21, 46, 22],
+        },
+    )
+    df_sorted_as_struct = df.select(pl.struct(["sex", "age"]).sort()).unnest("sex")
+    df_expected = df.sort(by=["sex", "age"])
+
+    assert_frame_equal(df_expected, df_sorted_as_struct)
+    assert df_sorted_as_struct.to_dict(as_series=False) == {
+        "sex": ["f", "f", "f", "f", "m", "m", "m"],
+        "age": [22, 24, 26, 38, 21, 22, 46],
     }
 
 
@@ -834,37 +834,395 @@ def test_struct_get_field_by_index() -> None:
     assert df.select(pl.all().struct[1]).to_dict(as_series=False) == expected
 
 
-def test_struct_null_count_10130() -> None:
-    a_0 = pl.DataFrame({"x": [None, 0, 0, 1, 1], "y": [0, 0, 1, 0, 1]}).to_struct("xy")
-    a_1 = pl.DataFrame({"x": [2, 0, 0, 1, 1], "y": [0, 0, 1, 0, 1]}).to_struct("xy")
-    a_2 = pl.DataFrame({"x": [2, 0, 0, 1, 1], "y": [0, 0, None, 0, 1]}).to_struct("xy")
-    assert a_0.null_count() == 0
-    assert a_1.null_count() == 0
-    assert a_2.null_count() == 0
+def test_struct_arithmetic_schema() -> None:
+    q = pl.LazyFrame({"A": [1], "B": [2]})
 
-    b_0 = pl.DataFrame(
-        {"x": [1, None, 0, 0, 1, 1, None], "y": [None, 0, None, 0, 1, 0, 1]}
-    ).to_struct("xy")
-    b_1 = pl.DataFrame(
-        {"x": [None, None, 0, 0, 1, 1, None], "y": [None, 0, None, 0, 1, 0, 1]}
-    ).to_struct("xy")
-    assert b_0.null_count() == 0
-    assert b_1.null_count() == 1
-
-    c_0 = pl.DataFrame({"x": [None, None]}).to_struct("x")
-    c_1 = pl.DataFrame({"y": [1, 2], "x": [None, None]}).to_struct("xy")
-    c_2 = pl.DataFrame({"x": [None, None], "y": [1, 2]}).to_struct("xy")
-    assert c_0.null_count() == 2
-    assert c_1.null_count() == 0
-    assert c_2.null_count() == 0
-
-    # There was an issue where it could ignore parts of a multi-chunk Series
-    s = pl.Series([{"a": 1, "b": 2}])
-    r = pl.Series(
-        [{"a": None, "b": None}], dtype=pl.Struct({"a": pl.Int64, "b": pl.Int64})
+    assert q.select(pl.struct("A") - pl.struct("B")).collect_schema()["A"] == pl.Struct(
+        {"A": pl.Int64}
     )
-    s.append(r)
-    assert s.null_count() == 1
 
-    s = pl.Series([{"a": None}])
-    assert s.null_count() == 1
+
+def test_struct_field() -> None:
+    df = pl.DataFrame(
+        {
+            "item": [
+                {"name": "John", "age": 30, "car": None},
+                {"name": "Alice", "age": 65, "car": "Volvo"},
+            ]
+        }
+    )
+
+    assert df.select(
+        pl.col("item").struct.with_fields(
+            pl.field("name").str.to_uppercase(), pl.field("car").fill_null("Mazda")
+        )
+    ).to_dict(as_series=False) == {
+        "item": [
+            {"name": "JOHN", "age": 30, "car": "Mazda"},
+            {"name": "ALICE", "age": 65, "car": "Volvo"},
+        ]
+    }
+
+
+def test_struct_field_recognized_as_renaming_expr_16480() -> None:
+    q = pl.LazyFrame(
+        {
+            "foo": "bar",
+            "my_struct": [{"x": 1, "y": 2}],
+        }
+    ).select(pl.col("my_struct").struct.field("x"))
+
+    q = q.select("x")
+    assert q.collect().to_dict(as_series=False) == {"x": [1]}
+
+
+def test_struct_filter_chunked_16498() -> None:
+    with pl.StringCache():
+        N = 5
+        df_orig1 = pl.DataFrame({"cat_a": ["remove"] * N, "cat_b": ["b"] * N})
+
+        df_orig2 = pl.DataFrame({"cat_a": ["a"] * N, "cat_b": ["b"] * N})
+
+        df = pl.concat([df_orig1, df_orig2], rechunk=False).cast(pl.Categorical)
+        df = df.select(pl.struct(pl.all()).alias("s"))
+        df = df.filter(pl.col("s").struct.field("cat_a") != pl.lit("remove"))
+        assert df.shape == (5, 1)
+
+
+def test_struct_field_dynint_nullable_16243() -> None:
+    pl.select(pl.lit(None).fill_null(pl.struct(42)))
+
+
+def test_struct_split_16536() -> None:
+    df = pl.DataFrame({"struct": [{"a": {"a": {"a": 1}}}], "list": [[1]], "int": [1]})
+
+    df = pl.concat([df, df, df, df], rechunk=False)
+    assert df.filter(pl.col("int") == 1).shape == (4, 3)
+
+
+def test_struct_wildcard_expansion_and_exclude() -> None:
+    df = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "meta_data": [
+                {"system_data": "to_remove", "user_data": "keep"},
+                {"user_data": "keep_"},
+            ],
+        }
+    )
+
+    # ensure wildcard expansion is on input
+    assert df.lazy().select(
+        pl.col("meta_data").struct.with_fields("*")
+    ).collect().schema["meta_data"].fields == [  # type: ignore[attr-defined]
+        pl.Field("system_data", pl.String),
+        pl.Field("user_data", pl.String),
+        pl.Field("id", pl.Int64),
+        pl.Field(
+            "meta_data", pl.Struct({"system_data": pl.String, "user_data": pl.String})
+        ),
+    ]
+
+    with pytest.raises(pl.exceptions.InvalidOperationError):
+        df.lazy().select(
+            pl.col("meta_data").struct.with_fields(pl.field("*").exclude("user_data"))
+        ).collect()
+
+
+def test_struct_chunked_gather_17603() -> None:
+    df = pl.DataFrame(
+        {
+            "id": [0, 0, 1, 1],
+            "a": [0, 1, 2, 3],
+        }
+    ).select("id", pl.struct("a"))
+    df = pl.concat((df, df))
+
+    assert df.select(pl.col("a").map_batches(lambda s: s).over("id")).to_dict(
+        as_series=False
+    ) == {
+        "a": [
+            {"a": 0},
+            {"a": 1},
+            {"a": 2},
+            {"a": 3},
+            {"a": 0},
+            {"a": 1},
+            {"a": 2},
+            {"a": 3},
+        ]
+    }
+
+
+def test_struct_out_nullability_from_arrow() -> None:
+    df = pl.DataFrame(pd.DataFrame({"abc": [{"a": 1.0, "b": pd.NA}, pd.NA]}))
+    res = df.select(a=pl.col("abc").struct.field("a"))
+    assert res.to_dicts() == [{"a": 1.0}, {"a": None}]
+
+
+def test_empty_struct_raise() -> None:
+    with pytest.raises(ValueError):
+        pl.struct()
+
+
+def test_named_exprs() -> None:
+    df = pl.DataFrame({"a": 1})
+    schema = {"b": pl.Int64}
+    res = df.select(pl.struct(schema=schema, b=pl.col("a")))
+    assert res.to_dict(as_series=False) == {"b": [{"b": 1}]}
+    assert res.schema["b"] == pl.Struct(schema)
+
+
+def test_struct_outer_nullability_zip_18119() -> None:
+    df = pl.Series("int", [0, 1, 2, 3], dtype=pl.Int64).to_frame()
+    assert df.lazy().with_columns(
+        result=pl.when(pl.col("int") >= 1).then(
+            pl.struct(
+                a=pl.when(pl.col("int") % 2 == 1).then(True),
+                b=pl.when(pl.col("int") >= 2).then(False),
+            )
+        )
+    ).collect().to_dict(as_series=False) == {
+        "int": [0, 1, 2, 3],
+        "result": [
+            None,
+            {"a": True, "b": None},
+            {"a": None, "b": False},
+            {"a": True, "b": False},
+        ],
+    }
+
+
+def test_struct_group_by_shift_18107() -> None:
+    df_in = pl.DataFrame(
+        {
+            "group": [1, 1, 1, 2, 2, 2],
+            "id": [1, 2, 3, 4, 5, 6],
+            "value": [
+                {"lon": 20, "lat": 10},
+                {"lon": 30, "lat": 20},
+                {"lon": 40, "lat": 30},
+                {"lon": 50, "lat": 40},
+                {"lon": 60, "lat": 50},
+                {"lon": 70, "lat": 60},
+            ],
+        }
+    )
+
+    assert df_in.group_by("group", maintain_order=True).agg(
+        pl.col("value").shift(-1)
+    ).to_dict(as_series=False) == {
+        "group": [1, 2],
+        "value": [
+            [{"lon": 30, "lat": 20}, {"lon": 40, "lat": 30}, None],
+            [{"lon": 60, "lat": 50}, {"lon": 70, "lat": 60}, None],
+        ],
+    }
+
+
+def test_struct_chunked_zip_18119() -> None:
+    dtype = pl.Struct({"x": pl.Null})
+
+    a_dfs = [pl.DataFrame([pl.Series("a", [None] * i, dtype)]) for i in range(5)]
+    b_dfs = [pl.DataFrame([pl.Series("b", [None] * i, dtype)]) for i in range(5)]
+    mask_dfs = [
+        pl.DataFrame([pl.Series("f", [None] * i, pl.Boolean)]) for i in range(5)
+    ]
+
+    a = pl.concat([a_dfs[2], a_dfs[2], a_dfs[1]])
+    b = pl.concat([b_dfs[4], b_dfs[1]])
+    mask = pl.concat([mask_dfs[3], mask_dfs[2]])
+
+    df = pl.concat([a, b, mask], how="horizontal")
+
+    assert_frame_equal(
+        df.select(pl.when(pl.col.f).then(pl.col.a).otherwise(pl.col.b)),
+        pl.DataFrame([pl.Series("a", [None] * 5, dtype)]),
+    )
+
+
+def test_struct_null_zip() -> None:
+    df = pl.Series("int", [], dtype=pl.Struct({"x": pl.Int64})).to_frame()
+    assert_frame_equal(
+        df.select(pl.when(pl.Series([True])).then(pl.col.int).otherwise(pl.col.int)),
+        pl.Series("int", [], dtype=pl.Struct({"x": pl.Int64})).to_frame(),
+    )
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 5, 9, 13, 42])
+def test_zfs_construction(size: int) -> None:
+    a = pl.Series("a", [{}] * size, pl.Struct([]))
+    assert a.len() == size
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 13])
+def test_zfs_unnest(size: int) -> None:
+    a = pl.Series("a", [{}] * size, pl.Struct([])).struct.unnest()
+    assert a.height == size
+    assert a.width == 0
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 13])
+def test_zfs_equality(size: int) -> None:
+    a = pl.Series("a", [{}] * size, pl.Struct([]))
+    b = pl.Series("a", [{}] * size, pl.Struct([]))
+
+    assert_series_equal(a, b)
+
+    assert_frame_equal(
+        a.to_frame(),
+        b.to_frame(),
+    )
+
+
+def test_zfs_nullable_when_otherwise() -> None:
+    a = pl.Series("a", [{}, None, {}, {}, None], pl.Struct([]))
+    b = pl.Series("b", [None, {}, None, {}, None], pl.Struct([]))
+
+    df = pl.DataFrame([a, b])
+
+    df = df.select(
+        x=pl.when(pl.col.a.is_not_null()).then(pl.col.a).otherwise(pl.col.b),
+        y=pl.when(pl.col.a.is_null()).then(pl.col.a).otherwise(pl.col.b),
+    )
+
+    assert_series_equal(df["x"], pl.Series("x", [{}, {}, {}, {}, None], pl.Struct([])))
+    assert_series_equal(
+        df["y"], pl.Series("y", [None, None, None, {}, None], pl.Struct([]))
+    )
+
+
+def test_zfs_struct_fns() -> None:
+    a = pl.Series("a", [{}], pl.Struct([]))
+
+    assert a.struct.fields == []
+
+    # @TODO: This should really throw an error as per #19132
+    assert a.struct.rename_fields(["a"]).struct.unnest().shape == (1, 0)
+    assert a.struct.rename_fields([]).struct.unnest().shape == (1, 0)
+
+    assert_series_equal(a.struct.json_encode(), pl.Series("a", ["{}"], pl.String))
+
+
+@pytest.mark.parametrize("format", ["binary", "json"])
+@pytest.mark.parametrize("size", [0, 1, 2, 13])
+def test_zfs_serialization_roundtrip(format: pl.SerializationFormat, size: int) -> None:
+    a = pl.Series("a", [{}] * size, pl.Struct([])).to_frame()
+
+    f = io.BytesIO()
+    a.serialize(f, format=format)
+
+    f.seek(0)
+    assert_frame_equal(
+        a,
+        pl.DataFrame.deserialize(f, format=format),
+    )
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 13])
+def test_zfs_row_encoding(size: int) -> None:
+    a = pl.Series("a", [{}] * size, pl.Struct([]))
+
+    df = pl.DataFrame([a, pl.Series("x", list(range(size)), pl.Int8)])
+
+    gb = df.lazy().group_by(["a", "x"]).agg(pl.all().min()).collect(streaming=True)
+
+    # We need to ignore the order because the group_by is non-deterministic
+    assert_frame_equal(gb, df, check_row_order=False)
+
+
+@pytest.mark.may_fail_auto_streaming
+def test_list_to_struct_19208() -> None:
+    df = pl.DataFrame(
+        {
+            "nested": [
+                [{"a": 1}],
+                [],
+                [{"a": 3}],
+            ]
+        }
+    )
+    assert pl.concat([df[0], df[1], df[2]]).select(
+        pl.col("nested").list.to_struct(_eager=True)
+    ).to_dict(as_series=False) == {
+        "nested": [{"field_0": {"a": 1}}, {"field_0": None}, {"field_0": {"a": 3}}]
+    }
+
+
+def test_struct_reverse_outer_validity_19445() -> None:
+    assert_series_equal(
+        pl.Series([{"a": 1}, None]).reverse(),
+        pl.Series([None, {"a": 1}]),
+    )
+
+
+@pytest.mark.parametrize("maybe_swap", [lambda a, b: (a, b), lambda a, b: (b, a)])
+def test_struct_eq_missing_outer_validity_19156(
+    maybe_swap: Callable[[pl.Series, pl.Series], tuple[pl.Series, pl.Series]],
+) -> None:
+    # Ensure that lit({'x': NULL}).eq_missing(lit(NULL)) => False
+    l, r = maybe_swap(  # noqa: E741
+        pl.Series([{"a": None, "b": None}, None]),
+        pl.Series([None, {"a": None, "b": None}]),
+    )
+
+    assert_series_equal(l.eq_missing(r), pl.Series([False, False]))
+    assert_series_equal(l.ne_missing(r), pl.Series([True, True]))
+
+    l, r = maybe_swap(  # noqa: E741
+        pl.Series([{"a": None, "b": None}, None]),
+        pl.Series([None]),
+    )
+
+    assert_series_equal(l.eq_missing(r), pl.Series([False, True]))
+    assert_series_equal(l.ne_missing(r), pl.Series([True, False]))
+
+    l, r = maybe_swap(  # noqa: E741
+        pl.Series([{"a": None, "b": None}, None]),
+        pl.Series([{"a": None, "b": None}]),
+    )
+
+    assert_series_equal(l.eq_missing(r), pl.Series([True, False]))
+    assert_series_equal(l.ne_missing(r), pl.Series([False, True]))
+
+
+def test_struct_field_list_eval_17356() -> None:
+    df = pl.DataFrame(
+        {
+            "items": [
+                [
+                    {"name": "John", "age": 30, "car": None},
+                ],
+                [
+                    {"name": "Alice", "age": 65, "car": "Volvo"},
+                ],
+            ]
+        }
+    )
+
+    assert df.select(
+        pl.col("items").list.eval(
+            pl.element().struct.with_fields(
+                pl.field("name").str.to_uppercase(), pl.field("car").fill_null("Mazda")
+            )
+        )
+    ).to_dict(as_series=False) == {
+        "items": [
+            [{"name": "JOHN", "age": 30, "car": "Mazda"}],
+            [{"name": "ALICE", "age": 65, "car": "Mazda"}],
+        ],
+    }
+
+
+@pytest.mark.parametrize("data", [[1], [[1]], {"a": 1}, [{"a": 1}]])
+def test_leaf_list_eq_19613(data: Any) -> None:
+    assert not pl.DataFrame([data]).equals(pl.DataFrame([[data]]))
+
+
+def test_nested_object_raises_15237() -> None:
+    obj = object()
+    df = pl.DataFrame({"a": [obj]})
+    with pytest.raises(
+        pl.exceptions.InvalidOperationError, match="nested objects are not allowed"
+    ):
+        df.select(pl.struct("a"))

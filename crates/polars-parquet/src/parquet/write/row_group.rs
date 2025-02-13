@@ -2,15 +2,15 @@ use std::io::Write;
 
 #[cfg(feature = "async")]
 use futures::AsyncWrite;
-use parquet_format_safe::{ColumnChunk, RowGroup};
+use polars_parquet_format::{ColumnChunk, RowGroup};
 
 use super::column_chunk::write_column_chunk;
 #[cfg(feature = "async")]
 use super::column_chunk::write_column_chunk_async;
 use super::page::{is_data_page, PageWriteSpec};
 use super::{DynIter, DynStreamingIterator};
-use crate::parquet::error::{Error, Result};
-use crate::parquet::metadata::{ColumnChunkMetaData, ColumnDescriptor};
+use crate::parquet::error::{ParquetError, ParquetResult};
+use crate::parquet::metadata::{ColumnChunkMetadata, ColumnDescriptor};
 use crate::parquet::page::CompressedPage;
 
 pub struct ColumnOffsetsMetadata {
@@ -34,7 +34,7 @@ impl ColumnOffsetsMetadata {
     }
 
     pub fn from_column_chunk_metadata(
-        column_chunk_metadata: &ColumnChunkMetaData,
+        column_chunk_metadata: &ColumnChunkMetadata,
     ) -> ColumnOffsetsMetadata {
         ColumnOffsetsMetadata {
             dictionary_page_offset: column_chunk_metadata.dictionary_page_offset(),
@@ -49,7 +49,7 @@ impl ColumnOffsetsMetadata {
     }
 }
 
-fn compute_num_rows(columns: &[(ColumnChunk, Vec<PageWriteSpec>)]) -> Result<i64> {
+fn compute_num_rows(columns: &[(ColumnChunk, Vec<PageWriteSpec>)]) -> ParquetResult<i64> {
     columns
         .first()
         .map(|(_, specs)| {
@@ -58,12 +58,10 @@ fn compute_num_rows(columns: &[(ColumnChunk, Vec<PageWriteSpec>)]) -> Result<i64
                 .iter()
                 .filter(|x| is_data_page(x))
                 .try_for_each(|spec| {
-                    num_rows += spec.num_rows.ok_or_else(|| {
-                        Error::oos("All data pages must declare the number of rows on it")
-                    })? as i64;
-                    Result::Ok(())
+                    num_rows += spec.num_rows as i64;
+                    ParquetResult::Ok(())
                 })?;
-            Result::Ok(num_rows)
+            ParquetResult::Ok(num_rows)
         })
         .unwrap_or(Ok(0))
 }
@@ -78,10 +76,10 @@ pub fn write_row_group<
     descriptors: &[ColumnDescriptor],
     columns: DynIter<'a, std::result::Result<DynStreamingIterator<'a, CompressedPage, E>, E>>,
     ordinal: usize,
-) -> Result<(RowGroup, Vec<Vec<PageWriteSpec>>, u64)>
+) -> ParquetResult<(RowGroup, Vec<Vec<PageWriteSpec>>, u64)>
 where
     W: Write,
-    Error: From<E>,
+    ParquetError: From<E>,
     E: std::error::Error,
 {
     let column_iter = descriptors.iter().zip(columns);
@@ -94,7 +92,7 @@ where
             offset += size;
             Ok((column, page_specs))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<ParquetResult<Vec<_>>>()?;
     let bytes_written = offset - initial;
 
     let num_rows = compute_num_rows(&columns)?;
@@ -145,10 +143,10 @@ pub async fn write_row_group_async<
     descriptors: &[ColumnDescriptor],
     columns: DynIter<'a, std::result::Result<DynStreamingIterator<'a, CompressedPage, E>, E>>,
     ordinal: usize,
-) -> Result<(RowGroup, Vec<Vec<PageWriteSpec>>, u64)>
+) -> ParquetResult<(RowGroup, Vec<Vec<PageWriteSpec>>, u64)>
 where
     W: AsyncWrite + Unpin + Send,
-    Error: From<E>,
+    ParquetError: From<E>,
     E: std::error::Error,
 {
     let column_iter = descriptors.iter().zip(columns);

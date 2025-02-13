@@ -7,9 +7,12 @@ import pytest
 
 import polars as pl
 from polars.testing import assert_frame_equal
+from tests.unit.conftest import NUMERIC_DTYPES
 
 if TYPE_CHECKING:
-    from polars.type_aliases import PolarsDataType, PolarsTemporalType
+    from polars._typing import PolarsDataType, PolarsTemporalType
+
+from zoneinfo import ZoneInfo
 
 
 @pytest.mark.parametrize(
@@ -19,6 +22,7 @@ if TYPE_CHECKING:
         (pl.Int16, pl.Float64),
         (pl.Int32, pl.Float64),
         (pl.Int64, pl.Float64),
+        (pl.Int128, pl.Float64),
         (pl.UInt8, pl.Float64),
         (pl.UInt16, pl.Float64),
         (pl.UInt32, pl.Float64),
@@ -32,7 +36,7 @@ def test_interpolate_linear(
 ) -> None:
     df = pl.LazyFrame({"a": [1, None, 2, None, 3]}, schema={"a": input_dtype})
     result = df.with_columns(pl.all().interpolate(method="linear"))
-    assert result.schema["a"] == output_dtype
+    assert result.collect_schema()["a"] == output_dtype
     expected = pl.DataFrame(
         {"a": [1.0, 1.5, 2.0, 2.5, 3.0]}, schema={"a": output_dtype}
     )
@@ -53,9 +57,17 @@ def test_interpolate_linear(
             [datetime(2020, 1, 1), datetime(2020, 1, 1, 12), datetime(2020, 1, 2)],
         ),
         (
-            [datetime(2020, 1, 1), None, datetime(2020, 1, 2)],
+            [
+                datetime(2020, 1, 1, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                None,
+                datetime(2020, 1, 2, tzinfo=ZoneInfo("Asia/Kathmandu")),
+            ],
             pl.Datetime("us", "Asia/Kathmandu"),
-            [datetime(2020, 1, 1), datetime(2020, 1, 1, 12), datetime(2020, 1, 2)],
+            [
+                datetime(2020, 1, 1, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                datetime(2020, 1, 1, 12, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                datetime(2020, 1, 2, tzinfo=ZoneInfo("Asia/Kathmandu")),
+            ],
         ),
         ([time(1), None, time(2)], pl.Time, [time(1), time(1, 30), time(2)]),
         (
@@ -70,30 +82,16 @@ def test_interpolate_temporal_linear(
 ) -> None:
     df = pl.LazyFrame({"a": input}, schema={"a": input_dtype})
     result = df.with_columns(pl.all().interpolate(method="linear"))
-    assert result.schema["a"] == input_dtype
+    assert result.collect_schema()["a"] == input_dtype
     expected = pl.DataFrame({"a": output}, schema={"a": input_dtype})
     assert_frame_equal(result.collect(), expected)
 
 
-@pytest.mark.parametrize(
-    "input_dtype",
-    [
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
-        pl.UInt64,
-        pl.Float32,
-        pl.Float64,
-    ],
-)
+@pytest.mark.parametrize("input_dtype", NUMERIC_DTYPES)
 def test_interpolate_nearest(input_dtype: PolarsDataType) -> None:
     df = pl.LazyFrame({"a": [1, None, 2, None, 3]}, schema={"a": input_dtype})
     result = df.with_columns(pl.all().interpolate(method="nearest"))
-    assert result.schema["a"] == input_dtype
+    assert result.collect_schema()["a"] == input_dtype
     expected = pl.DataFrame({"a": [1, 2, 2, 3, 3]}, schema={"a": input_dtype})
     assert_frame_equal(result.collect(), expected)
 
@@ -112,9 +110,17 @@ def test_interpolate_nearest(input_dtype: PolarsDataType) -> None:
             [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 2)],
         ),
         (
-            [datetime(2020, 1, 1), None, datetime(2020, 1, 2)],
+            [
+                datetime(2020, 1, 1, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                None,
+                datetime(2020, 1, 2, tzinfo=ZoneInfo("Asia/Kathmandu")),
+            ],
             pl.Datetime("us", "Asia/Kathmandu"),
-            [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 2)],
+            [
+                datetime(2020, 1, 1, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                datetime(2020, 1, 2, tzinfo=ZoneInfo("Asia/Kathmandu")),
+                datetime(2020, 1, 2, tzinfo=ZoneInfo("Asia/Kathmandu")),
+            ],
         ),
         ([time(1), None, time(2)], pl.Time, [time(1), time(2), time(2)]),
         (
@@ -129,6 +135,6 @@ def test_interpolate_temporal_nearest(
 ) -> None:
     df = pl.LazyFrame({"a": input}, schema={"a": input_dtype})
     result = df.with_columns(pl.all().interpolate(method="nearest"))
-    assert result.schema["a"] == input_dtype
+    assert result.collect_schema()["a"] == input_dtype
     expected = pl.DataFrame({"a": output}, schema={"a": input_dtype})
     assert_frame_equal(result.collect(), expected)

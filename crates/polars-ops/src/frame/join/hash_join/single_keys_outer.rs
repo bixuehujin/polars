@@ -10,8 +10,8 @@ use super::*;
 
 pub(crate) fn create_hash_and_keys_threaded_vectorized<I, T>(
     iters: Vec<I>,
-    build_hasher: Option<RandomState>,
-) -> (Vec<Vec<(u64, T)>>, RandomState)
+    build_hasher: Option<PlRandomState>,
+) -> (Vec<Vec<(u64, T)>>, PlRandomState)
 where
     I: IntoIterator<Item = T> + Send,
     I::IntoIter: TrustedLen,
@@ -24,6 +24,7 @@ where
             .into_par_iter()
             .map(|iter| {
                 // create hashes and keys
+                #[allow(clippy::needless_borrows_for_generic_args)]
                 iter.into_iter()
                     .map(|val| (build_hasher.hash_one(&val.to_total_ord()), val))
                     .collect_trusted::<Vec<_>>()
@@ -230,6 +231,7 @@ where
     let (probe_hashes, _) = create_hash_and_keys_threaded_vectorized(probe, Some(random_state));
 
     let n_tables = hash_tbls.len();
+    try_raise_keyboard_interrupt();
 
     // probe the hash table.
     // Note: indexes from b that are not matched will be None, Some(idx_b)

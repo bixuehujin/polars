@@ -13,11 +13,8 @@ unsafe impl IntoSeries for DurationChunked {
 }
 
 impl private::PrivateSeriesNumeric for SeriesWrap<DurationChunked> {
-    fn bit_repr_is_large(&self) -> bool {
-        true
-    }
-    fn bit_repr_large(&self) -> UInt64Chunked {
-        self.0.bit_repr_large()
+    fn bit_repr(&self) -> Option<BitRepr> {
+        Some(self.0.to_bit_repr())
     }
 }
 
@@ -32,17 +29,10 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
         self.0.dtype()
     }
 
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
-        self.0
-            .explode_by_offsets(offsets)
-            .into_duration(self.0.time_unit())
-            .into_series()
-    }
-
-    fn _set_flags(&mut self, flags: Settings) {
+    fn _set_flags(&mut self, flags: StatisticsFlags) {
         self.0.deref_mut().set_flags(flags)
     }
-    fn _get_flags(&self) -> Settings {
+    fn _get_flags(&self) -> StatisticsFlags {
         self.0.deref().get_flags()
     }
 
@@ -58,18 +48,29 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
             .map(|ca| ca.into_duration(self.0.time_unit()).into_series())
     }
 
-    fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
+    fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+        self.0.physical().into_total_eq_inner()
+    }
+    fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+        self.0.physical().into_total_ord_inner()
+    }
+
+    fn vec_hash(&self, random_state: PlRandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
         self.0.vec_hash(random_state, buf)?;
         Ok(())
     }
 
-    fn vec_hash_combine(&self, build_hasher: RandomState, hashes: &mut [u64]) -> PolarsResult<()> {
+    fn vec_hash_combine(
+        &self,
+        build_hasher: PlRandomState,
+        hashes: &mut [u64],
+    ) -> PolarsResult<()> {
         self.0.vec_hash_combine(build_hasher, hashes)?;
         Ok(())
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_min(&self, groups: &GroupsType) -> Series {
         self.0
             .agg_min(groups)
             .into_duration(self.0.time_unit())
@@ -77,7 +78,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
         self.0
             .agg_max(groups)
             .into_duration(self.0.time_unit())
@@ -85,7 +86,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
         self.0
             .agg_sum(groups)
             .into_duration(self.0.time_unit())
@@ -93,7 +94,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_std(&self, groups: &GroupsProxy, ddof: u8) -> Series {
+    unsafe fn agg_std(&self, groups: &GroupsType, ddof: u8) -> Series {
         self.0
             .agg_std(groups, ddof)
             // cast f64 back to physical type
@@ -104,7 +105,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_var(&self, groups: &GroupsProxy, ddof: u8) -> Series {
+    unsafe fn agg_var(&self, groups: &GroupsType, ddof: u8) -> Series {
         self.0
             .agg_var(groups, ddof)
             // cast f64 back to physical type
@@ -115,7 +116,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
         // we cannot cast and dispatch as the inner type of the list would be incorrect
         self.0
             .agg_list(groups)
@@ -127,7 +128,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
         match (self.dtype(), rhs.dtype()) {
             (DataType::Duration(tu), DataType::Duration(tur)) => {
                 polars_ensure!(tu == tur, InvalidOperation: "units are different");
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs.subtract(&rhs)?.into_duration(*tu).into_series())
             },
@@ -138,7 +139,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
         match (self.dtype(), rhs.dtype()) {
             (DataType::Duration(tu), DataType::Duration(tur)) => {
                 polars_ensure!(tu == tur, InvalidOperation: "units are different");
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs.add_to(&rhs)?.into_duration(*tu).into_series())
             },
@@ -148,7 +149,8 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
                     TimeUnit::Microseconds => 86_400_000_000,
                     TimeUnit::Nanoseconds => 86_400_000_000_000,
                 };
-                let lhs = self.cast(&DataType::Int64).unwrap() / one_day_in_tu;
+                let lhs =
+                    self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap() / one_day_in_tu;
                 let rhs = rhs
                     .cast(&DataType::Int32)
                     .unwrap()
@@ -162,7 +164,7 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
             },
             (DataType::Duration(tu), DataType::Datetime(tur, tz)) => {
                 polars_ensure!(tu == tur, InvalidOperation: "units are different");
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs
                     .add_to(&rhs)?
@@ -173,16 +175,69 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
         }
     }
     fn multiply(&self, rhs: &Series) -> PolarsResult<Series> {
-        // dependent on units, doesn't make sense
-        polars_bail!(opq = mul, self.dtype(), rhs.dtype());
+        let tul = self.0.time_unit();
+        match rhs.dtype() {
+            DataType::Int64 => Ok((&self.0 .0 * rhs.i64().unwrap())
+                .into_duration(tul)
+                .into_series()),
+            dt if dt.is_integer() => {
+                let rhs = rhs.cast(&DataType::Int64)?;
+                self.multiply(&rhs)
+            },
+            dt if dt.is_float() => {
+                let phys = &self.0 .0;
+                let phys_float = phys.cast(dt).unwrap();
+                let out = std::ops::Mul::mul(&phys_float, rhs)?
+                    .cast(&DataType::Int64)
+                    .unwrap();
+                let phys = out.i64().unwrap().clone();
+                Ok(phys.into_duration(tul).into_series())
+            },
+            _ => {
+                polars_bail!(opq = mul, self.dtype(), rhs.dtype());
+            },
+        }
     }
     fn divide(&self, rhs: &Series) -> PolarsResult<Series> {
-        // dependent on units, doesn't make sense
-        polars_bail!(opq = div, self.dtype(), rhs.dtype());
+        let tul = self.0.time_unit();
+        match rhs.dtype() {
+            DataType::Duration(tur) => {
+                if tul == *tur {
+                    // Returns a constant as f64.
+                    Ok(std::ops::Div::div(
+                        &self.0 .0.cast(&DataType::Float64).unwrap(),
+                        &rhs.duration().unwrap().0.cast(&DataType::Float64).unwrap(),
+                    )?
+                    .into_series())
+                } else {
+                    let rhs = rhs.cast(self.dtype())?;
+                    self.divide(&rhs)
+                }
+            },
+            DataType::Int64 => Ok((&self.0 .0 / rhs.i64().unwrap())
+                .into_duration(tul)
+                .into_series()),
+            dt if dt.is_integer() => {
+                let rhs = rhs.cast(&DataType::Int64)?;
+                self.divide(&rhs)
+            },
+            dt if dt.is_float() => {
+                let phys = &self.0 .0;
+                let phys_float = phys.cast(dt).unwrap();
+                let out = std::ops::Div::div(&phys_float, rhs)?
+                    .cast(&DataType::Int64)
+                    .unwrap();
+                let phys = out.i64().unwrap().clone();
+                Ok(phys.into_duration(tul).into_series())
+            },
+            _ => {
+                polars_bail!(opq = div, self.dtype(), rhs.dtype());
+            },
+        }
     }
     fn remainder(&self, rhs: &Series) -> PolarsResult<Series> {
         polars_ensure!(self.dtype() == rhs.dtype(), InvalidOperation: "dtypes and units must be equal in duration arithmetic");
-        let lhs = self.cast(&DataType::Int64).unwrap();
+        let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
         let rhs = rhs.cast(&DataType::Int64).unwrap();
         Ok(lhs
             .remainder(&rhs)?
@@ -190,13 +245,13 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
             .into_series())
     }
     #[cfg(feature = "algorithm_group_by")]
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsType> {
         self.0.group_tuples(multithreaded, sorted)
     }
 
     fn arg_sort_multiple(
         &self,
-        by: &[Series],
+        by: &[Column],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
         self.0.deref().arg_sort_multiple(by, options)
@@ -204,14 +259,14 @@ impl private::PrivateSeries for SeriesWrap<DurationChunked> {
 }
 
 impl SeriesTrait for SeriesWrap<DurationChunked> {
-    fn rename(&mut self, name: &str) {
+    fn rename(&mut self, name: PlSmallStr) {
         self.0.rename(name);
     }
 
-    fn chunk_lengths(&self) -> ChunkIdIter {
-        self.0.chunk_id()
+    fn chunk_lengths(&self) -> ChunkLenIter {
+        self.0.chunk_lengths()
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &PlSmallStr {
         self.0.name()
     }
 
@@ -233,6 +288,17 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
             .into_series()
     }
 
+    fn split_at(&self, offset: i64) -> (Series, Series) {
+        let (a, b) = self.0.split_at(offset);
+        let a = a.into_duration(self.0.time_unit()).into_series();
+        let b = b.into_duration(self.0.time_unit()).into_series();
+        (a, b)
+    }
+
+    fn _sum_as_f64(&self) -> f64 {
+        self.0._sum_as_f64()
+    }
+
     fn mean(&self) -> Option<f64> {
         self.0.mean()
     }
@@ -251,15 +317,26 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), append);
-        let other = other.to_physical_repr().into_owned();
-        self.0.append(other.as_ref().as_ref());
-        Ok(())
+        let mut other = other.to_physical_repr().into_owned();
+        self.0
+            .append_owned(std::mem::take(other._get_inner_mut().as_mut()))
+    }
+    fn append_owned(&mut self, mut other: Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append_owned(std::mem::take(
+            &mut other
+                ._get_inner_mut()
+                .as_any_mut()
+                .downcast_mut::<DurationChunked>()
+                .unwrap()
+                .0,
+        ))
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), extend);
         let other = other.to_physical_repr();
-        self.0.extend(other.as_ref().as_ref().as_ref());
+        self.0.extend(other.as_ref().as_ref().as_ref())?;
         Ok(())
     }
 
@@ -306,6 +383,7 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
     fn rechunk(&self) -> Series {
         self.0
             .rechunk()
+            .into_owned()
             .into_duration(self.0.time_unit())
             .into_series()
     }
@@ -317,12 +395,8 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
             .into_series()
     }
 
-    fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
-        self.0.cast(data_type)
-    }
-
-    fn get(&self, index: usize) -> PolarsResult<AnyValue> {
-        self.0.get_any_value(index)
+    fn cast(&self, dtype: &DataType, cast_options: CastOptions) -> PolarsResult<Series> {
+        self.0.cast_with_options(dtype, cast_options)
     }
 
     #[inline]
@@ -346,8 +420,8 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
         self.0.null_count()
     }
 
-    fn has_validity(&self) -> bool {
-        self.0.has_validity()
+    fn has_nulls(&self) -> bool {
+        self.0.has_nulls()
     }
 
     #[cfg(feature = "algorithm_group_by")]
@@ -393,47 +467,63 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
             .into_series()
     }
 
-    fn _sum_as_series(&self) -> PolarsResult<Series> {
-        Ok(self.0.sum_as_series().into_duration(self.0.time_unit()))
+    fn sum_reduce(&self) -> PolarsResult<Scalar> {
+        let sc = self.0.sum_reduce();
+        let v = sc.value().as_duration(self.0.time_unit());
+        Ok(Scalar::new(self.dtype().clone(), v))
     }
 
-    fn max_as_series(&self) -> PolarsResult<Series> {
-        Ok(self.0.max_as_series().into_duration(self.0.time_unit()))
+    fn max_reduce(&self) -> PolarsResult<Scalar> {
+        let sc = self.0.max_reduce();
+        let v = sc.value().as_duration(self.0.time_unit());
+        Ok(Scalar::new(self.dtype().clone(), v))
     }
-    fn min_as_series(&self) -> PolarsResult<Series> {
-        Ok(self.0.min_as_series().into_duration(self.0.time_unit()))
+    fn min_reduce(&self) -> PolarsResult<Scalar> {
+        let sc = self.0.min_reduce();
+        let v = sc.value().as_duration(self.0.time_unit());
+        Ok(Scalar::new(self.dtype().clone(), v))
     }
-    fn std_as_series(&self, ddof: u8) -> PolarsResult<Series> {
-        Ok(self
-            .0
-            .std_as_series(ddof)
-            .cast(&self.dtype().to_physical())
-            .unwrap()
-            .into_duration(self.0.time_unit()))
+    fn std_reduce(&self, ddof: u8) -> PolarsResult<Scalar> {
+        let sc = self.0.std_reduce(ddof);
+        let to = self.dtype().to_physical();
+        let v = sc.value().cast(&to);
+        Ok(Scalar::new(
+            self.dtype().clone(),
+            v.as_duration(self.0.time_unit()),
+        ))
     }
 
-    fn var_as_series(&self, ddof: u8) -> PolarsResult<Series> {
-        Ok(self
+    fn var_reduce(&self, ddof: u8) -> PolarsResult<Scalar> {
+        // Why do we go via MilliSeconds here? Seems wrong to me.
+        // I think we should fix/inspect the tests that fail if we remain on the time-unit here.
+        let sc = self
             .0
             .cast_time_unit(TimeUnit::Milliseconds)
-            .var_as_series(ddof)
-            .cast(&self.dtype().to_physical())
-            .unwrap()
-            .into_duration(TimeUnit::Milliseconds))
+            .var_reduce(ddof);
+        let to = self.dtype().to_physical();
+        let v = sc.value().cast(&to);
+        Ok(Scalar::new(
+            DataType::Duration(TimeUnit::Milliseconds),
+            v.as_duration(TimeUnit::Milliseconds),
+        ))
     }
-    fn median_as_series(&self) -> PolarsResult<Series> {
-        Series::new(self.name(), &[self.median().map(|v| v as i64)]).cast(self.dtype())
+    fn median_reduce(&self) -> PolarsResult<Scalar> {
+        let v: AnyValue = self.median().map(|v| v as i64).into();
+        let to = self.dtype().to_physical();
+        let v = v.cast(&to);
+        Ok(Scalar::new(
+            self.dtype().clone(),
+            v.as_duration(self.0.time_unit()),
+        ))
     }
-    fn quantile_as_series(
-        &self,
-        quantile: f64,
-        interpol: QuantileInterpolOptions,
-    ) -> PolarsResult<Series> {
-        self.0
-            .quantile_as_series(quantile, interpol)?
-            .cast(&self.dtype().to_physical())
-            .unwrap()
-            .cast(self.dtype())
+    fn quantile_reduce(&self, quantile: f64, method: QuantileMethod) -> PolarsResult<Scalar> {
+        let v = self.0.quantile_reduce(quantile, method)?;
+        let to = self.dtype().to_physical();
+        let v = v.value().cast(&to);
+        Ok(Scalar::new(
+            self.dtype().clone(),
+            v.as_duration(self.0.time_unit()),
+        ))
     }
 
     fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
@@ -441,5 +531,13 @@ impl SeriesTrait for SeriesWrap<DurationChunked> {
     }
     fn as_any(&self) -> &dyn Any {
         &self.0
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self as _
     }
 }

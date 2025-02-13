@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from polars._utils.various import (
     _process_null_values,
     normalize_filepath,
 )
 from polars._utils.wrap import wrap_df
-from polars.datatypes import N_INFER_DEFAULT, py_type_to_dtype
+from polars.datatypes import N_INFER_DEFAULT, parse_into_dtype
 from polars.io._utils import parse_columns_arg, parse_row_index_args
 from polars.io.csv._utils import _update_columns
 
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from polars import DataFrame
-    from polars.type_aliases import CsvEncoding, PolarsDataType, SchemaDict
+    from polars._typing import CsvEncoding, PolarsDataType, SchemaDict
 
 
 class BatchedCsvReader:
@@ -35,7 +36,8 @@ class BatchedCsvReader:
         comment_prefix: str | None = None,
         quote_char: str | None = '"',
         skip_rows: int = 0,
-        dtypes: None | (SchemaDict | Sequence[PolarsDataType]) = None,
+        skip_lines: int = 0,
+        schema_overrides: SchemaDict | Sequence[PolarsDataType] | None = None,
         null_values: str | Sequence[str] | dict[str, str] | None = None,
         missing_utf8_is_empty_string: bool = False,
         ignore_errors: bool = False,
@@ -50,25 +52,25 @@ class BatchedCsvReader:
         skip_rows_after_header: int = 0,
         row_index_name: str | None = None,
         row_index_offset: int = 0,
-        sample_size: int = 1024,
         eol_char: str = "\n",
         new_columns: Sequence[str] | None = None,
         raise_if_empty: bool = True,
         truncate_ragged_lines: bool = False,
-    ):
-        path = normalize_filepath(source)
+        decimal_comma: bool = False,
+    ) -> None:
+        path = normalize_filepath(source, check_not_directory=False)
 
         dtype_list: Sequence[tuple[str, PolarsDataType]] | None = None
         dtype_slice: Sequence[PolarsDataType] | None = None
-        if dtypes is not None:
-            if isinstance(dtypes, dict):
+        if schema_overrides is not None:
+            if isinstance(schema_overrides, dict):
                 dtype_list = []
-                for k, v in dtypes.items():
-                    dtype_list.append((k, py_type_to_dtype(v)))
-            elif isinstance(dtypes, Sequence):
-                dtype_slice = dtypes
+                for k, v in schema_overrides.items():
+                    dtype_list.append((k, parse_into_dtype(v)))
+            elif isinstance(schema_overrides, Sequence):
+                dtype_slice = schema_overrides
             else:
-                msg = "`dtypes` arg should be list or dict"
+                msg = "`schema_overrides` arg should be list or dict"
                 raise TypeError(msg)
 
         processed_null_values = _process_null_values(null_values)
@@ -81,6 +83,7 @@ class BatchedCsvReader:
             ignore_errors=ignore_errors,
             n_rows=n_rows,
             skip_rows=skip_rows,
+            skip_lines=skip_lines,
             projection=projection,
             separator=separator,
             rechunk=rechunk,
@@ -88,7 +91,7 @@ class BatchedCsvReader:
             encoding=encoding,
             n_threads=n_threads,
             path=path,
-            overwrite_dtype=dtype_list,
+            schema_overrides=dtype_list,
             overwrite_dtype_slice=dtype_slice,
             low_memory=low_memory,
             comment_prefix=comment_prefix,
@@ -98,10 +101,10 @@ class BatchedCsvReader:
             try_parse_dates=try_parse_dates,
             skip_rows_after_header=skip_rows_after_header,
             row_index=parse_row_index_args(row_index_name, row_index_offset),
-            sample_size=sample_size,
             eol_char=eol_char,
             raise_if_empty=raise_if_empty,
             truncate_ragged_lines=truncate_ragged_lines,
+            decimal_comma=decimal_comma,
         )
         self.new_columns = new_columns
 
@@ -119,7 +122,7 @@ class BatchedCsvReader:
         Examples
         --------
         >>> reader = pl.read_csv_batched(
-        ...     "./tpch/tables_scale_100/lineitem.tbl",
+        ...     "./pdsh/tables_scale_100/lineitem.tbl",
         ...     separator="|",
         ...     try_parse_dates=True,
         ... )  # doctest: +SKIP
@@ -129,8 +132,7 @@ class BatchedCsvReader:
         -------
         list of DataFrames
         """
-        batches = self._reader.next_batches(n)
-        if batches is not None:
+        if (batches := self._reader.next_batches(n)) is not None:
             if self.new_columns:
                 return [
                     _update_columns(wrap_df(df), self.new_columns) for df in batches

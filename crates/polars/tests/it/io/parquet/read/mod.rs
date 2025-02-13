@@ -1,48 +1,76 @@
+mod binary;
 /// Serialization to Rust's Native types.
 /// In comparison to Arrow, this in-memory format does not leverage logical types nor SIMD operations,
 /// but OTOH it has no external dependencies and is very familiar to Rust developers.
-mod binary;
 mod boolean;
-mod deserialize;
 mod dictionary;
+pub(crate) mod file;
 mod fixed_binary;
-mod indexes;
 mod primitive;
 mod primitive_nested;
+pub(crate) mod row_group;
 mod struct_;
 mod utils;
 
 use std::fs::File;
 
-use dictionary::{deserialize as deserialize_dict, DecodedDictPage};
-#[cfg(feature = "async")]
-use futures::StreamExt;
-use polars_parquet::parquet::error::{Error, Result};
-use polars_parquet::parquet::metadata::ColumnChunkMetaData;
-use polars_parquet::parquet::page::{CompressedPage, DataPage, Page};
-#[cfg(feature = "async")]
-use polars_parquet::parquet::read::get_page_stream;
-#[cfg(feature = "async")]
-use polars_parquet::parquet::read::read_metadata_async;
-use polars_parquet::parquet::read::{
-    get_column_iterator, get_field_columns, read_metadata, BasicDecompressor, MutStreamingIterator,
-    State,
-};
+use dictionary::DecodedDictPage;
+use polars_parquet::parquet::encoding::hybrid_rle::{HybridRleChunk, HybridRleDecoder};
+use polars_parquet::parquet::error::{ParquetError, ParquetResult};
+use polars_parquet::parquet::metadata::ColumnChunkMetadata;
+use polars_parquet::parquet::page::DataPage;
+use polars_parquet::parquet::read::{get_column_iterator, read_metadata, BasicDecompressor};
 use polars_parquet::parquet::schema::types::{GroupConvertedType, ParquetType};
 use polars_parquet::parquet::schema::Repetition;
 use polars_parquet::parquet::types::int96_to_i64_ns;
-use polars_parquet::parquet::FallibleStreamingIterator;
+use polars_parquet::read::PageReader;
+use polars_utils::mmap::MemReader;
 
 use super::*;
 
+pub fn hybrid_rle_iter(d: HybridRleDecoder) -> ParquetResult<std::vec::IntoIter<u32>> {
+    Ok(d.collect()?.into_iter())
+}
+
+pub fn hybrid_rle_fn_collect<T: Clone>(
+    d: HybridRleDecoder,
+    mut f: impl FnMut(u32) -> ParquetResult<T>,
+) -> ParquetResult<Vec<T>> {
+    let mut target = Vec::with_capacity(d.len());
+
+    for chunk in d.into_chunk_iter() {
+        match chunk? {
+            HybridRleChunk::Rle(value, size) => {
+                target.resize(target.len() + size, f(value)?);
+            },
+            HybridRleChunk::Bitpacked(mut decoder) => {
+                let mut chunked = decoder.chunked();
+                for dchunk in chunked.by_ref() {
+                    for v in dchunk {
+                        target.push(f(v)?);
+                    }
+                }
+
+                if let Some((dchunk, l)) = chunked.remainder() {
+                    for &v in &dchunk[..l] {
+                        target.push(f(v)?);
+                    }
+                }
+            },
+        }
+    }
+
+    Ok(target)
+}
+
 pub fn get_path() -> PathBuf {
     let dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(dir).join("../../docs/data")
+    PathBuf::from(dir).join("../../docs/assets/data")
 }
 
 /// Reads a page into an [`Array`].
 /// This is CPU-intensive: decompress, decode and de-serialize.
-pub fn page_to_array(page: &DataPage, dict: Option<&DecodedDictPage>) -> Result<Array> {
+pub fn page_to_array(page: &DataPage, dict: Option<&DecodedDictPage>) -> ParquetResult<Array> {
     let physical_type = page.descriptor.primitive_type.physical_type;
     match page.descriptor.max_rep_level {
         0 => match physical_type {
@@ -142,60 +170,36 @@ pub fn page_to_array(page: &DataPage, dict: Option<&DecodedDictPage>) -> Result<
     }
 }
 
-pub fn collect<I: FallibleStreamingIterator<Item = Page, Error = Error>>(
-    mut iterator: I,
-    type_: PhysicalType,
-) -> Result<Vec<Array>> {
-    let mut arrays = vec![];
-    let mut dict = None;
-    while let Some(page) = iterator.next()? {
-        match page {
-            Page::Data(page) => arrays.push(page_to_array(page, dict.as_ref())?),
-            Page::Dict(page) => {
-                dict = Some(deserialize_dict(page, type_)?);
-            },
-        }
-    }
-    Ok(arrays)
-}
-
 /// Reads columns into an [`Array`].
 /// This is CPU-intensive: decompress, decode and de-serialize.
-pub fn columns_to_array<II, I>(mut columns: I, field: &ParquetType) -> Result<Array>
+pub fn columns_to_array<'a, I>(mut columns: I, field: &ParquetType) -> ParquetResult<Array>
 where
-    II: Iterator<Item = Result<CompressedPage>>,
-    I: MutStreamingIterator<Item = (II, ColumnChunkMetaData), Error = Error>,
+    I: Iterator<Item = ParquetResult<(PageReader, &'a ColumnChunkMetadata)>>,
 {
     let mut validity = vec![];
     let mut has_filled = false;
     let mut arrays = vec![];
-    while let State::Some(mut new_iter) = columns.advance()? {
-        if let Some((pages, column)) = new_iter.get() {
-            let mut iterator = BasicDecompressor::new(pages, vec![]);
+    while let Some((pages, column)) = columns.next().transpose()? {
+        let mut iterator = BasicDecompressor::new(pages, vec![]);
 
-            let mut dict = None;
-            while let Some(page) = iterator.next()? {
-                match page {
-                    polars_parquet::parquet::page::Page::Data(page) => {
-                        if !has_filled {
-                            struct_::extend_validity(&mut validity, page)?;
-                        }
-                        arrays.push(page_to_array(page, dict.as_ref())?)
-                    },
-                    polars_parquet::parquet::page::Page::Dict(page) => {
-                        dict = Some(deserialize_dict(page, column.physical_type())?);
-                    },
-                }
+        let dict = iterator
+            .read_dict_page()?
+            .map(|dict| dictionary::deserialize(&dict, column.physical_type()))
+            .transpose()?;
+        while let Some(page) = iterator.next().transpose()? {
+            let page = page.decompress(&mut iterator)?;
+            if !has_filled {
+                struct_::extend_validity(&mut validity, &page)?;
             }
+            arrays.push(page_to_array(&page, dict.as_ref())?)
         }
         has_filled = true;
-        columns = new_iter;
     }
 
     match field {
-        ParquetType::PrimitiveType { .. } => {
-            arrays.pop().ok_or_else(|| Error::OutOfSpec("".to_string()))
-        },
+        ParquetType::PrimitiveType { .. } => arrays
+            .pop()
+            .ok_or_else(|| ParquetError::OutOfSpec("".to_string())),
         ParquetType::GroupType { converted_type, .. } => {
             if let Some(converted_type) = converted_type {
                 match converted_type {
@@ -209,132 +213,97 @@ where
     }
 }
 
-pub fn read_column<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
+pub fn read_column(
+    mut reader: MemReader,
     row_group: usize,
     field_name: &str,
-) -> Result<(Array, Option<std::sync::Arc<dyn Statistics>>)> {
-    let metadata = read_metadata(reader)?;
+) -> ParquetResult<(Array, Option<Statistics>)> {
+    let metadata = read_metadata(&mut reader)?;
 
     let field = metadata
         .schema()
         .fields()
         .iter()
         .find(|field| field.name() == field_name)
-        .ok_or_else(|| Error::OutOfSpec("column does not exist".to_string()))?;
+        .ok_or_else(|| ParquetError::OutOfSpec("column does not exist".to_string()))?;
 
     let columns = get_column_iterator(
         reader,
         &metadata.row_groups[row_group],
         field.name(),
-        None,
-        vec![],
         usize::MAX,
     );
 
-    let mut statistics = get_field_columns(metadata.row_groups[row_group].columns(), field.name())
+    let mut statistics = metadata.row_groups[row_group]
+        .columns_under_root_iter(field.name())
+        .unwrap()
         .map(|column_meta| column_meta.statistics().transpose())
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<ParquetResult<Vec<_>>>()?;
 
     let array = columns_to_array(columns, field)?;
 
     Ok((array, statistics.pop().unwrap()))
 }
 
-#[cfg(feature = "async")]
-pub async fn read_column_async<
-    R: futures::AsyncRead + futures::AsyncSeek + Send + std::marker::Unpin,
->(
-    reader: &mut R,
-    row_group: usize,
-    field_name: &str,
-) -> Result<(Array, Option<std::sync::Arc<dyn Statistics>>)> {
-    let metadata = read_metadata_async(reader).await?;
-
-    let field = metadata
-        .schema()
-        .fields()
-        .iter()
-        .find(|field| field.name() == field_name)
-        .ok_or_else(|| Error::OutOfSpec("column does not exist".to_string()))?;
-
-    let column = get_field_columns(metadata.row_groups[row_group].columns(), field.name())
-        .next()
-        .unwrap();
-
-    let pages = get_page_stream(column, reader, vec![], Arc::new(|_, _| true), usize::MAX).await?;
-
-    let mut statistics = get_field_columns(metadata.row_groups[row_group].columns(), field.name())
-        .map(|column_meta| column_meta.statistics().transpose())
-        .collect::<Result<Vec<_>>>()?;
-
-    let pages = pages.collect::<Vec<_>>().await;
-
-    let iterator = BasicDecompressor::new(pages.into_iter(), vec![]);
-
-    let mut arrays = collect(iterator, column.physical_type())?;
-
-    Ok((arrays.pop().unwrap(), statistics.pop().unwrap()))
+fn get_column(path: &str, column: &str) -> ParquetResult<(Array, Option<Statistics>)> {
+    let file = File::open(path).unwrap();
+    let memreader = MemReader::from_reader(file).unwrap();
+    read_column(memreader, 0, column)
 }
 
-fn get_column(path: &str, column: &str) -> Result<(Array, Option<std::sync::Arc<dyn Statistics>>)> {
-    let mut file = File::open(path).unwrap();
-    read_column(&mut file, 0, column)
-}
-
-fn test_column(column: &str) -> Result<()> {
+fn test_column(column: &str) -> ParquetResult<()> {
     let mut path = get_path();
     path.push("alltypes_plain.parquet");
     let path = path.to_str().unwrap();
     let (result, statistics) = get_column(path, column)?;
     // the file does not have statistics
-    assert_eq!(statistics.as_ref().map(|x| x.as_ref()), None);
+    assert_eq!(statistics.as_ref(), None);
     assert_eq!(result, alltypes_plain(column));
     Ok(())
 }
 
 #[test]
-fn int32() -> Result<()> {
+fn int32() -> ParquetResult<()> {
     test_column("id")
 }
 
 #[test]
-fn bool() -> Result<()> {
+fn bool() -> ParquetResult<()> {
     test_column("bool_col")
 }
 
 #[test]
-fn tinyint_col() -> Result<()> {
+fn tinyint_col() -> ParquetResult<()> {
     test_column("tinyint_col")
 }
 
 #[test]
-fn smallint_col() -> Result<()> {
+fn smallint_col() -> ParquetResult<()> {
     test_column("smallint_col")
 }
 
 #[test]
-fn int_col() -> Result<()> {
+fn int_col() -> ParquetResult<()> {
     test_column("int_col")
 }
 
 #[test]
-fn bigint_col() -> Result<()> {
+fn bigint_col() -> ParquetResult<()> {
     test_column("bigint_col")
 }
 
 #[test]
-fn float_col() -> Result<()> {
+fn float_col() -> ParquetResult<()> {
     test_column("float_col")
 }
 
 #[test]
-fn double_col() -> Result<()> {
+fn double_col() -> ParquetResult<()> {
     test_column("double_col")
 }
 
 #[test]
-fn timestamp_col() -> Result<()> {
+fn timestamp_col() -> ParquetResult<()> {
     let mut path = get_path();
     path.push("alltypes_plain.parquet");
     let path = path.to_str().unwrap();
@@ -365,7 +334,7 @@ fn timestamp_col() -> Result<()> {
 }
 
 #[test]
-fn test_metadata() -> Result<()> {
+fn test_metadata() -> ParquetResult<()> {
     let mut testdata = get_path();
     testdata.push("alltypes_plain.parquet");
     let mut file = File::open(testdata).unwrap();

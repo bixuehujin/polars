@@ -15,7 +15,7 @@ use crate::trusted_len::TrustedLen;
 /// This struct does not allocate a validity until one is required (i.e. push a null to it).
 #[derive(Debug, Clone)]
 pub struct MutableBooleanArray {
-    data_type: ArrowDataType,
+    dtype: ArrowDataType,
     values: MutableBitmap,
     validity: Option<MutableBitmap>,
 }
@@ -23,7 +23,7 @@ pub struct MutableBooleanArray {
 impl From<MutableBooleanArray> for BooleanArray {
     fn from(other: MutableBooleanArray) -> Self {
         BooleanArray::new(
-            other.data_type,
+            other.dtype,
             other.values.into(),
             other.validity.map(|x| x.into()),
         )
@@ -53,29 +53,29 @@ impl MutableBooleanArray {
     /// # Errors
     /// This function errors iff:
     /// * The validity is not `None` and its length is different from `values`'s length
-    /// * The `data_type`'s [`PhysicalType`] is not equal to [`PhysicalType::Boolean`].
+    /// * The `dtype`'s [`PhysicalType`] is not equal to [`PhysicalType::Boolean`].
     pub fn try_new(
-        data_type: ArrowDataType,
+        dtype: ArrowDataType,
         values: MutableBitmap,
         validity: Option<MutableBitmap>,
     ) -> PolarsResult<Self> {
         if validity
             .as_ref()
-            .map_or(false, |validity| validity.len() != values.len())
+            .is_some_and(|validity| validity.len() != values.len())
         {
             polars_bail!(ComputeError:
                 "validity mask length must match the number of values",
             )
         }
 
-        if data_type.to_physical_type() != PhysicalType::Boolean {
+        if dtype.to_physical_type() != PhysicalType::Boolean {
             polars_bail!(oos =
                 "MutableBooleanArray can only be initialized with a DataType whose physical type is Boolean",
             )
         }
 
         Ok(Self {
-            data_type,
+            dtype,
             values,
             validity,
         })
@@ -84,7 +84,7 @@ impl MutableBooleanArray {
     /// Creates an new [`MutableBooleanArray`] with a capacity of values.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            data_type: ArrowDataType::Boolean,
+            dtype: ArrowDataType::Boolean,
             values: MutableBitmap::with_capacity(capacity),
             validity: None,
         }
@@ -98,23 +98,29 @@ impl MutableBooleanArray {
         }
     }
 
+    #[inline]
+    pub fn push_value(&mut self, value: bool) {
+        self.values.push(value);
+        if let Some(validity) = &mut self.validity {
+            validity.push(true)
+        }
+    }
+
+    #[inline]
+    pub fn push_null(&mut self) {
+        self.values.push(false);
+        match &mut self.validity {
+            Some(validity) => validity.push(false),
+            None => self.init_validity(),
+        }
+    }
+
     /// Pushes a new entry to [`MutableBooleanArray`].
+    #[inline]
     pub fn push(&mut self, value: Option<bool>) {
         match value {
-            Some(value) => {
-                self.values.push(value);
-                match &mut self.validity {
-                    Some(validity) => validity.push(true),
-                    None => {},
-                }
-            },
-            None => {
-                self.values.push(false);
-                match &mut self.validity {
-                    Some(validity) => validity.push(false),
-                    None => self.init_validity(),
-                }
-            },
+            Some(value) => self.push_value(value),
+            None => self.push_null(),
         }
     }
 
@@ -231,6 +237,10 @@ impl MutableBooleanArray {
     pub fn into_arc(self) -> Arc<dyn Array> {
         let a: BooleanArray = self.into();
         Arc::new(a)
+    }
+
+    pub fn freeze(self) -> BooleanArray {
+        self.into()
     }
 }
 
@@ -523,8 +533,8 @@ impl MutableArray for MutableBooleanArray {
         array.arced()
     }
 
-    fn data_type(&self) -> &ArrowDataType {
-        &self.data_type
+    fn dtype(&self) -> &ArrowDataType {
+        &self.dtype
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

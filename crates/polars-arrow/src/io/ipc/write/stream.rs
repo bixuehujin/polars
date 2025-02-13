@@ -4,6 +4,7 @@
 //! however the `FileWriter` expects a reader that supports `Seek`ing
 
 use std::io::Write;
+use std::sync::Arc;
 
 use polars_error::{PolarsError, PolarsResult};
 
@@ -13,7 +14,7 @@ use super::common_sync::{write_continuation, write_message};
 use super::{default_ipc_fields, schema_to_bytes};
 use crate::array::Array;
 use crate::datatypes::*;
-use crate::record_batch::RecordBatch;
+use crate::record_batch::RecordBatchT;
 
 /// Arrow stream writer
 ///
@@ -30,6 +31,8 @@ pub struct StreamWriter<W: Write> {
     finished: bool,
     /// Keeps track of dictionaries that have been written
     dictionary_tracker: DictionaryTracker,
+    /// Custom schema-level metadata
+    custom_schema_metadata: Option<Arc<Metadata>>,
 
     ipc_fields: Option<Vec<IpcField>>,
 }
@@ -46,7 +49,13 @@ impl<W: Write> StreamWriter<W> {
                 cannot_replace: false,
             },
             ipc_fields: None,
+            custom_schema_metadata: None,
         }
+    }
+
+    /// Sets custom schema metadata. Must be called before `start` is called
+    pub fn set_custom_schema_metadata(&mut self, custom_metadata: Arc<Metadata>) {
+        self.custom_schema_metadata = Some(custom_metadata);
     }
 
     /// Starts the stream by writing a Schema message to it.
@@ -59,21 +68,25 @@ impl<W: Write> StreamWriter<W> {
         self.ipc_fields = Some(if let Some(ipc_fields) = ipc_fields {
             ipc_fields
         } else {
-            default_ipc_fields(&schema.fields)
+            default_ipc_fields(schema.iter_values())
         });
 
         let encoded_message = EncodedData {
-            ipc_message: schema_to_bytes(schema, self.ipc_fields.as_ref().unwrap()),
+            ipc_message: schema_to_bytes(
+                schema,
+                self.ipc_fields.as_ref().unwrap(),
+                self.custom_schema_metadata.as_deref(),
+            ),
             arrow_data: vec![],
         };
         write_message(&mut self.writer, &encoded_message)?;
         Ok(())
     }
 
-    /// Writes [`RecordBatch`] to the stream
+    /// Writes [`RecordBatchT`] to the stream
     pub fn write(
         &mut self,
-        columns: &RecordBatch<Box<dyn Array>>,
+        columns: &RecordBatchT<Box<dyn Array>>,
         ipc_fields: Option<&[IpcField]>,
     ) -> PolarsResult<()> {
         if self.finished {

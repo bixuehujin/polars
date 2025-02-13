@@ -9,5 +9,5 @@ pub(super) mod ndjson;
 #[cfg(feature = "parquet")]
 pub(super) mod parquet;
 
-#[cfg(feature = "json")]
-use file_list_reader::*;
+#[cfg(feature = "catalog")]
+mod catalog;

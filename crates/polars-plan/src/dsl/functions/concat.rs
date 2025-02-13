@@ -4,7 +4,7 @@ use super::*;
 /// Horizontally concat string columns in linear time
 pub fn concat_str<E: AsRef<[Expr]>>(s: E, separator: &str, ignore_nulls: bool) -> Expr {
     let input = s.as_ref().to_vec();
-    let separator = separator.to_string();
+    let separator = separator.into();
 
     Expr::Function {
         input,
@@ -15,8 +15,8 @@ pub fn concat_str<E: AsRef<[Expr]>>(s: E, separator: &str, ignore_nulls: bool) -
         .into(),
         options: FunctionOptions {
             collect_groups: ApplyOptions::ElementWise,
-            input_wildcard_expansion: true,
-            returns_scalar: false,
+            flags: FunctionFlags::default()
+                | FunctionFlags::INPUT_WILDCARD_EXPANSION & !FunctionFlags::RETURNS_SCALAR,
             ..Default::default()
         },
     }
@@ -63,9 +63,26 @@ pub fn concat_list<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(s: E) -> PolarsResult
         function: FunctionExpr::ListExpr(ListFunction::Concat),
         options: FunctionOptions {
             collect_groups: ApplyOptions::ElementWise,
-            input_wildcard_expansion: true,
+            flags: FunctionFlags::default() | FunctionFlags::INPUT_WILDCARD_EXPANSION,
             ..Default::default()
         },
+    })
+}
+
+/// Horizontally concatenate columns into a single array-type column.
+pub fn concat_arr(input: Vec<Expr>) -> PolarsResult<Expr> {
+    feature_gated!("dtype-array", {
+        polars_ensure!(!input.is_empty(), ComputeError: "`concat_arr` needs one or more expressions");
+
+        Ok(Expr::Function {
+            input,
+            function: FunctionExpr::ArrayExpr(ArrayFunction::Concat),
+            options: FunctionOptions {
+                collect_groups: ApplyOptions::ElementWise,
+                flags: FunctionFlags::default() | FunctionFlags::INPUT_WILDCARD_EXPANSION,
+                ..Default::default()
+            },
+        })
     })
 }
 
@@ -81,8 +98,8 @@ pub fn concat_expr<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(
         function: FunctionExpr::ConcatExpr(rechunk),
         options: FunctionOptions {
             collect_groups: ApplyOptions::ElementWise,
-            input_wildcard_expansion: true,
-            cast_to_supertypes: true,
+            flags: FunctionFlags::default() | FunctionFlags::INPUT_WILDCARD_EXPANSION,
+            cast_options: Some(CastingRules::cast_to_supertypes()),
             ..Default::default()
         },
     })

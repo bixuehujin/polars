@@ -7,7 +7,7 @@ use std::io::Write;
 use arrow::array::Array;
 use arrow::datatypes::ArrowSchema;
 use arrow::io::iterator::StreamingIterator;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::RecordBatchT;
 pub use fallible_streaming_iterator::*;
 use polars_error::{PolarsError, PolarsResult};
 pub(crate) use serialize::new_serializer;
@@ -65,7 +65,7 @@ where
     }
 }
 
-/// [`FallibleStreamingIterator`] that serializes a [`RecordBatch`] into bytes of JSON
+/// [`FallibleStreamingIterator`] that serializes a [`RecordBatchT`] into bytes of JSON
 /// in a (pandas-compatible) record-oriented format.
 ///
 /// # Implementation
@@ -80,7 +80,7 @@ pub struct RecordSerializer<'a> {
 
 impl<'a> RecordSerializer<'a> {
     /// Creates a new [`RecordSerializer`].
-    pub fn new<A>(schema: ArrowSchema, chunk: &'a RecordBatch<A>, buffer: Vec<u8>) -> Self
+    pub fn new<A>(schema: ArrowSchema, chunk: &'a RecordBatchT<A>, buffer: Vec<u8>) -> Self
     where
         A: AsRef<dyn Array>,
     {
@@ -101,7 +101,7 @@ impl<'a> RecordSerializer<'a> {
     }
 }
 
-impl<'a> FallibleStreamingIterator for RecordSerializer<'a> {
+impl FallibleStreamingIterator for RecordSerializer<'_> {
     type Item = [u8];
 
     type Error = PolarsError;
@@ -114,7 +114,7 @@ impl<'a> FallibleStreamingIterator for RecordSerializer<'a> {
 
         let mut is_first_row = true;
         write!(&mut self.buffer, "{{")?;
-        for (f, ref mut it) in self.schema.fields.iter().zip(self.iterators.iter_mut()) {
+        for (f, ref mut it) in self.schema.iter_values().zip(self.iterators.iter_mut()) {
             if !is_first_row {
                 write!(&mut self.buffer, ",")?;
             }
@@ -144,15 +144,15 @@ where
     W: std::io::Write,
     I: FallibleStreamingIterator<Item = [u8], Error = PolarsError>,
 {
-    writer.write_all(&[b'['])?;
+    writer.write_all(b"[")?;
     let mut is_first_row = true;
     while let Some(block) = blocks.next()? {
         if !is_first_row {
-            writer.write_all(&[b','])?;
+            writer.write_all(b",")?;
         }
         is_first_row = false;
         writer.write_all(block)?;
     }
-    writer.write_all(&[b']'])?;
+    writer.write_all(b"]")?;
     Ok(())
 }

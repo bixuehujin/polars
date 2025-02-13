@@ -22,7 +22,7 @@ fn test_swap_rename() -> PolarsResult<()> {
         "b" => [2],
     ]?
     .lazy()
-    .rename(["a", "b"], ["b", "a"])
+    .rename(["a", "b"], ["b", "a"], true)
     .collect()?;
 
     let expected = df![
@@ -34,7 +34,7 @@ fn test_swap_rename() -> PolarsResult<()> {
 }
 
 #[test]
-fn test_outer_join_with_column_2988() -> PolarsResult<()> {
+fn test_full_outer_join_with_column_2988() -> PolarsResult<()> {
     let ldf1 = df![
         "key1" => ["foo", "bar"],
         "key2" => ["foo", "bar"],
@@ -54,7 +54,7 @@ fn test_outer_join_with_column_2988() -> PolarsResult<()> {
             ldf2,
             [col("key1"), col("key2")],
             [col("key1"), col("key2")],
-            JoinType::Outer { coalesce: true }.into(),
+            JoinArgs::new(JoinType::Full).with_coalesce(JoinCoalesce::CoalesceColumns),
         )
         .with_columns([col("key1")])
         .collect()?;
@@ -77,20 +77,6 @@ fn test_outer_join_with_column_2988() -> PolarsResult<()> {
     );
 
     Ok(())
-}
-
-#[test]
-fn test_err_no_found() {
-    let df = df![
-        "a" => [1, 2, 3],
-        "b" => [None, Some("a"), Some("b")]
-    ]
-    .unwrap();
-
-    assert!(matches!(
-        df.lazy().filter(col("nope").gt(lit(2))).collect(),
-        Err(PolarsError::ColumnNotFound(_))
-    ));
 }
 
 #[test]
@@ -120,6 +106,7 @@ fn test_many_aliasing_projections_5070() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "cum_agg")]
 fn test_projection_5086() -> PolarsResult<()> {
     let df = df![
         "a" => ["a", "a", "a", "b"],
@@ -160,8 +147,8 @@ fn test_projection_5086() -> PolarsResult<()> {
 #[cfg(feature = "dtype-struct")]
 fn test_unnest_pushdown() -> PolarsResult<()> {
     let df = df![
-        "collection" => Series::full_null("", 1, &DataType::Int32),
-        "users" => Series::full_null("", 1, &DataType::List(Box::new(DataType::Struct(vec![Field::new("email", DataType::String)])))),
+        "collection" => Series::full_null("".into(), 1, &DataType::Int32),
+        "users" => Series::full_null("".into(), 1, &DataType::List(Box::new(DataType::Struct(vec![Field::new("email".into(), DataType::String)])))),
     ]?;
 
     let out = df

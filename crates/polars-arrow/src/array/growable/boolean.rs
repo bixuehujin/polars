@@ -1,19 +1,17 @@
 use std::sync::Arc;
 
-use polars_utils::slice::GetSaferUnchecked;
-
 use super::Growable;
 use crate::array::growable::utils::{extend_validity, prepare_validity};
 use crate::array::{Array, BooleanArray};
-use crate::bitmap::MutableBitmap;
+use crate::bitmap::BitmapBuilder;
 use crate::datatypes::ArrowDataType;
 
 /// Concrete [`Growable`] for the [`BooleanArray`].
 pub struct GrowableBoolean<'a> {
     arrays: Vec<&'a BooleanArray>,
-    data_type: ArrowDataType,
-    validity: Option<MutableBitmap>,
-    values: MutableBitmap,
+    dtype: ArrowDataType,
+    validity: Option<BitmapBuilder>,
+    values: BitmapBuilder,
 }
 
 impl<'a> GrowableBoolean<'a> {
@@ -21,7 +19,7 @@ impl<'a> GrowableBoolean<'a> {
     /// # Panics
     /// If `arrays` is empty.
     pub fn new(arrays: Vec<&'a BooleanArray>, mut use_validity: bool, capacity: usize) -> Self {
-        let data_type = arrays[0].data_type().clone();
+        let dtype = arrays[0].dtype().clone();
 
         // if any of the arrays has nulls, insertions from any array requires setting bits
         // as there is at least one array with nulls.
@@ -31,8 +29,8 @@ impl<'a> GrowableBoolean<'a> {
 
         Self {
             arrays,
-            data_type,
-            values: MutableBitmap::with_capacity(capacity),
+            dtype,
+            values: BitmapBuilder::with_capacity(capacity),
             validity: prepare_validity(use_validity, capacity),
         }
     }
@@ -42,26 +40,22 @@ impl<'a> GrowableBoolean<'a> {
         let values = std::mem::take(&mut self.values);
 
         BooleanArray::new(
-            self.data_type.clone(),
-            values.into(),
-            validity.map(|v| v.into()),
+            self.dtype.clone(),
+            values.freeze(),
+            validity.map(|v| v.freeze()),
         )
     }
 }
 
 impl<'a> Growable<'a> for GrowableBoolean<'a> {
     unsafe fn extend(&mut self, index: usize, start: usize, len: usize) {
-        let array = *self.arrays.get_unchecked_release(index);
+        let array = *self.arrays.get_unchecked(index);
         extend_validity(&mut self.validity, array, start, len);
 
         let values = array.values();
 
         let (slice, offset, _) = values.as_slice();
-        // SAFETY: invariant offset + length <= slice.len()
-        unsafe {
-            self.values
-                .extend_from_slice_unchecked(slice, start + offset, len);
-        }
+        self.values.extend_from_slice(slice, start + offset, len);
     }
 
     fn extend_validity(&mut self, additional: usize) {
@@ -88,9 +82,9 @@ impl<'a> Growable<'a> for GrowableBoolean<'a> {
 impl<'a> From<GrowableBoolean<'a>> for BooleanArray {
     fn from(val: GrowableBoolean<'a>) -> Self {
         BooleanArray::new(
-            val.data_type,
-            val.values.into(),
-            val.validity.map(|v| v.into()),
+            val.dtype,
+            val.values.freeze(),
+            val.validity.map(|v| v.freeze()),
         )
     }
 }

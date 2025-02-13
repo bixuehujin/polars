@@ -1,11 +1,12 @@
 use std::io::{Read, Seek};
 
 use arrow::io::avro::{self, read};
+use arrow::record_batch::RecordBatch;
 use polars_core::error::to_compute_err;
 use polars_core::prelude::*;
 
-use super::{finish_reader, ArrowChunk, ArrowReader};
 use crate::prelude::*;
+use crate::shared::{finish_reader, ArrowReader};
 
 /// Read [Apache Avro] format into a [`DataFrame`]
 ///
@@ -38,7 +39,7 @@ impl<R: Read + Seek> AvroReader<R> {
     /// Get schema of the Avro File
     pub fn schema(&mut self) -> PolarsResult<Schema> {
         let schema = self.arrow_schema()?;
-        Ok(Schema::from_iter(&schema.fields))
+        Ok(Schema::from_arrow_schema(&schema))
     }
 
     /// Get arrow schema of the avro File, this is faster than a polars schema.
@@ -73,7 +74,7 @@ impl<R> ArrowReader for read::Reader<R>
 where
     R: Read + Seek,
 {
-    fn next_record_batch(&mut self) -> PolarsResult<Option<ArrowChunk>> {
+    fn next_record_batch(&mut self) -> PolarsResult<Option<RecordBatch>> {
         self.next().map_or(Ok(None), |v| v.map(Some))
     }
 }
@@ -108,7 +109,7 @@ where
         }
 
         let (projection, projected_schema) = if let Some(projection) = self.projection {
-            let mut prj = vec![false; schema.fields.len()];
+            let mut prj = vec![false; schema.len()];
             for &index in projection.iter() {
                 prj[index] = true;
             }
@@ -117,8 +118,7 @@ where
             (None, schema.clone())
         };
 
-        let avro_reader =
-            avro::read::Reader::new(&mut self.reader, metadata, schema.fields, projection);
+        let avro_reader = avro::read::Reader::new(&mut self.reader, metadata, schema, projection);
 
         finish_reader(
             avro_reader,

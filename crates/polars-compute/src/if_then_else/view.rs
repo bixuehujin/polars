@@ -1,10 +1,12 @@
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryViewArray, Utf8ViewArray, View};
+use arrow::array::{Array, BinaryViewArray, MutablePlBinary, Utf8ViewArray, View};
 use arrow::bitmap::Bitmap;
 use arrow::buffer::Buffer;
 use arrow::datatypes::ArrowDataType;
+use polars_utils::aliases::{InitHashMaps, PlHashSet};
 
 use super::IfThenElseKernel;
 use crate::if_then_else::scalar::if_then_else_broadcast_both_scalar_64;
@@ -27,24 +29,36 @@ fn make_buffer_and_views<const N: usize>(
     (views, buf)
 }
 
+fn has_duplicate_buffers(bufs: &[Buffer<u8>]) -> bool {
+    let mut has_duplicate_buffers = false;
+    let mut bufset = PlHashSet::new();
+    for buf in bufs {
+        if !bufset.insert(buf.as_ptr()) {
+            has_duplicate_buffers = true;
+            break;
+        }
+    }
+    has_duplicate_buffers
+}
+
 impl IfThenElseKernel for BinaryViewArray {
     type Scalar<'a> = &'a [u8];
 
     fn if_then_else(mask: &Bitmap, if_true: &Self, if_false: &Self) -> Self {
         let combined_buffers: Arc<_>;
-        let combined_buffer_len: usize;
         let false_buffer_idx_offset: u32;
+        let mut has_duplicate_bufs = false;
         if Arc::ptr_eq(if_true.data_buffers(), if_false.data_buffers()) {
             // Share exact same buffers, no need to combine.
             combined_buffers = if_true.data_buffers().clone();
-            combined_buffer_len = if_true.total_buffer_len();
             false_buffer_idx_offset = 0;
         } else {
             // Put false buffers after true buffers.
             let true_buffers = if_true.data_buffers().iter().cloned();
             let false_buffers = if_false.data_buffers().iter().cloned();
+
             combined_buffers = true_buffers.chain(false_buffers).collect();
-            combined_buffer_len = if_true.total_buffer_len() + if_false.total_buffer_len();
+            has_duplicate_bufs = has_duplicate_buffers(&combined_buffers);
             false_buffer_idx_offset = if_true.data_buffers().len() as u32;
         }
 
@@ -57,15 +71,24 @@ impl IfThenElseKernel for BinaryViewArray {
         );
 
         let validity = super::if_then_else_validity(mask, if_true.validity(), if_false.validity());
-        unsafe {
-            BinaryViewArray::new_unchecked_unknown_md(
-                if_true.data_type().clone(),
-                views.into(),
-                combined_buffers,
-                validity,
-                Some(combined_buffer_len),
-            )
+
+        let mut builder = MutablePlBinary::with_capacity(views.len());
+
+        if has_duplicate_bufs {
+            unsafe {
+                builder.extend_non_null_views_unchecked_dedupe(
+                    views.into_iter(),
+                    combined_buffers.deref(),
+                )
+            };
+        } else {
+            unsafe {
+                builder.extend_non_null_views_unchecked(views.into_iter(), combined_buffers.deref())
+            };
         }
+        builder
+            .freeze_with_dtype(if_true.dtype().clone())
+            .with_validity(validity)
     }
 
     fn if_then_else_broadcast_true(
@@ -78,7 +101,6 @@ impl IfThenElseKernel for BinaryViewArray {
         let true_buffer_idx_offset: u32 = if_false.data_buffers().len() as u32;
         let ([true_view], true_buffer) = make_buffer_and_views([if_true], true_buffer_idx_offset);
         let combined_buffers: Arc<_> = false_buffers.chain(true_buffer).collect();
-        let combined_buffer_len = if_false.total_buffer_len() + if_true.len();
 
         let views = super::if_then_else_loop_broadcast_false(
             true, // Invert the mask so we effectively broadcast true.
@@ -89,15 +111,22 @@ impl IfThenElseKernel for BinaryViewArray {
         );
 
         let validity = super::if_then_else_validity(mask, None, if_false.validity());
+
+        let mut builder = MutablePlBinary::with_capacity(views.len());
+
         unsafe {
-            BinaryViewArray::new_unchecked_unknown_md(
-                if_false.data_type().clone(),
-                views.into(),
-                combined_buffers,
-                validity,
-                Some(combined_buffer_len),
-            )
+            if has_duplicate_buffers(&combined_buffers) {
+                builder.extend_non_null_views_unchecked_dedupe(
+                    views.into_iter(),
+                    combined_buffers.deref(),
+                )
+            } else {
+                builder.extend_non_null_views_unchecked(views.into_iter(), combined_buffers.deref())
+            }
         }
+        builder
+            .freeze_with_dtype(if_false.dtype().clone())
+            .with_validity(validity)
     }
 
     fn if_then_else_broadcast_false(
@@ -111,7 +140,6 @@ impl IfThenElseKernel for BinaryViewArray {
         let ([false_view], false_buffer) =
             make_buffer_and_views([if_false], false_buffer_idx_offset);
         let combined_buffers: Arc<_> = true_buffers.chain(false_buffer).collect();
-        let combined_buffer_len = if_true.total_buffer_len() + if_false.len();
 
         let views = super::if_then_else_loop_broadcast_false(
             false,
@@ -122,15 +150,21 @@ impl IfThenElseKernel for BinaryViewArray {
         );
 
         let validity = super::if_then_else_validity(mask, if_true.validity(), None);
+
+        let mut builder = MutablePlBinary::with_capacity(views.len());
         unsafe {
-            BinaryViewArray::new_unchecked_unknown_md(
-                if_true.data_type().clone(),
-                views.into(),
-                combined_buffers,
-                validity,
-                Some(combined_buffer_len),
-            )
-        }
+            if has_duplicate_buffers(&combined_buffers) {
+                builder.extend_non_null_views_unchecked_dedupe(
+                    views.into_iter(),
+                    combined_buffers.deref(),
+                )
+            } else {
+                builder.extend_non_null_views_unchecked(views.into_iter(), combined_buffers.deref())
+            }
+        };
+        builder
+            .freeze_with_dtype(if_true.dtype().clone())
+            .with_validity(validity)
     }
 
     fn if_then_else_broadcast_both(
@@ -139,7 +173,6 @@ impl IfThenElseKernel for BinaryViewArray {
         if_true: Self::Scalar<'_>,
         if_false: Self::Scalar<'_>,
     ) -> Self {
-        let total_len = if_true.len() + if_false.len();
         let ([true_view, false_view], buffer) = make_buffer_and_views([if_true, if_false], 0);
         let buffers: Arc<_> = buffer.into_iter().collect();
         let views = super::if_then_else_loop_broadcast_both(
@@ -148,9 +181,16 @@ impl IfThenElseKernel for BinaryViewArray {
             false_view,
             if_then_else_broadcast_both_scalar_64,
         );
+
+        let mut builder = MutablePlBinary::with_capacity(views.len());
         unsafe {
-            BinaryViewArray::new_unchecked(dtype, views.into(), buffers, None, total_len, total_len)
-        }
+            if has_duplicate_buffers(&buffers) {
+                builder.extend_non_null_views_unchecked_dedupe(views.into_iter(), buffers.deref())
+            } else {
+                builder.extend_non_null_views_unchecked(views.into_iter(), buffers.deref())
+            }
+        };
+        builder.freeze_with_dtype(dtype)
     }
 }
 

@@ -13,8 +13,8 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.xdist_group("streaming")
 
 
-@pytest.mark.write_disk()
-@pytest.mark.slow()
+@pytest.mark.write_disk
+@pytest.mark.slow
 def test_streaming_out_of_core_unique(
     io_files_path: Path, tmp_path: Path, monkeypatch: Any, capfd: Any
 ) -> None:
@@ -39,6 +39,7 @@ def test_streaming_out_of_core_unique(
     # assert "OOC group_by started" in err
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_streaming_unique(monkeypatch: Any, capfd: Any) -> None:
     monkeypatch.setenv("POLARS_VERBOSE", "1")
     df = pl.DataFrame({"a": [1, 2, 2, 2], "b": [3, 4, 4, 4], "c": [5, 6, 7, 7]})

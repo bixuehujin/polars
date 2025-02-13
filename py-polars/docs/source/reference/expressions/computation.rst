@@ -15,6 +15,12 @@ Computation
     Expr.arctan
     Expr.arctanh
     Expr.arg_unique
+    Expr.bitwise_count_ones
+    Expr.bitwise_count_zeros
+    Expr.bitwise_leading_ones
+    Expr.bitwise_leading_zeros
+    Expr.bitwise_trailing_ones
+    Expr.bitwise_trailing_zeros
     Expr.cbrt
     Expr.cos
     Expr.cosh
@@ -24,11 +30,6 @@ Computation
     Expr.cum_min
     Expr.cum_prod
     Expr.cum_sum
-    Expr.cumcount
-    Expr.cummax
-    Expr.cummin
-    Expr.cumprod
-    Expr.cumsum
     Expr.cumulative_eval
     Expr.degrees
     Expr.diff
@@ -41,29 +42,36 @@ Computation
     Expr.exp
     Expr.hash
     Expr.hist
+    Expr.index_of
     Expr.kurtosis
     Expr.log
     Expr.log10
     Expr.log1p
     Expr.mode
     Expr.n_unique
-    Expr.null_count
     Expr.pct_change
     Expr.peak_max
     Expr.peak_min
     Expr.radians
     Expr.rank
-    Expr.rolling_apply
     Expr.rolling_map
     Expr.rolling_max
+    Expr.rolling_max_by
     Expr.rolling_mean
+    Expr.rolling_mean_by
     Expr.rolling_median
+    Expr.rolling_median_by
     Expr.rolling_min
+    Expr.rolling_min_by
     Expr.rolling_quantile
+    Expr.rolling_quantile_by
     Expr.rolling_skew
     Expr.rolling_std
+    Expr.rolling_std_by
     Expr.rolling_sum
+    Expr.rolling_sum_by
     Expr.rolling_var
+    Expr.rolling_var_by
     Expr.search_sorted
     Expr.sign
     Expr.sin

@@ -2,7 +2,7 @@ use std::fmt::{Result, Write};
 
 use super::Array;
 use crate::bitmap::Bitmap;
-use crate::{match_integer_type, with_match_primitive_type};
+use crate::{match_integer_type, with_match_primitive_type_full};
 
 /// Returns a function that writes the value of the element of `array`
 /// at position `index` to a [`Write`],
@@ -12,12 +12,12 @@ pub fn get_value_display<'a, F: Write + 'a>(
     null: &'static str,
 ) -> Box<dyn Fn(&mut F, usize) -> Result + 'a> {
     use crate::datatypes::PhysicalType::*;
-    match array.data_type().to_physical_type() {
+    match array.dtype().to_physical_type() {
         Null => Box::new(move |f, _| write!(f, "{null}")),
         Boolean => Box::new(|f, index| {
             super::boolean::fmt::write_value(array.as_any().downcast_ref().unwrap(), index, f)
         }),
-        Primitive(primitive) => with_match_primitive_type!(primitive, |$T| {
+        Primitive(primitive) => with_match_primitive_type_full!(primitive, |$T| {
             let writer = super::primitive::fmt::get_write_value::<$T, _>(
                 array.as_any().downcast_ref().unwrap(),
             );

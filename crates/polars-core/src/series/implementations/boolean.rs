@@ -12,16 +12,13 @@ impl private::PrivateSeries for SeriesWrap<BooleanChunked> {
         Cow::Borrowed(self.0.ref_field())
     }
     fn _dtype(&self) -> &DataType {
-        self.0.ref_field().data_type()
+        self.0.ref_field().dtype()
     }
-    fn _get_flags(&self) -> Settings {
+    fn _get_flags(&self) -> StatisticsFlags {
         self.0.get_flags()
     }
-    fn _set_flags(&mut self, flags: Settings) {
+    fn _set_flags(&mut self, flags: StatisticsFlags) {
         self.0.set_flags(flags)
-    }
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
-        self.0.explode_by_offsets(offsets)
     }
 
     unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
@@ -39,58 +36,75 @@ impl private::PrivateSeries for SeriesWrap<BooleanChunked> {
         (&self.0).into_total_ord_inner()
     }
 
-    fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
+    fn vec_hash(&self, random_state: PlRandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
         self.0.vec_hash(random_state, buf)?;
         Ok(())
     }
 
-    fn vec_hash_combine(&self, build_hasher: RandomState, hashes: &mut [u64]) -> PolarsResult<()> {
+    fn vec_hash_combine(
+        &self,
+        build_hasher: PlRandomState,
+        hashes: &mut [u64],
+    ) -> PolarsResult<()> {
         self.0.vec_hash_combine(build_hasher, hashes)?;
         Ok(())
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_min(&self, groups: &GroupsType) -> Series {
         self.0.agg_min(groups)
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
         self.0.agg_max(groups)
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_sum(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_sum(&self, groups: &GroupsType) -> Series {
         self.0.agg_sum(groups)
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
         self.0.agg_list(groups)
     }
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_std(&self, groups: &GroupsProxy, _ddof: u8) -> Series {
+    unsafe fn agg_std(&self, groups: &GroupsType, _ddof: u8) -> Series {
         self.0
-            .cast(&DataType::Float64)
+            .cast_with_options(&DataType::Float64, CastOptions::Overflowing)
             .unwrap()
             .agg_std(groups, _ddof)
     }
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_var(&self, groups: &GroupsProxy, _ddof: u8) -> Series {
+    unsafe fn agg_var(&self, groups: &GroupsType, _ddof: u8) -> Series {
         self.0
-            .cast(&DataType::Float64)
+            .cast_with_options(&DataType::Float64, CastOptions::Overflowing)
             .unwrap()
             .agg_var(groups, _ddof)
     }
 
+    #[cfg(feature = "bitwise")]
+    unsafe fn agg_and(&self, groups: &GroupsType) -> Series {
+        self.0.agg_and(groups)
+    }
+    #[cfg(feature = "bitwise")]
+    unsafe fn agg_or(&self, groups: &GroupsType) -> Series {
+        self.0.agg_or(groups)
+    }
+    #[cfg(feature = "bitwise")]
+    unsafe fn agg_xor(&self, groups: &GroupsType) -> Series {
+        self.0.agg_xor(groups)
+    }
+
     #[cfg(feature = "algorithm_group_by")]
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
-        IntoGroupsProxy::group_tuples(&self.0, multithreaded, sorted)
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsType> {
+        IntoGroupsType::group_tuples(&self.0, multithreaded, sorted)
     }
 
     fn arg_sort_multiple(
         &self,
-        by: &[Series],
+        by: &[Column],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
         self.0.arg_sort_multiple(by, options)
@@ -101,29 +115,14 @@ impl private::PrivateSeries for SeriesWrap<BooleanChunked> {
 }
 
 impl SeriesTrait for SeriesWrap<BooleanChunked> {
-    fn bitxor(&self, other: &Series) -> PolarsResult<Series> {
-        let other = self.0.unpack_series_matching_type(other)?;
-        Ok((&self.0).bitxor(other).into_series())
-    }
-
-    fn bitand(&self, other: &Series) -> PolarsResult<Series> {
-        let other = self.0.unpack_series_matching_type(other)?;
-        Ok((&self.0).bitand(other).into_series())
-    }
-
-    fn bitor(&self, other: &Series) -> PolarsResult<Series> {
-        let other = self.0.unpack_series_matching_type(other)?;
-        Ok((&self.0).bitor(other).into_series())
-    }
-
-    fn rename(&mut self, name: &str) {
+    fn rename(&mut self, name: PlSmallStr) {
         self.0.rename(name);
     }
 
-    fn chunk_lengths(&self) -> ChunkIdIter {
-        self.0.chunk_id()
+    fn chunk_lengths(&self) -> ChunkLenIter {
+        self.0.chunk_lengths()
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &PlSmallStr {
         self.0.name()
     }
 
@@ -140,21 +139,33 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
     fn slice(&self, offset: i64, length: usize) -> Series {
         self.0.slice(offset, length).into_series()
     }
+    fn split_at(&self, offset: i64) -> (Series, Series) {
+        let (a, b) = self.0.split_at(offset);
+        (a.into_series(), b.into_series())
+    }
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), append);
-        self.0.append(other.as_ref().as_ref());
+        self.0.append(other.as_ref().as_ref())?;
         Ok(())
+    }
+    fn append_owned(&mut self, other: Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append_owned(other.take_inner())
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), extend);
-        self.0.extend(other.as_ref().as_ref());
+        self.0.extend(other.as_ref().as_ref())?;
         Ok(())
     }
 
     fn filter(&self, filter: &BooleanChunked) -> PolarsResult<Series> {
         ChunkFilter::filter(&self.0, filter).map(|ca| ca.into_series())
+    }
+
+    fn _sum_as_f64(&self) -> f64 {
+        self.0.sum().unwrap() as f64
     }
 
     fn mean(&self) -> Option<f64> {
@@ -182,19 +193,15 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
     }
 
     fn rechunk(&self) -> Series {
-        self.0.rechunk().into_series()
+        self.0.rechunk().into_owned().into_series()
     }
 
     fn new_from_index(&self, index: usize, length: usize) -> Series {
         ChunkExpandAtIndex::new_from_index(&self.0, index, length).into_series()
     }
 
-    fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
-        self.0.cast(data_type)
-    }
-
-    fn get(&self, index: usize) -> PolarsResult<AnyValue> {
-        self.0.get_any_value(index)
+    fn cast(&self, dtype: &DataType, options: CastOptions) -> PolarsResult<Series> {
+        self.0.cast_with_options(dtype, options)
     }
 
     #[inline]
@@ -214,8 +221,8 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
         self.0.null_count()
     }
 
-    fn has_validity(&self) -> bool {
-        self.0.has_validity()
+    fn has_nulls(&self) -> bool {
+        self.0.has_nulls()
     }
 
     #[cfg(feature = "algorithm_group_by")]
@@ -253,57 +260,110 @@ impl SeriesTrait for SeriesWrap<BooleanChunked> {
         ChunkShift::shift(&self.0, periods).into_series()
     }
 
-    fn _sum_as_series(&self) -> PolarsResult<Series> {
-        Ok(ChunkAggSeries::sum_as_series(&self.0))
+    fn sum_reduce(&self) -> PolarsResult<Scalar> {
+        Ok(ChunkAggSeries::sum_reduce(&self.0))
     }
-    fn max_as_series(&self) -> PolarsResult<Series> {
-        Ok(ChunkAggSeries::max_as_series(&self.0))
+    fn max_reduce(&self) -> PolarsResult<Scalar> {
+        Ok(ChunkAggSeries::max_reduce(&self.0))
     }
-    fn min_as_series(&self) -> PolarsResult<Series> {
-        Ok(ChunkAggSeries::min_as_series(&self.0))
+    fn min_reduce(&self) -> PolarsResult<Scalar> {
+        Ok(ChunkAggSeries::min_reduce(&self.0))
     }
-    fn median_as_series(&self) -> PolarsResult<Series> {
-        // first convert array to f32 as that's cheaper
-        // finally the single value to f64
-        Ok(self
+    fn median_reduce(&self) -> PolarsResult<Scalar> {
+        let ca = self
             .0
-            .cast(&DataType::Float32)
-            .unwrap()
-            .median_as_series()
-            .unwrap()
-            .cast(&DataType::Float64)
-            .unwrap())
+            .cast_with_options(&DataType::Int8, CastOptions::Overflowing)
+            .unwrap();
+        let sc = ca.median_reduce()?;
+        let v = sc.value().cast(&DataType::Float64);
+        Ok(Scalar::new(DataType::Float64, v))
     }
     /// Get the variance of the Series as a new Series of length 1.
-    fn var_as_series(&self, _ddof: u8) -> PolarsResult<Series> {
-        // first convert array to f32 as that's cheaper
-        // finally the single value to f64
-        Ok(self
+    fn var_reduce(&self, _ddof: u8) -> PolarsResult<Scalar> {
+        let ca = self
             .0
-            .cast(&DataType::Float32)
-            .unwrap()
-            .var_as_series(_ddof)
-            .unwrap()
-            .cast(&DataType::Float64)
-            .unwrap())
+            .cast_with_options(&DataType::Int8, CastOptions::Overflowing)
+            .unwrap();
+        let sc = ca.var_reduce(_ddof)?;
+        let v = sc.value().cast(&DataType::Float64);
+        Ok(Scalar::new(DataType::Float64, v))
     }
     /// Get the standard deviation of the Series as a new Series of length 1.
-    fn std_as_series(&self, _ddof: u8) -> PolarsResult<Series> {
-        // first convert array to f32 as that's cheaper
-        // finally the single value to f64
-        Ok(self
+    fn std_reduce(&self, _ddof: u8) -> PolarsResult<Scalar> {
+        let ca = self
             .0
-            .cast(&DataType::Float32)
-            .unwrap()
-            .std_as_series(_ddof)
-            .unwrap()
-            .cast(&DataType::Float64)
-            .unwrap())
+            .cast_with_options(&DataType::Int8, CastOptions::Overflowing)
+            .unwrap();
+        let sc = ca.std_reduce(_ddof)?;
+        let v = sc.value().cast(&DataType::Float64);
+        Ok(Scalar::new(DataType::Float64, v))
     }
+    fn and_reduce(&self) -> PolarsResult<Scalar> {
+        let dt = DataType::Boolean;
+        if self.0.null_count() > 0 {
+            return Ok(Scalar::new(dt, AnyValue::Null));
+        }
+
+        Ok(Scalar::new(
+            dt,
+            self.0
+                .downcast_iter()
+                .filter(|arr| !arr.is_empty())
+                .map(|arr| polars_compute::bitwise::BitwiseKernel::reduce_and(arr).unwrap())
+                .reduce(|a, b| a & b)
+                .map_or(AnyValue::Null, Into::into),
+        ))
+    }
+    fn or_reduce(&self) -> PolarsResult<Scalar> {
+        let dt = DataType::Boolean;
+        if self.0.null_count() > 0 {
+            return Ok(Scalar::new(dt, AnyValue::Null));
+        }
+
+        Ok(Scalar::new(
+            dt,
+            self.0
+                .downcast_iter()
+                .filter(|arr| !arr.is_empty())
+                .map(|arr| polars_compute::bitwise::BitwiseKernel::reduce_or(arr).unwrap())
+                .reduce(|a, b| a | b)
+                .map_or(AnyValue::Null, Into::into),
+        ))
+    }
+    fn xor_reduce(&self) -> PolarsResult<Scalar> {
+        let dt = DataType::Boolean;
+        if self.0.null_count() > 0 {
+            return Ok(Scalar::new(dt, AnyValue::Null));
+        }
+
+        Ok(Scalar::new(
+            dt,
+            self.0
+                .downcast_iter()
+                .filter(|arr| !arr.is_empty())
+                .map(|arr| polars_compute::bitwise::BitwiseKernel::reduce_xor(arr).unwrap())
+                .reduce(|a, b| a ^ b)
+                .map_or(AnyValue::Null, Into::into),
+        ))
+    }
+
+    #[cfg(feature = "approx_unique")]
+    fn approx_n_unique(&self) -> PolarsResult<IdxSize> {
+        Ok(ChunkApproxNUnique::approx_n_unique(&self.0))
+    }
+
     fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
         Arc::new(SeriesWrap(Clone::clone(&self.0)))
     }
     fn as_any(&self) -> &dyn Any {
         &self.0
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self as _
     }
 }

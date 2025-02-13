@@ -10,11 +10,8 @@ unsafe impl IntoSeries for DatetimeChunked {
 }
 
 impl private::PrivateSeriesNumeric for SeriesWrap<DatetimeChunked> {
-    fn bit_repr_is_large(&self) -> bool {
-        true
-    }
-    fn bit_repr_large(&self) -> UInt64Chunked {
-        self.0.bit_repr_large()
+    fn bit_repr(&self) -> Option<BitRepr> {
+        Some(self.0.to_bit_repr())
     }
 }
 
@@ -28,18 +25,11 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
     fn _dtype(&self) -> &DataType {
         self.0.dtype()
     }
-    fn _get_flags(&self) -> Settings {
+    fn _get_flags(&self) -> StatisticsFlags {
         self.0.get_flags()
     }
-    fn _set_flags(&mut self, flags: Settings) {
+    fn _set_flags(&mut self, flags: StatisticsFlags) {
         self.0.set_flags(flags)
-    }
-
-    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
-        self.0
-            .explode_by_offsets(offsets)
-            .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
-            .into_series()
     }
 
     #[cfg(feature = "zip_with")]
@@ -51,18 +41,29 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
         })
     }
 
-    fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
+    fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+        self.0.physical().into_total_eq_inner()
+    }
+    fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+        self.0.physical().into_total_ord_inner()
+    }
+
+    fn vec_hash(&self, random_state: PlRandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
         self.0.vec_hash(random_state, buf)?;
         Ok(())
     }
 
-    fn vec_hash_combine(&self, build_hasher: RandomState, hashes: &mut [u64]) -> PolarsResult<()> {
+    fn vec_hash_combine(
+        &self,
+        build_hasher: PlRandomState,
+        hashes: &mut [u64],
+    ) -> PolarsResult<()> {
         self.0.vec_hash_combine(build_hasher, hashes)?;
         Ok(())
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_min(&self, groups: &GroupsType) -> Series {
         self.0
             .agg_min(groups)
             .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
@@ -70,14 +71,14 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_max(&self, groups: &GroupsType) -> Series {
         self.0
             .agg_max(groups)
             .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
             .into_series()
     }
     #[cfg(feature = "algorithm_group_by")]
-    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
         // we cannot cast and dispatch as the inner type of the list would be incorrect
         self.0
             .agg_list(groups)
@@ -90,13 +91,13 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
             (DataType::Datetime(tu, tz), DataType::Datetime(tur, tzr)) => {
                 assert_eq!(tu, tur);
                 assert_eq!(tz, tzr);
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs.subtract(&rhs)?.into_duration(*tu).into_series())
             },
             (DataType::Datetime(tu, tz), DataType::Duration(tur)) => {
                 assert_eq!(tu, tur);
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs
                     .subtract(&rhs)?
@@ -110,7 +111,7 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
         match (self.dtype(), rhs.dtype()) {
             (DataType::Datetime(tu, tz), DataType::Duration(tur)) => {
                 assert_eq!(tu, tur);
-                let lhs = self.cast(&DataType::Int64).unwrap();
+                let lhs = self.cast(&DataType::Int64, CastOptions::NonStrict).unwrap();
                 let rhs = rhs.cast(&DataType::Int64).unwrap();
                 Ok(lhs
                     .add_to(&rhs)?
@@ -130,13 +131,13 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
         polars_bail!(opq = rem, self.dtype(), rhs.dtype());
     }
     #[cfg(feature = "algorithm_group_by")]
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsType> {
         self.0.group_tuples(multithreaded, sorted)
     }
 
     fn arg_sort_multiple(
         &self,
-        by: &[Series],
+        by: &[Column],
         options: &SortMultipleOptions,
     ) -> PolarsResult<IdxCa> {
         self.0.deref().arg_sort_multiple(by, options)
@@ -144,14 +145,14 @@ impl private::PrivateSeries for SeriesWrap<DatetimeChunked> {
 }
 
 impl SeriesTrait for SeriesWrap<DatetimeChunked> {
-    fn rename(&mut self, name: &str) {
+    fn rename(&mut self, name: PlSmallStr) {
         self.0.rename(name);
     }
 
-    fn chunk_lengths(&self) -> ChunkIdIter {
-        self.0.chunk_id()
+    fn chunk_lengths(&self) -> ChunkLenIter {
+        self.0.chunk_lengths()
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &PlSmallStr {
         self.0.name()
     }
 
@@ -172,6 +173,19 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
             .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
             .into_series()
     }
+    fn split_at(&self, offset: i64) -> (Series, Series) {
+        let (a, b) = self.0.split_at(offset);
+        (
+            a.into_datetime(self.0.time_unit(), self.0.time_zone().clone())
+                .into_series(),
+            b.into_datetime(self.0.time_unit(), self.0.time_zone().clone())
+                .into_series(),
+        )
+    }
+
+    fn _sum_as_f64(&self) -> f64 {
+        self.0._sum_as_f64()
+    }
 
     fn mean(&self) -> Option<f64> {
         self.0.mean()
@@ -183,15 +197,26 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), append);
-        let other = other.to_physical_repr();
-        self.0.append(other.as_ref().as_ref().as_ref());
-        Ok(())
+        let mut other = other.to_physical_repr().into_owned();
+        self.0
+            .append_owned(std::mem::take(other._get_inner_mut().as_mut()))
+    }
+    fn append_owned(&mut self, mut other: Series) -> PolarsResult<()> {
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append_owned(std::mem::take(
+            &mut other
+                ._get_inner_mut()
+                .as_any_mut()
+                .downcast_mut::<DatetimeChunked>()
+                .unwrap()
+                .0,
+        ))
     }
 
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
         polars_ensure!(self.0.dtype() == other.dtype(), extend);
         let other = other.to_physical_repr();
-        self.0.extend(other.as_ref().as_ref().as_ref());
+        self.0.extend(other.as_ref().as_ref().as_ref())?;
         Ok(())
     }
 
@@ -235,6 +260,7 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
     fn rechunk(&self) -> Series {
         self.0
             .rechunk()
+            .into_owned()
             .into_datetime(self.0.time_unit(), self.0.time_zone().clone())
             .into_series()
     }
@@ -246,23 +272,11 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
             .into_series()
     }
 
-    fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
-        match (data_type, self.0.time_unit()) {
-            (DataType::String, TimeUnit::Milliseconds) => {
-                Ok(self.0.to_string("%F %T%.3f")?.into_series())
-            },
-            (DataType::String, TimeUnit::Microseconds) => {
-                Ok(self.0.to_string("%F %T%.6f")?.into_series())
-            },
-            (DataType::String, TimeUnit::Nanoseconds) => {
-                Ok(self.0.to_string("%F %T%.9f")?.into_series())
-            },
-            _ => self.0.cast(data_type),
+    fn cast(&self, dtype: &DataType, cast_options: CastOptions) -> PolarsResult<Series> {
+        match dtype {
+            DataType::String => Ok(self.0.to_string("iso")?.into_series()),
+            _ => self.0.cast_with_options(dtype, cast_options),
         }
-    }
-
-    fn get(&self, index: usize) -> PolarsResult<AnyValue> {
-        self.0.get_any_value(index)
     }
 
     #[inline]
@@ -286,8 +300,8 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
         self.0.null_count()
     }
 
-    fn has_validity(&self) -> bool {
-        self.0.has_validity()
+    fn has_nulls(&self) -> bool {
+        self.0.has_nulls()
     }
 
     #[cfg(feature = "algorithm_group_by")]
@@ -334,38 +348,40 @@ impl SeriesTrait for SeriesWrap<DatetimeChunked> {
             .into_series()
     }
 
-    fn max_as_series(&self) -> PolarsResult<Series> {
-        Ok(self
-            .0
-            .max_as_series()
-            .into_datetime(self.0.time_unit(), self.0.time_zone().clone()))
+    fn max_reduce(&self) -> PolarsResult<Scalar> {
+        let sc = self.0.max_reduce();
+
+        Ok(Scalar::new(self.dtype().clone(), sc.value().clone()))
     }
 
-    fn min_as_series(&self) -> PolarsResult<Series> {
-        Ok(self
-            .0
-            .min_as_series()
-            .into_datetime(self.0.time_unit(), self.0.time_zone().clone()))
+    fn min_reduce(&self) -> PolarsResult<Scalar> {
+        let sc = self.0.min_reduce();
+
+        Ok(Scalar::new(self.dtype().clone(), sc.value().clone()))
     }
 
-    fn median_as_series(&self) -> PolarsResult<Series> {
-        Series::new(self.name(), &[self.median().map(|v| v as i64)]).cast(self.dtype())
+    fn median_reduce(&self) -> PolarsResult<Scalar> {
+        let av: AnyValue = self.median().map(|v| v as i64).into();
+        Ok(Scalar::new(self.dtype().clone(), av))
     }
 
-    fn quantile_as_series(
-        &self,
-        _quantile: f64,
-        _interpol: QuantileInterpolOptions,
-    ) -> PolarsResult<Series> {
-        Ok(Int32Chunked::full_null(self.name(), 1)
-            .cast(self.dtype())
-            .unwrap())
+    fn quantile_reduce(&self, _quantile: f64, _method: QuantileMethod) -> PolarsResult<Scalar> {
+        Ok(Scalar::new(self.dtype().clone(), AnyValue::Null))
     }
 
     fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
         Arc::new(SeriesWrap(Clone::clone(&self.0)))
     }
+
     fn as_any(&self) -> &dyn Any {
         &self.0
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self as _
     }
 }

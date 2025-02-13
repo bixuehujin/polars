@@ -3,25 +3,54 @@ mod warning;
 
 use std::borrow::Cow;
 use std::collections::TryReserveError;
+use std::convert::Infallible;
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Formatter, Write};
 use std::ops::Deref;
+use std::sync::{Arc, LazyLock};
 use std::{env, io};
+pub mod signals;
 
 pub use warning::*;
 
-#[derive(Debug)]
+enum ErrorStrategy {
+    Panic,
+    WithBacktrace,
+    Normal,
+}
+
+static ERROR_STRATEGY: LazyLock<ErrorStrategy> = LazyLock::new(|| {
+    if env::var("POLARS_PANIC_ON_ERR").as_deref() == Ok("1") {
+        ErrorStrategy::Panic
+    } else if env::var("POLARS_BACKTRACE_IN_ERR").as_deref() == Ok("1") {
+        ErrorStrategy::WithBacktrace
+    } else {
+        ErrorStrategy::Normal
+    }
+});
+
+#[derive(Debug, Clone)]
 pub struct ErrString(Cow<'static, str>);
+
+impl ErrString {
+    pub const fn new_static(s: &'static str) -> Self {
+        Self(Cow::Borrowed(s))
+    }
+}
 
 impl<T> From<T> for ErrString
 where
     T: Into<Cow<'static, str>>,
 {
     fn from(msg: T) -> Self {
-        if env::var("POLARS_PANIC_ON_ERR").as_deref().unwrap_or("") == "1" {
-            panic!("{}", msg.into())
-        } else {
-            ErrString(msg.into())
+        match &*ERROR_STRATEGY {
+            ErrorStrategy::Panic => panic!("{}", msg.into()),
+            ErrorStrategy::WithBacktrace => ErrString(Cow::Owned(format!(
+                "{}\n\nRust backtrace:\n{}",
+                msg.into(),
+                std::backtrace::Backtrace::force_capture()
+            ))),
+            ErrorStrategy::Normal => ErrString(msg.into()),
         }
     }
 }
@@ -46,32 +75,67 @@ impl Display for ErrString {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone)]
 pub enum PolarsError {
-    #[error("not found: {0}")]
     ColumnNotFound(ErrString),
-    #[error("{0}")]
     ComputeError(ErrString),
-    #[error("duplicate: {0}")]
     Duplicate(ErrString),
-    #[error("invalid operation: {0}")]
     InvalidOperation(ErrString),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error("no data: {0}")]
+    IO {
+        error: Arc<io::Error>,
+        msg: Option<ErrString>,
+    },
     NoData(ErrString),
-    #[error("{0}")]
     OutOfBounds(ErrString),
-    #[error("field not found: {0}")]
     SchemaFieldNotFound(ErrString),
-    #[error("{0}")]
     SchemaMismatch(ErrString),
-    #[error("lengths don't match: {0}")]
     ShapeMismatch(ErrString),
-    #[error("string caches don't match: {0}")]
+    SQLInterface(ErrString),
+    SQLSyntax(ErrString),
     StringCacheMismatch(ErrString),
-    #[error("field not found: {0}")]
     StructFieldNotFound(ErrString),
+    Context {
+        error: Box<PolarsError>,
+        msg: ErrString,
+    },
+}
+
+impl Error for PolarsError {}
+
+impl Display for PolarsError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use PolarsError::*;
+        match self {
+            ComputeError(msg)
+            | InvalidOperation(msg)
+            | OutOfBounds(msg)
+            | SchemaMismatch(msg)
+            | SQLInterface(msg)
+            | SQLSyntax(msg) => write!(f, "{msg}"),
+
+            ColumnNotFound(msg) => write!(f, "not found: {msg}"),
+            Duplicate(msg) => write!(f, "duplicate: {msg}"),
+            IO { error, msg } => match msg {
+                Some(m) => write!(f, "{m}"),
+                None => write!(f, "{error}"),
+            },
+            NoData(msg) => write!(f, "no data: {msg}"),
+            SchemaFieldNotFound(msg) => write!(f, "field not found: {msg}"),
+            ShapeMismatch(msg) => write!(f, "lengths don't match: {msg}"),
+            StringCacheMismatch(msg) => write!(f, "string caches don't match: {msg}"),
+            StructFieldNotFound(msg) => write!(f, "field not found: {msg}"),
+            Context { error, msg } => write!(f, "{error}: {msg}"),
+        }
+    }
+}
+
+impl From<io::Error> for PolarsError {
+    fn from(value: io::Error) -> Self {
+        PolarsError::IO {
+            error: Arc::new(value),
+            msg: None,
+        }
+    }
 }
 
 #[cfg(feature = "regex")]
@@ -84,10 +148,11 @@ impl From<regex::Error> for PolarsError {
 #[cfg(feature = "object_store")]
 impl From<object_store::Error> for PolarsError {
     fn from(err: object_store::Error) -> Self {
-        PolarsError::Io(std::io::Error::new(
+        std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("object-store error: {err:?}"),
-        ))
+        )
+        .into()
     }
 }
 
@@ -95,14 +160,6 @@ impl From<object_store::Error> for PolarsError {
 impl From<avro_schema::error::Error> for PolarsError {
     fn from(value: avro_schema::error::Error) -> Self {
         polars_err!(ComputeError: "avro-error: {}", value)
-    }
-}
-
-#[cfg(feature = "parquet2")]
-impl From<PolarsError> for parquet2::error::Error {
-    fn from(value: PolarsError) -> Self {
-        // catch all needed :(.
-        parquet2::error::Error::OutOfSpec(format!("error: {value}"))
     }
 }
 
@@ -124,17 +181,65 @@ impl From<TryReserveError> for PolarsError {
     }
 }
 
+impl From<Infallible> for PolarsError {
+    fn from(_: Infallible) -> Self {
+        unreachable!()
+    }
+}
+
 pub type PolarsResult<T> = Result<T, PolarsError>;
 
 impl PolarsError {
-    pub fn wrap_msg(&self, func: &dyn Fn(&str) -> String) -> Self {
+    pub fn context_trace(self) -> Self {
+        use PolarsError::*;
+        match self {
+            Context { error, msg } => {
+                // If context is 1 level deep, just return error.
+                if !matches!(&*error, PolarsError::Context { .. }) {
+                    return *error;
+                }
+                let mut current_error = &*error;
+                let material_error = error.get_err();
+
+                let mut messages = vec![&msg];
+
+                while let PolarsError::Context { msg, error } = current_error {
+                    current_error = error;
+                    messages.push(msg)
+                }
+
+                let mut bt = String::new();
+
+                let mut count = 0;
+                while let Some(msg) = messages.pop() {
+                    count += 1;
+                    writeln!(&mut bt, "\t[{count}] {}", msg).unwrap();
+                }
+                material_error.wrap_msg(move |msg| {
+                    format!("{msg}\n\nThis error occurred with the following context stack:\n{bt}")
+                })
+            },
+            err => err,
+        }
+    }
+
+    pub fn wrap_msg<F: FnOnce(&str) -> String>(&self, func: F) -> Self {
         use PolarsError::*;
         match self {
             ColumnNotFound(msg) => ColumnNotFound(func(msg).into()),
             ComputeError(msg) => ComputeError(func(msg).into()),
             Duplicate(msg) => Duplicate(func(msg).into()),
             InvalidOperation(msg) => InvalidOperation(func(msg).into()),
-            Io(err) => ComputeError(func(&format!("IO: {err}")).into()),
+            IO { error, msg } => {
+                let msg = match msg {
+                    Some(msg) => func(msg),
+                    None => func(&format!("{}", error)),
+                };
+                IO {
+                    error: error.clone(),
+                    msg: Some(msg.into()),
+                }
+            },
             NoData(msg) => NoData(func(msg).into()),
             OutOfBounds(msg) => OutOfBounds(func(msg).into()),
             SchemaFieldNotFound(msg) => SchemaFieldNotFound(func(msg).into()),
@@ -142,6 +247,24 @@ impl PolarsError {
             ShapeMismatch(msg) => ShapeMismatch(func(msg).into()),
             StringCacheMismatch(msg) => StringCacheMismatch(func(msg).into()),
             StructFieldNotFound(msg) => StructFieldNotFound(func(msg).into()),
+            SQLInterface(msg) => SQLInterface(func(msg).into()),
+            SQLSyntax(msg) => SQLSyntax(func(msg).into()),
+            Context { error, .. } => error.wrap_msg(func),
+        }
+    }
+
+    fn get_err(&self) -> &Self {
+        use PolarsError::*;
+        match self {
+            Context { error, .. } => error.get_err(),
+            err => err,
+        }
+    }
+
+    pub fn context(self, msg: ErrString) -> Self {
+        PolarsError::Context {
+            msg,
+            error: Box::new(self),
         }
     }
 }
@@ -193,6 +316,11 @@ macro_rules! polars_err {
             InvalidOperation: "{} operation not supported for dtype `{}`", $op, $arg
         )
     };
+    (op = $op:expr, $arg:expr, hint = $hint:literal) => {
+        $crate::polars_err!(
+            InvalidOperation: "{} operation not supported for dtype `{}`\n\nHint: {}", $op, $arg, $hint
+        )
+    };
     (op = $op:expr, $lhs:expr, $rhs:expr) => {
         $crate::polars_err!(
             InvalidOperation: "{} operation not supported for dtypes `{}` and `{}`", $op, $lhs, $rhs
@@ -209,6 +337,14 @@ macro_rules! polars_err {
     };
     (opq = $op:ident, $lhs:expr, $rhs:expr) => {
         $crate::polars_err!(op = stringify!($op), $lhs, $rhs)
+    };
+    (bigidx, ctx = $ctx:expr, size = $size:expr) => {
+        polars_err!(ComputeError: "\
+{} produces {} rows which is more than maximum allowed pow(2, 32) rows; \
+consider compiling with bigidx feature (polars-u64-idx package on python)",
+            $ctx,
+            $size,
+        )
     };
     (append) => {
         polars_err!(SchemaMismatch: "cannot append series, data types don't match")
@@ -243,7 +379,10 @@ Alternatively, if the performance cost is acceptable, you could just set:
 on startup."#.trim_start())
     };
     (duplicate = $name:expr) => {
-        polars_err!(Duplicate: "column with name '{}' has more than one occurrences", $name)
+        polars_err!(Duplicate: "column with name '{}' has more than one occurrence", $name)
+    };
+    (col_not_found = $name:expr) => {
+        polars_err!(ColumnNotFound: "{:?} not found", $name)
     };
     (oob = $idx:expr, $len:expr) => {
         polars_err!(OutOfBounds: "index {} is out of bounds for sequence of length {}", $idx, $len)
@@ -285,17 +424,16 @@ macro_rules! polars_ensure {
 pub fn to_compute_err(err: impl Display) -> PolarsError {
     PolarsError::ComputeError(err.to_string().into())
 }
-
 #[macro_export]
 macro_rules! feature_gated {
-    ($feature:expr, $content:expr) => {{
-        #[cfg(feature = $feature)]
+    ($($feature:literal);*, $content:expr) => {{
+        #[cfg(all($(feature = $feature),*))]
         {
             $content
         }
-        #[cfg(not(feature = $feature))]
+        #[cfg(not(all($(feature = $feature),*)))]
         {
-            panic!("activate '{}' feature", $feature)
+            panic!("activate '{}' feature", concat!($($feature, ", "),*))
         }
     }};
 }

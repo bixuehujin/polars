@@ -6,6 +6,8 @@ use polars_core::utils::arrow::types::NativeType;
 use polars_utils::index::check_bounds;
 
 pub trait ChunkedSet<T: Copy> {
+    /// Invariant for implementations: if the scatter() fails, typically because
+    /// of bad indexes, then self should remain unmodified.
     fn scatter<V>(self, idx: &[IdxSize], values: V) -> PolarsResult<Series>
     where
         V: IntoIterator<Item = Option<T>>;
@@ -37,6 +39,8 @@ impl PolarsOpsNumericType for Int8Type {}
 impl PolarsOpsNumericType for Int16Type {}
 impl PolarsOpsNumericType for Int32Type {}
 impl PolarsOpsNumericType for Int64Type {}
+#[cfg(feature = "dtype-i128")]
+impl PolarsOpsNumericType for Int128Type {}
 impl PolarsOpsNumericType for Float32Type {}
 impl PolarsOpsNumericType for Float64Type {}
 
@@ -88,7 +92,7 @@ unsafe fn scatter_impl<V, T: NativeType>(
     }
 }
 
-impl<T: PolarsOpsNumericType> ChunkedSet<T::Native> for ChunkedArray<T>
+impl<T: PolarsOpsNumericType> ChunkedSet<T::Native> for &mut ChunkedArray<T>
 where
     ChunkedArray<T>: IntoSeries,
 {
@@ -97,8 +101,8 @@ where
         V: IntoIterator<Item = Option<T::Native>>,
     {
         check_bounds(idx, self.len() as IdxSize)?;
-        let mut ca = self.rechunk();
-        drop(self);
+        let mut ca = std::mem::take(self);
+        ca.rechunk_mut();
 
         // SAFETY:
         // we will not modify the length
@@ -128,7 +132,7 @@ where
 
         // The null count may have changed - make sure to update the ChunkedArray
         let new_null_count = arr.null_count();
-        unsafe { ca.set_null_count(new_null_count.try_into().unwrap()) };
+        unsafe { ca.set_null_count(new_null_count) };
 
         Ok(ca.into_series())
     }
@@ -142,7 +146,7 @@ impl<'a> ChunkedSet<&'a str> for &'a StringChunked {
         check_bounds(idx, self.len() as IdxSize)?;
         check_sorted(idx)?;
         let mut ca_iter = self.into_iter().enumerate();
-        let mut builder = StringChunkedBuilder::new(self.name(), self.len());
+        let mut builder = StringChunkedBuilder::new(self.name().clone(), self.len());
 
         for (current_idx, current_value) in idx.iter().zip(values) {
             for (cnt_idx, opt_val_self) in &mut ca_iter {
@@ -171,7 +175,7 @@ impl ChunkedSet<bool> for &BooleanChunked {
         check_bounds(idx, self.len() as IdxSize)?;
         check_sorted(idx)?;
         let mut ca_iter = self.into_iter().enumerate();
-        let mut builder = BooleanChunkedBuilder::new(self.name(), self.len());
+        let mut builder = BooleanChunkedBuilder::new(self.name().clone(), self.len());
 
         for (current_idx, current_value) in idx.iter().zip(values) {
             for (cnt_idx, opt_val_self) in &mut ca_iter {

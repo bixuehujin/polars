@@ -55,7 +55,7 @@ pub fn business_day_count(
                     )
                 })
             } else {
-                Int32Chunked::full_null(start_dates.name(), start_dates.len())
+                Int32Chunked::full_null(start_dates.name().clone(), start_dates.len())
             }
         },
         (1, _) => {
@@ -70,7 +70,7 @@ pub fn business_day_count(
                     )
                 })
             } else {
-                Int32Chunked::full_null(start_dates.name(), end_dates.len())
+                Int32Chunked::full_null(start_dates.name().clone(), end_dates.len())
             }
         },
         _ => binary_elementwise_values(start_dates, end_dates, |start_date, end_date| {
@@ -157,7 +157,10 @@ pub fn add_business_days(
             let start_time = start
                 .cast(&DataType::Time)?
                 .cast(&DataType::Duration(*time_unit))?;
-            return Ok(result_date.cast(&DataType::Datetime(*time_unit, None))? + start_time);
+            return std::ops::Add::add(
+                result_date.cast(&DataType::Datetime(*time_unit, None))?,
+                start_time,
+            );
         },
         #[cfg(feature = "timezones")]
         DataType::Datetime(time_unit, Some(time_zone)) => {
@@ -177,8 +180,10 @@ pub fn add_business_days(
             let start_time = start_naive
                 .cast(&DataType::Time)?
                 .cast(&DataType::Duration(*time_unit))?;
-            let result_naive =
-                result_date.cast(&DataType::Datetime(*time_unit, None))? + start_time;
+            let result_naive = std::ops::Add::add(
+                result_date.cast(&DataType::Datetime(*time_unit, None))?,
+                start_time,
+            )?;
             let result_tz_aware = replace_time_zone(
                 result_naive.datetime().unwrap(),
                 Some(time_zone),
@@ -218,7 +223,7 @@ pub fn add_business_days(
                     ))
                 })?
             } else {
-                Int32Chunked::full_null(start_dates.name(), start_dates.len())
+                Int32Chunked::full_null(start_dates.name().clone(), start_dates.len())
             }
         },
         (1, _) => {
@@ -236,7 +241,7 @@ pub fn add_business_days(
                     )
                 })
             } else {
-                Int32Chunked::full_null(start_dates.name(), n.len())
+                Int32Chunked::full_null(start_dates.name().clone(), n.len())
             }
         },
         _ => try_binary_elementwise(start_dates, n, |opt_start_date, opt_n| {

@@ -1,12 +1,17 @@
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 import polars as pl
 import polars.selectors as cs
-from polars import PolarsDataType
 from polars.testing import assert_frame_equal, assert_series_equal
+
+if TYPE_CHECKING:
+    from polars._typing import PolarsDataType
 
 
 def test_simplify_expression_lit_true_4376() -> None:
@@ -24,7 +29,7 @@ def test_filter_contains_nth_11205() -> None:
     assert df.filter(pl.first()).is_empty()
 
 
-def test_melt_values_predicate_pushdown() -> None:
+def test_unpivot_values_predicate_pushdown() -> None:
     lf = pl.DataFrame(
         {
             "id": [1],
@@ -35,7 +40,7 @@ def test_melt_values_predicate_pushdown() -> None:
     ).lazy()
 
     assert (
-        lf.melt("id", ["asset_key_1", "asset_key_2", "asset_key_3"])
+        lf.unpivot(index="id", on=["asset_key_1", "asset_key_2", "asset_key_3"])
         .filter(pl.col("value") == pl.lit("123"))
         .collect()
     ).to_dict(as_series=False) == {
@@ -148,6 +153,7 @@ def test_binary_simplification_5971() -> None:
     ]
 
 
+@pytest.mark.usefixtures("test_global_and_local")
 def test_categorical_string_comparison_6283() -> None:
     scores = pl.DataFrame(
         {
@@ -252,7 +258,7 @@ def test_filter_horizontal_selector_15428() -> None:
     assert_frame_equal(df, expected_df)
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "dtype", [pl.Boolean, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.String]
 )
@@ -268,3 +274,57 @@ def test_filter(dtype: PolarsDataType, size: int, selectivity: float) -> None:
     reference = pl.Series(np_payload[np_mask]).cast(dtype)
     result = payload.filter(mask)
     assert_series_equal(reference, result)
+
+
+def test_filter_group_aware_17030() -> None:
+    df = pl.DataFrame({"foo": ["1", "2", "1", "2", "1", "2"]})
+
+    trim_col = "foo"
+    group_count = pl.col(trim_col).count().over(trim_col)
+    group_cum_count = pl.col(trim_col).cum_count().over(trim_col)
+    filter_expr = (
+        (group_count > 2) & (group_cum_count > 1) & (group_cum_count < group_count)
+    )
+    assert df.filter(filter_expr)["foo"].to_list() == ["1", "2"]
+
+
+def test_invalid_filter_18295() -> None:
+    codes = ["a"] * 5 + ["b"] * 5
+    values = list(range(-2, 3)) + list(range(2, -3, -1))
+    df = pl.DataFrame({"code": codes, "value": values})
+    with pytest.raises(pl.exceptions.ShapeError):
+        df.group_by("code").agg(
+            pl.col("value")
+            .ewm_mean(span=2, ignore_nulls=True)
+            .tail(3)
+            .filter(pl.col("value") > 0),
+        ).sort("code")
+
+
+def test_filter_19771() -> None:
+    q = pl.LazyFrame({"a": [None, None]})
+    assert q.filter(pl.lit(True)).collect()["a"].to_list() == [None, None]
+
+
+def test_filter_expand_20014() -> None:
+    n_rows = 1
+    date_list = [datetime(2000, 1, 1) + timedelta(days=x) for x in range(n_rows)]
+    df = pl.DataFrame(
+        {
+            "date": date_list,
+            "col1": [1],
+        }
+    )
+
+    df = df.with_columns(pl.col("date").dt.month().alias("month"))
+    assert (
+        df.lazy()
+        .filter(
+            pl.col("month") <= 6,
+            pl.col("date") >= pl.datetime(2000, 1, 1),
+            pl.col("date") <= pl.datetime(2020, 1, 1),
+        )
+        .explain(optimized=False)
+        .count("FILTER")
+        == 3
+    )

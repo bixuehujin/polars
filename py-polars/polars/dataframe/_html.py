@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import os
+import re
 from textwrap import dedent
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 from polars.dependencies import html
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from types import TracebackType
 
     from polars import DataFrame
+
+
+def replace_consecutive_spaces(s: str) -> str:
+    """Replace consecutive spaces with HTML non-breaking spaces."""
+    return re.sub(r"( {2,})", lambda match: "&nbsp;" * len(match.group(0)), s)
 
 
 class Tag:
@@ -22,7 +29,7 @@ class Tag:
         elements: list[str],
         tag: str,
         attributes: dict[str, str] | None = None,
-    ):
+    ) -> None:
         self.tag = tag
         self.elements = elements
         self.attributes = attributes
@@ -54,7 +61,7 @@ class HTMLFormatter:
         max_cols: int = 75,
         max_rows: int = 40,
         from_series: bool = False,
-    ):
+    ) -> None:
         self.df = df
         self.elements: list[str] = []
         self.max_cols = max_cols
@@ -107,7 +114,7 @@ class HTMLFormatter:
 
     def write_body(self) -> None:
         """Write the body of an HTML table."""
-        str_lengths = int(os.environ.get("POLARS_FMT_STR_LEN", "15"))
+        str_len_limit = int(os.environ.get("POLARS_FMT_STR_LEN", default=30))
         with Tag(self.elements, "tbody"):
             for r in self.row_idx:
                 with Tag(self.elements, "tr"):
@@ -118,7 +125,9 @@ class HTMLFormatter:
                             else:
                                 series = self.df[:, c]
                                 self.elements.append(
-                                    html.escape(series._s.get_fmt(r, str_lengths))
+                                    replace_consecutive_spaces(
+                                        html.escape(series._s.get_fmt(r, str_len_limit))
+                                    )
                                 )
 
     def write(self, inner: str) -> None:

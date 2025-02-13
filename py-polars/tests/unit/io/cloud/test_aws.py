@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable
 
 import boto3
 import pytest
@@ -11,9 +11,14 @@ import polars as pl
 from polars.testing import assert_frame_equal
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 pytestmark = [
+    pytest.mark.skip(
+        reason="Causes intermittent failures in CI. See: "
+        "https://github.com/pola-rs/polars/issues/16910"
+    ),
     pytest.mark.xdist_group("aws"),
     pytest.mark.slow(),
 ]
@@ -45,7 +50,7 @@ def s3_base(monkeypatch_module: Any) -> Iterator[str]:
     p.kill()
 
 
-@pytest.fixture()
+@pytest.fixture
 def s3(s3_base: str, io_files_path: Path) -> str:
     region = "us-east-1"
     client = boto3.client("s3", region_name=region, endpoint_url=s3_base)
@@ -59,15 +64,22 @@ def s3(s3_base: str, io_files_path: Path) -> str:
 
 @pytest.mark.parametrize(
     ("function", "extension"),
-    [(pl.read_csv, "csv"), (pl.read_ipc, "ipc")],
+    [
+        (pl.read_csv, "csv"),
+        (pl.read_ipc, "ipc"),
+    ],
 )
 def test_read_s3(s3: str, function: Callable[..., Any], extension: str) -> None:
+    storage_options = {"endpoint_url": s3}
     df = function(
         f"s3://bucket/foods1.{extension}",
-        storage_options={"endpoint_url": s3},
+        storage_options=storage_options,
     )
     assert df.columns == ["category", "calories", "fats_g", "sugars_g"]
     assert df.shape == (27, 4)
+
+    # ensure we aren't modifying the original user dictionary (ref #15859)
+    assert storage_options == {"endpoint_url": s3}
 
 
 @pytest.mark.parametrize(
@@ -75,12 +87,12 @@ def test_read_s3(s3: str, function: Callable[..., Any], extension: str) -> None:
     [(pl.scan_ipc, "ipc"), (pl.scan_parquet, "parquet")],
 )
 def test_scan_s3(s3: str, function: Callable[..., Any], extension: str) -> None:
-    df = function(
+    lf = function(
         f"s3://bucket/foods1.{extension}",
         storage_options={"endpoint_url": s3},
     )
-    assert df.columns == ["category", "calories", "fats_g", "sugars_g"]
-    assert df.collect().shape == (27, 4)
+    assert lf.collect_schema().names() == ["category", "calories", "fats_g", "sugars_g"]
+    assert lf.collect().shape == (27, 4)
 
 
 def test_lazy_count_s3(s3: str) -> None:
@@ -88,6 +100,6 @@ def test_lazy_count_s3(s3: str) -> None:
         "s3://bucket/foods*.parquet", storage_options={"endpoint_url": s3}
     ).select(pl.len())
 
-    assert "FAST COUNT(*)" in lf.explain()
+    assert "FAST_COUNT" in lf.explain()
     expected = pl.DataFrame({"len": [54]}, schema={"len": pl.UInt32})
     assert_frame_equal(lf.collect(), expected)

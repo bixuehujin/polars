@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from functools import reduce
-from operator import or_
-from typing import TYPE_CHECKING, Callable, TypeVar
+from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 from warnings import warn
 
 import polars._reexport as pl
@@ -11,27 +9,24 @@ from polars._utils.various import find_stacklevel
 if TYPE_CHECKING:
     from polars import DataFrame, Expr, LazyFrame, Series
 
+
 __all__ = [
-    "register_expr_namespace",
     "register_dataframe_namespace",
+    "register_expr_namespace",
     "register_lazyframe_namespace",
     "register_series_namespace",
 ]
 
 # do not allow override of polars' own namespaces (as registered by '_accessors')
-_reserved_namespaces: set[str] = reduce(
-    or_,
-    (
-        cls._accessors  # type: ignore[attr-defined]
-        for cls in (pl.DataFrame, pl.Expr, pl.LazyFrame, pl.Series)
-    ),
+_reserved_namespaces: set[str] = set.union(
+    *(cls._accessors for cls in (pl.DataFrame, pl.Expr, pl.LazyFrame, pl.Series))
 )
 
 
 NS = TypeVar("NS")
 
 
-class NameSpace:
+class NameSpace(Generic[NS]):
     """Establish property-like namespace object for user-defined functionality."""
 
     def __init__(self, name: str, namespace: type[NS]) -> None:
@@ -81,15 +76,15 @@ def register_expr_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
 
     See Also
     --------
-    register_dataframe_namespace: Register functionality on a DataFrame.
-    register_lazyframe_namespace: Register functionality on a LazyFrame.
-    register_series_namespace: Register functionality on a Series.
+    register_dataframe_namespace : Register functionality on a DataFrame.
+    register_lazyframe_namespace : Register functionality on a LazyFrame.
+    register_series_namespace : Register functionality on a Series.
 
     Examples
     --------
     >>> @pl.api.register_expr_namespace("pow_n")
     ... class PowersOfN:
-    ...     def __init__(self, expr: pl.Expr):
+    ...     def __init__(self, expr: pl.Expr) -> None:
     ...         self._expr = expr
     ...
     ...     def next(self, p: int) -> pl.Expr:
@@ -134,15 +129,15 @@ def register_dataframe_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
 
     See Also
     --------
-    register_expr_namespace: Register functionality on an Expr.
-    register_lazyframe_namespace: Register functionality on a LazyFrame.
-    register_series_namespace: Register functionality on a Series.
+    register_expr_namespace : Register functionality on an Expr.
+    register_lazyframe_namespace : Register functionality on a LazyFrame.
+    register_series_namespace : Register functionality on a Series.
 
     Examples
     --------
     >>> @pl.api.register_dataframe_namespace("split")
     ... class SplitFrame:
-    ...     def __init__(self, df: pl.DataFrame):
+    ...     def __init__(self, df: pl.DataFrame) -> None:
     ...         self._df = df
     ...
     ...     def by_first_letter_of_column_names(self) -> list[pl.DataFrame]:
@@ -232,34 +227,33 @@ def register_lazyframe_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
 
     See Also
     --------
-    register_expr_namespace: Register functionality on an Expr.
-    register_dataframe_namespace: Register functionality on a DataFrame.
-    register_series_namespace: Register functionality on a Series.
+    register_expr_namespace : Register functionality on an Expr.
+    register_dataframe_namespace : Register functionality on a DataFrame.
+    register_series_namespace : Register functionality on a Series.
 
     Examples
     --------
     >>> @pl.api.register_lazyframe_namespace("types")
     ... class DTypeOperations:
-    ...     def __init__(self, ldf: pl.LazyFrame):
-    ...         self._ldf = ldf
+    ...     def __init__(self, lf: pl.LazyFrame) -> None:
+    ...         self._lf = lf
     ...
     ...     def split_by_column_dtypes(self) -> list[pl.LazyFrame]:
     ...         return [
-    ...             self._ldf.select(pl.col(tp))
-    ...             for tp in dict.fromkeys(self._ldf.dtypes)
+    ...             self._lf.select(pl.col(tp))
+    ...             for tp in dict.fromkeys(self._lf.collect_schema().dtypes())
     ...         ]
     ...
     ...     def upcast_integer_types(self) -> pl.LazyFrame:
-    ...         return self._ldf.with_columns(
+    ...         return self._lf.with_columns(
     ...             pl.col(tp).cast(pl.Int64) for tp in (pl.Int8, pl.Int16, pl.Int32)
     ...         )
     >>>
-    >>> ldf = pl.DataFrame(
+    >>> lf = pl.LazyFrame(
     ...     data={"a": [1, 2], "b": [3, 4], "c": [5.6, 6.7]},
     ...     schema=[("a", pl.Int16), ("b", pl.Int32), ("c", pl.Float32)],
-    ... ).lazy()
-    >>>
-    >>> ldf.collect()
+    ... )
+    >>> lf.collect()
     shape: (2, 3)
     ┌─────┬─────┬─────┐
     │ a   ┆ b   ┆ c   │
@@ -269,7 +263,7 @@ def register_lazyframe_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
     │ 1   ┆ 3   ┆ 5.6 │
     │ 2   ┆ 4   ┆ 6.7 │
     └─────┴─────┴─────┘
-    >>> ldf.types.upcast_integer_types().collect()
+    >>> lf.types.upcast_integer_types().collect()
     shape: (2, 3)
     ┌─────┬─────┬─────┐
     │ a   ┆ b   ┆ c   │
@@ -279,14 +273,13 @@ def register_lazyframe_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
     │ 1   ┆ 3   ┆ 5.6 │
     │ 2   ┆ 4   ┆ 6.7 │
     └─────┴─────┴─────┘
-    >>>
-    >>> ldf = pl.DataFrame(
+
+    >>> lf = pl.LazyFrame(
     ...     data=[["xx", 2, 3, 4], ["xy", 4, 5, 6], ["yy", 5, 6, 7], ["yz", 6, 7, 8]],
     ...     schema=["a1", "a2", "b1", "b2"],
     ...     orient="row",
-    ... ).lazy()
-    >>>
-    >>> ldf.collect()
+    ... )
+    >>> lf.collect()
     shape: (4, 4)
     ┌─────┬─────┬─────┬─────┐
     │ a1  ┆ a2  ┆ b1  ┆ b2  │
@@ -298,7 +291,7 @@ def register_lazyframe_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
     │ yy  ┆ 5   ┆ 6   ┆ 7   │
     │ yz  ┆ 6   ┆ 7   ┆ 8   │
     └─────┴─────┴─────┴─────┘
-    >>> pl.collect_all(ldf.types.split_by_column_dtypes())
+    >>> pl.collect_all(lf.types.split_by_column_dtypes())
     [shape: (4, 1)
     ┌─────┐
     │ a1  │
@@ -335,15 +328,15 @@ def register_series_namespace(name: str) -> Callable[[type[NS]], type[NS]]:
 
     See Also
     --------
-    register_expr_namespace: Register functionality on an Expr.
-    register_dataframe_namespace: Register functionality on a DataFrame.
-    register_lazyframe_namespace: Register functionality on a LazyFrame.
+    register_expr_namespace : Register functionality on an Expr.
+    register_dataframe_namespace : Register functionality on a DataFrame.
+    register_lazyframe_namespace : Register functionality on a LazyFrame.
 
     Examples
     --------
     >>> @pl.api.register_series_namespace("math")
     ... class MathShortcuts:
-    ...     def __init__(self, s: pl.Series):
+    ...     def __init__(self, s: pl.Series) -> None:
     ...         self._s = s
     ...
     ...     def square(self) -> pl.Series:

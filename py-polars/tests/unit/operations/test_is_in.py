@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import date
+from decimal import Decimal as D
+from typing import TYPE_CHECKING
 
 import pytest
 
 import polars as pl
 from polars import StringCache
+from polars.exceptions import ComputeError, InvalidOperationError
 from polars.testing import assert_frame_equal, assert_series_equal
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from polars._typing import PolarsDataType
 
 
 def test_struct_logical_is_in() -> None:
@@ -25,7 +34,6 @@ def test_struct_logical_is_in() -> None:
 
     s1 = df1.select(pl.struct(["x", "y"])).to_series()
     s2 = df2.select(pl.struct(["x", "y"])).to_series()
-
     assert s1.is_in(s2).to_list() == [False, False, True, True, True, True, True]
 
 
@@ -77,24 +85,13 @@ def test_is_in_struct() -> None:
 
 def test_is_in_null_prop() -> None:
     assert pl.Series([None], dtype=pl.Float32).is_in(pl.Series([42])).item() is None
-    assert (
-        pl.Series([{"a": None}], dtype=pl.Struct({"a": pl.Float32}))
-        .is_in(pl.Series([{"a": 42}]))
-        .item()
-        is None
-    )
-    with pytest.raises(
-        pl.InvalidOperationError,
-        match="`is_in` cannot check for Int64 values in Boolean data",
-    ):
-        _res = pl.Series([None], dtype=pl.Boolean).is_in(pl.Series([42])).item()
+    assert pl.Series([{"a": None}, None], dtype=pl.Struct({"a": pl.Float32})).is_in(
+        pl.Series([{"a": 42}])
+    ).to_list() == [False, None]
 
-    assert (
-        pl.Series([{"a": None}], dtype=pl.Struct({"a": pl.Boolean}))
-        .is_in(pl.Series([{"a": 42}]))
-        .item()
-        is None
-    )
+    assert pl.Series([{"a": None}, None], dtype=pl.Struct({"a": pl.Boolean})).is_in(
+        pl.Series([{"a": 42}])
+    ).to_list() == [False, None]
 
 
 def test_is_in_9070() -> None:
@@ -140,17 +137,19 @@ def test_is_in_series() -> None:
     assert df.select(pl.col("b").is_in([])).to_series().to_list() == [False] * df.height
 
     with pytest.raises(
-        pl.InvalidOperationError,
-        match=r"`is_in` cannot check for String values in Int64 data",
+        InvalidOperationError,
+        match=r"'is_in' cannot check for String values in Int64 data",
     ):
         df.select(pl.col("b").is_in(["x", "x"]))
 
     # check we don't shallow-copy and accidentally modify 'a' (see: #10072)
     a = pl.Series("a", [1, 2])
     b = pl.Series("b", [1, 3]).is_in(a)
+    c = pl.Series("c", [1, 3]).is_in(a.to_frame())  # type: ignore[arg-type]
 
     assert a.name == "a"
     assert_series_equal(b, pl.Series("b", [True, False]))
+    assert_series_equal(c, pl.Series("c", [True, False]))
 
 
 def test_is_in_null() -> None:
@@ -160,13 +159,22 @@ def test_is_in_null() -> None:
     assert_series_equal(result, expected)
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_is_in_invalid_shape() -> None:
-    with pytest.raises(pl.ComputeError):
+    with pytest.raises(ComputeError):
         pl.Series("a", [1, 2, 3]).is_in([[]])
 
 
+@pytest.mark.may_fail_auto_streaming
+def test_is_in_list_rhs() -> None:
+    assert_series_equal(
+        pl.Series([1, 2, 3, 4, 5]).is_in([[1], [2, 9], [None], None, None]),
+        pl.Series([True, True, False, False, False]),
+    )
+
+
 @pytest.mark.parametrize("dtype", [pl.Float32, pl.Float64])
-def test_is_in_float(dtype: pl.PolarsDataType) -> None:
+def test_is_in_float(dtype: PolarsDataType) -> None:
     s = pl.Series([float("nan"), 0.0], dtype=dtype)
     result = s.is_in([-0.0, -float("nan")])
     expected = pl.Series([True, True], dtype=pl.Boolean)
@@ -197,12 +205,12 @@ def test_is_in_float(dtype: pl.PolarsDataType) -> None:
         (
             pl.DataFrame({"a": ["1", "2"], "b": [[1, 2], [3, 4]]}),
             None,
-            r"`is_in` cannot check for String values in List\(Int64\) data",
+            r"'is_in' cannot check for String values in List\(Int64\) data",
         ),
         (
             pl.DataFrame({"a": [date.today(), None], "b": [[1, 2], [3, 4]]}),
             None,
-            r"`is_in` cannot check for Date values in List\(Int64\) data",
+            r"'is_in' cannot check for Date values in List\(Int64\) data",
         ),
     ],
 )
@@ -213,7 +221,7 @@ def test_is_in_expr_list_series(
     if matches:
         assert df.select(expr_is_in).to_series().to_list() == matches
     else:
-        with pytest.raises(pl.InvalidOperationError, match=expected_error):
+        with pytest.raises(InvalidOperationError, match=expected_error):
             df.select(expr_is_in)
 
 
@@ -315,6 +323,7 @@ def test_is_in_with_wildcard_13809() -> None:
 
 
 @pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c", "d"])])
+@pytest.mark.may_fail_auto_streaming
 def test_cat_is_in_from_str(dtype: pl.DataType) -> None:
     s = pl.Series(["c", "c", "b"], dtype=dtype)
 
@@ -326,6 +335,7 @@ def test_cat_is_in_from_str(dtype: pl.DataType) -> None:
 
 
 @pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c", "d"])])
+@pytest.mark.may_fail_auto_streaming
 def test_cat_list_is_in_from_cat(dtype: pl.DataType) -> None:
     df = pl.DataFrame(
         [
@@ -336,6 +346,7 @@ def test_cat_list_is_in_from_cat(dtype: pl.DataType) -> None:
             (["a"], "d"),
         ],
         schema={"li": pl.List(dtype), "x": dtype},
+        orient="row",
     )
     res = df.select(pl.col("li").list.contains(pl.col("x")))
     expected_df = pl.DataFrame({"li": [False, True, True, False, False]})
@@ -350,6 +361,7 @@ def test_cat_list_is_in_from_cat(dtype: pl.DataType) -> None:
         ("e", [False, False, False, None, False]),
     ],
 )
+@pytest.mark.may_fail_auto_streaming
 def test_cat_list_is_in_from_cat_single(val: str | None, expected: list[bool]) -> None:
     df = pl.Series(
         "li",
@@ -371,6 +383,7 @@ def test_cat_list_is_in_from_str() -> None:
             (["a"], "d"),
         ],
         schema={"li": pl.List(pl.Categorical), "x": pl.String},
+        orient="row",
     )
     res = df.select(pl.col("li").list.contains(pl.col("x")))
     expected_df = pl.DataFrame({"li": [False, True, True, False, False]})
@@ -394,3 +407,60 @@ def test_cat_list_is_in_from_single_str(val: str | None, expected: list[bool]) -
     res = df.select(pl.col("li").list.contains(pl.lit(val, dtype=pl.String)))
     expected_df = pl.DataFrame({"li": expected})
     assert_frame_equal(res, expected_df)
+
+
+def test_is_in_struct_enum_17618() -> None:
+    df = pl.DataFrame()
+    dtype = pl.Enum(categories=["HBS"])
+    df = df.insert_column(0, pl.Series("category", [], dtype=dtype))
+    assert df.filter(
+        pl.struct("category").is_in(
+            pl.Series(
+                [{"category": "HBS"}],
+                dtype=pl.Struct({"category": df["category"].dtype}),
+            )
+        )
+    ).shape == (0, 1)
+
+
+def test_is_in_decimal() -> None:
+    assert pl.DataFrame({"a": [D("0.0"), D("0.2"), D("0.1")]}).select(
+        pl.col("a").is_in([0.0, 0.1])
+    )["a"].to_list() == [True, False, True]
+    assert pl.DataFrame({"a": [D("0.0"), D("0.2"), D("0.1")]}).select(
+        pl.col("a").is_in([D("0.0"), D("0.1")])
+    )["a"].to_list() == [True, False, True]
+    assert pl.DataFrame({"a": [D("0.0"), D("0.2"), D("0.1")]}).select(
+        pl.col("a").is_in([1, 0, 2])
+    )["a"].to_list() == [True, False, False]
+
+
+def test_is_in_collection() -> None:
+    df = pl.DataFrame(
+        {
+            "lbl": ["aa", "bb", "cc", "dd", "ee"],
+            "val": [0, 1, 2, 3, 4],
+        }
+    )
+
+    class CustomCollection(Collection[int]):
+        def __init__(self, vals: Collection[int]) -> None:
+            super().__init__()
+            self.vals = vals
+
+        def __contains__(self, x: object) -> bool:
+            return x in self.vals
+
+        def __iter__(self) -> Iterator[int]:
+            yield from self.vals
+
+        def __len__(self) -> int:
+            return len(self.vals)
+
+    for constraint_values in (
+        {3, 2, 1},
+        frozenset({3, 2, 1}),
+        CustomCollection([3, 2, 1]),
+    ):
+        res = df.filter(pl.col("val").is_in(constraint_values))
+        assert set(res["lbl"]) == {"bb", "cc", "dd"}

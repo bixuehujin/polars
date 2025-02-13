@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
 
+use polars_core::config::verbose;
+use polars_utils::mmap::MemSlice;
+
 /// Trait used to get a hold to file handler or to the underlying bytes
 /// without performing a Read.
 pub trait MmapBytesReader: Read + Seek + Send + Sync {
@@ -20,6 +23,12 @@ impl MmapBytesReader for File {
 }
 
 impl MmapBytesReader for BufReader<File> {
+    fn to_file(&self) -> Option<&File> {
+        Some(self.get_ref())
+    }
+}
+
+impl MmapBytesReader for BufReader<&File> {
     fn to_file(&self) -> Option<&File> {
         Some(self.get_ref())
     }
@@ -57,8 +66,7 @@ impl<T: MmapBytesReader> MmapBytesReader for &mut T {
 // Handle various forms of input bytes
 pub enum ReaderBytes<'a> {
     Borrowed(&'a [u8]),
-    Owned(Vec<u8>),
-    Mapped(memmap::Mmap, &'a File),
+    Owned(MemSlice),
 }
 
 impl std::ops::Deref for ReaderBytes<'_> {
@@ -67,19 +75,44 @@ impl std::ops::Deref for ReaderBytes<'_> {
         match self {
             Self::Borrowed(ref_bytes) => ref_bytes,
             Self::Owned(vec) => vec,
-            Self::Mapped(mmap, _) => mmap,
         }
     }
 }
 
-impl<'a, T: 'a + MmapBytesReader> From<&'a T> for ReaderBytes<'a> {
-    fn from(m: &'a T) -> Self {
+/// There are some places that perform manual lifetime management after transmuting `ReaderBytes`
+/// to have a `'static` inner lifetime. The advantage to doing this is that it lets you construct a
+/// `MemSlice` from the `ReaderBytes` in a zero-copy manner regardless of the underlying enum
+/// variant.
+impl ReaderBytes<'static> {
+    /// Construct a `MemSlice` in a zero-copy manner from the underlying bytes, with the assumption
+    /// that the underlying bytes have a `'static` lifetime.
+    pub fn to_memslice(&self) -> MemSlice {
+        match self {
+            ReaderBytes::Borrowed(v) => MemSlice::from_static(v),
+            ReaderBytes::Owned(v) => v.clone(),
+        }
+    }
+}
+
+impl<'a, T: 'a + MmapBytesReader> From<&'a mut T> for ReaderBytes<'a> {
+    fn from(m: &'a mut T) -> Self {
         match m.to_bytes() {
-            Some(s) => ReaderBytes::Borrowed(s),
+            // , but somehow bchk doesn't see that lifetime is 'a.
+            Some(s) => {
+                let s = unsafe { std::mem::transmute::<&[u8], &'a [u8]>(s) };
+                ReaderBytes::Borrowed(s)
+            },
             None => {
-                let f = m.to_file().unwrap();
-                let mmap = unsafe { memmap::Mmap::map(f).unwrap() };
-                ReaderBytes::Mapped(mmap, f)
+                if let Some(f) = m.to_file() {
+                    ReaderBytes::Owned(MemSlice::from_file(f).unwrap())
+                } else {
+                    if verbose() {
+                        eprintln!("could not memory map file; read to buffer.")
+                    }
+                    let mut buf = vec![];
+                    m.read_to_end(&mut buf).expect("could not read");
+                    ReaderBytes::Owned(MemSlice::from_vec(buf))
+                }
             },
         }
     }

@@ -1,3 +1,5 @@
+use polars_ops::frame::JoinCoalesce;
+
 use super::*;
 
 fn get_csv_file() -> LazyFrame {
@@ -61,10 +63,7 @@ fn test_streaming_csv() -> PolarsResult<()> {
 
 #[test]
 fn test_streaming_glob() -> PolarsResult<()> {
-    let q = get_csv_glob();
-    let q = q.sort(["sugars_g"], Default::default());
-
-    assert_streaming_with_default(q, true, false);
+    assert_streaming_with_default(get_csv_glob(), true, false);
     Ok(())
 }
 
@@ -83,7 +82,7 @@ fn test_streaming_union_order() -> PolarsResult<()> {
 fn test_streaming_union_join() -> PolarsResult<()> {
     let q = get_csv_glob();
     let q = q.select([col("sugars_g"), col("calories")]);
-    let q = q.clone().cross_join(q);
+    let q = q.clone().cross_join(q, None);
 
     assert_streaming_with_default(q, true, true);
     Ok(())
@@ -102,7 +101,7 @@ fn test_streaming_multiple_keys_aggregate() -> PolarsResult<()> {
         ])
         .sort_by_exprs(
             [col("sugars_g"), col("calories")],
-            SortMultipleOptions::default().with_order_descendings([false, false]),
+            SortMultipleOptions::default().with_order_descending_multi([false, false]),
         );
 
     assert_streaming_with_default(q, true, false);
@@ -164,18 +163,22 @@ fn test_streaming_cross_join() -> PolarsResult<()> {
         "a" => [1 ,2, 3]
     ]?;
     let q = df.lazy();
-    let out = q.clone().cross_join(q).with_streaming(true).collect()?;
+    let out = q
+        .clone()
+        .cross_join(q, None)
+        .with_streaming(true)
+        .collect()?;
     assert_eq!(out.shape(), (9, 2));
 
     let q = get_parquet_file().with_projection_pushdown(false);
     let q1 = q
         .clone()
         .select([col("calories")])
-        .cross_join(q.clone())
+        .cross_join(q.clone(), None)
         .filter(col("calories").gt(col("calories_right")));
     let q2 = q1
         .select([all().name().suffix("_second")])
-        .cross_join(q)
+        .cross_join(q, None)
         .filter(col("calories_right_second").lt(col("calories")))
         .select([
             col("calories"),
@@ -258,13 +261,13 @@ fn test_streaming_left_join() -> PolarsResult<()> {
 #[cfg(feature = "cross_join")]
 fn test_streaming_slice() -> PolarsResult<()> {
     let vals = (0..100).collect::<Vec<_>>();
-    let s = Series::new("", vals);
+    let s = Series::new("".into(), vals);
     let lf_a = df![
         "a" => s
     ]?
     .lazy();
 
-    let q = lf_a.clone().cross_join(lf_a).slice(10, 20);
+    let q = lf_a.clone().cross_join(lf_a, None).slice(10, 20);
     let a = q.with_streaming(true).collect().unwrap();
     assert_eq!(a.shape(), (20, 2));
 
@@ -295,7 +298,8 @@ fn test_streaming_partial() -> PolarsResult<()> {
         .left_on([col("a")])
         .right_on([col("a")])
         .suffix("_foo")
-        .how(JoinType::Outer { coalesce: true })
+        .how(JoinType::Full)
+        .coalesce(JoinCoalesce::CoalesceColumns)
         .finish();
 
     let q = q.left_join(
@@ -397,7 +401,7 @@ fn test_sort_maintain_order_streaming() -> PolarsResult<()> {
 }
 
 #[test]
-fn test_streaming_outer_join() -> PolarsResult<()> {
+fn test_streaming_full_outer_join() -> PolarsResult<()> {
     let lf_left = df![
          "a"=> [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
         "b"=> [0, 0, 0, 3, 0, 1, 3, 3, 3, 1, 4, 4, 2, 1, 1, 3, 1, 4, 2, 2],
@@ -411,7 +415,7 @@ fn test_streaming_outer_join() -> PolarsResult<()> {
     .lazy();
 
     let q = lf_left
-        .outer_join(lf_right, col("a"), col("a"))
+        .full_join(lf_right, col("a"), col("a"))
         .sort_by_exprs([all()], SortMultipleOptions::default());
 
     // Toggle so that the join order is swapped.

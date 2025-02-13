@@ -73,8 +73,8 @@ def test_streaming_sort_multiple_columns_logical_types() -> None:
     assert_frame_equal(result, expected)
 
 
-@pytest.mark.write_disk()
-@pytest.mark.slow()
+@pytest.mark.write_disk
+@pytest.mark.slow
 def test_ooc_sort(tmp_path: Path, monkeypatch: Any) -> None:
     tmp_path.mkdir(exist_ok=True)
     monkeypatch.setenv("POLARS_TEMP_DIR", str(tmp_path))
@@ -92,8 +92,8 @@ def test_ooc_sort(tmp_path: Path, monkeypatch: Any) -> None:
         assert_series_equal(out, s.sort(descending=descending))
 
 
-@pytest.mark.debug()
-@pytest.mark.write_disk()
+@pytest.mark.debug
+@pytest.mark.write_disk
 @pytest.mark.parametrize("spill_source", [True, False])
 def test_streaming_sort(
     tmp_path: Path, monkeypatch: Any, capfd: Any, spill_source: bool
@@ -119,7 +119,7 @@ def test_streaming_sort(
         assert "PARTITIONED FORCE SPILLED" in err
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 @pytest.mark.parametrize("spill_source", [True, False])
 def test_out_of_core_sort_9503(
     tmp_path: Path, monkeypatch: Any, spill_source: bool
@@ -138,7 +138,7 @@ def test_out_of_core_sort_9503(
     # ensure we create many chunks
     # this will ensure we create more files
     # and that creates contention while dumping
-    q = pl.concat(
+    df = pl.concat(
         [
             pl.DataFrame(
                 [
@@ -149,12 +149,14 @@ def test_out_of_core_sort_9503(
             for _ in range(num_tables)
         ],
         rechunk=False,
-    ).lazy()
-    q = q.sort(q.columns)
-    df = q.collect(streaming=True)
-    assert df.shape == (1_000_000, 2)
-    assert df["column_0"].flags["SORTED_ASC"]
-    assert df.head(20).to_dict(as_series=False) == {
+    )
+    lf = df.lazy()
+
+    result = lf.sort(df.columns).collect(streaming=True)
+
+    assert result.shape == (1_000_000, 2)
+    assert result["column_0"].flags["SORTED_ASC"]
+    assert result.head(20).to_dict(as_series=False) == {
         "column_0": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         "column_1": [
             242,
@@ -181,8 +183,8 @@ def test_out_of_core_sort_9503(
     }
 
 
-@pytest.mark.write_disk()
-@pytest.mark.slow()
+@pytest.mark.write_disk
+@pytest.mark.slow
 def test_streaming_sort_multiple_columns(
     str_ints_df: pl.DataFrame, tmp_path: Path, monkeypatch: Any, capfd: Any
 ) -> None:

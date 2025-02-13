@@ -11,7 +11,7 @@ class ExprNameNameSpace:
 
     _accessor = "name"
 
-    def __init__(self, expr: Expr):
+    def __init__(self, expr: Expr) -> None:
         self._from_pyexpr = expr._from_pyexpr
         self._pyexpr = expr._pyexpr
 
@@ -286,63 +286,78 @@ class ExprNameNameSpace:
 
     def map_fields(self, function: Callable[[str], str]) -> Expr:
         """
-        Rename fields of a struct by mapping a function over the field name.
+        Rename fields of a struct by mapping a function over the field name(s).
 
         Notes
         -----
-        This only take effects for struct.
+        This only takes effect for struct columns.
 
         Parameters
         ----------
         function
             Function that maps a field name to a new name.
 
+        See Also
+        --------
+        prefix_fields
+        suffix_fields
+
         Examples
         --------
         >>> df = pl.DataFrame({"x": {"a": 1, "b": 2}})
         >>> df.select(pl.col("x").name.map_fields(lambda x: x.upper())).schema
-        OrderedDict({'x': Struct({'A': Int64, 'B': Int64})})
+        Schema({'x': Struct({'A': Int64, 'B': Int64})})
         """
         return self._from_pyexpr(self._pyexpr.name_map_fields(function))
 
     def prefix_fields(self, prefix: str) -> Expr:
         """
-        Add a prefix to all fields name of a struct.
+        Add a prefix to all field names of a struct.
 
         Notes
         -----
-        This only take effects for struct.
+        This only takes effect for struct columns.
 
         Parameters
         ----------
         prefix
-            Prefix to add to the filed name
+            Prefix to add to the field name.
+
+        See Also
+        --------
+        map_fields
+        suffix_fields
 
         Examples
         --------
         >>> df = pl.DataFrame({"x": {"a": 1, "b": 2}})
         >>> df.select(pl.col("x").name.prefix_fields("prefix_")).schema
-        OrderedDict({'x': Struct({'prefix_a': Int64, 'prefix_b': Int64})})
+        Schema({'x': Struct({'prefix_a': Int64, 'prefix_b': Int64})})
         """
         return self._from_pyexpr(self._pyexpr.name_prefix_fields(prefix))
 
     def suffix_fields(self, suffix: str) -> Expr:
         """
-        Add a suffix to all fields name of a struct.
+        Add a suffix to all field names of a struct.
 
         Notes
         -----
-        This only take effects for struct.
+        This only takes effect for struct columns.
 
         Parameters
         ----------
         suffix
-            Suffix to add to the filed name
+            Suffix to add to the field name.
+
+        See Also
+        --------
+        map_fields
+        prefix_fields
 
         Examples
         --------
         >>> df = pl.DataFrame({"x": {"a": 1, "b": 2}})
         >>> df.select(pl.col("x").name.suffix_fields("_suffix")).schema
-        OrderedDict({'x': Struct({'a_suffix': Int64, 'b_suffix': Int64})})
+        Schema({'x': Struct({'a_suffix': Int64, 'b_suffix': Int64})})
         """
         return self._from_pyexpr(self._pyexpr.name_suffix_fields(suffix))

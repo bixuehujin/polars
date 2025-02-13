@@ -1,18 +1,20 @@
 use std::any::Any;
 use std::borrow::Cow;
 
-use ahash::RandomState;
-
+use self::compare_inner::TotalOrdInner;
+use super::{BitRepr, StatisticsFlags};
+use crate::chunked_array::cast::CastOptions;
 use crate::chunked_array::object::PolarsObjectSafe;
 use crate::chunked_array::ops::compare_inner::{IntoTotalEqInner, TotalEqInner};
-use crate::chunked_array::Settings;
 use crate::prelude::*;
 use crate::series::implementations::SeriesWrap;
 use crate::series::private::{PrivateSeries, PrivateSeriesNumeric};
-#[cfg(feature = "chunked_ids")]
-use crate::series::IsSorted;
 
-impl<T: PolarsObject> PrivateSeriesNumeric for SeriesWrap<ObjectChunked<T>> {}
+impl<T: PolarsObject> PrivateSeriesNumeric for SeriesWrap<ObjectChunked<T>> {
+    fn bit_repr(&self) -> Option<BitRepr> {
+        None
+    }
+}
 
 impl<T> PrivateSeries for SeriesWrap<ObjectChunked<T>>
 where
@@ -20,7 +22,7 @@ where
 {
     fn get_list_builder(
         &self,
-        _name: &str,
+        _name: PlSmallStr,
         _values_capacity: usize,
         _list_capacity: usize,
     ) -> Box<dyn ListBuilderTrait> {
@@ -39,33 +41,40 @@ where
         self.0.dtype()
     }
 
-    fn _set_flags(&mut self, flags: Settings) {
+    fn _set_flags(&mut self, flags: StatisticsFlags) {
         self.0.set_flags(flags)
     }
-    fn _get_flags(&self) -> Settings {
+    fn _get_flags(&self) -> StatisticsFlags {
         self.0.get_flags()
     }
-    unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+    unsafe fn agg_list(&self, groups: &GroupsType) -> Series {
         self.0.agg_list(groups)
     }
 
     fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
         (&self.0).into_total_eq_inner()
     }
+    fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+        invalid_operation_panic!(into_total_ord_inner, self)
+    }
 
-    fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
+    fn vec_hash(&self, random_state: PlRandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
         self.0.vec_hash(random_state, buf)?;
         Ok(())
     }
 
-    fn vec_hash_combine(&self, build_hasher: RandomState, hashes: &mut [u64]) -> PolarsResult<()> {
+    fn vec_hash_combine(
+        &self,
+        build_hasher: PlRandomState,
+        hashes: &mut [u64],
+    ) -> PolarsResult<()> {
         self.0.vec_hash_combine(build_hasher, hashes)?;
         Ok(())
     }
 
     #[cfg(feature = "algorithm_group_by")]
-    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
-        IntoGroupsProxy::group_tuples(&self.0, multithreaded, sorted)
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsType> {
+        IntoGroupsType::group_tuples(&self.0, multithreaded, sorted)
     }
     #[cfg(feature = "zip_with")]
     fn zip_with_same_type(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
@@ -78,15 +87,15 @@ impl<T> SeriesTrait for SeriesWrap<ObjectChunked<T>>
 where
     T: PolarsObject,
 {
-    fn rename(&mut self, name: &str) {
+    fn rename(&mut self, name: PlSmallStr) {
         ObjectChunked::rename(&mut self.0, name)
     }
 
-    fn chunk_lengths(&self) -> ChunkIdIter {
-        ObjectChunked::chunk_id(&self.0)
+    fn chunk_lengths(&self) -> ChunkLenIter {
+        ObjectChunked::chunk_lengths(&self.0)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &PlSmallStr {
         ObjectChunked::name(&self.0)
     }
 
@@ -105,12 +114,18 @@ where
         ObjectChunked::slice(&self.0, offset, length).into_series()
     }
 
+    fn split_at(&self, offset: i64) -> (Series, Series) {
+        let (a, b) = ObjectChunked::split_at(&self.0, offset);
+        (a.into_series(), b.into_series())
+    }
+
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
-        if self.dtype() != other.dtype() {
-            polars_bail!(append);
-        }
-        ObjectChunked::append(&mut self.0, other.as_ref().as_ref());
-        Ok(())
+        polars_ensure!(self.dtype() == other.dtype(), append);
+        ObjectChunked::append(&mut self.0, other.as_ref().as_ref())
+    }
+    fn append_owned(&mut self, other: Series) -> PolarsResult<()> {
+        polars_ensure!(self.dtype() == other.dtype(), append);
+        ObjectChunked::append_owned(&mut self.0, other.take_inner())
     }
 
     fn extend(&mut self, _other: &Series) -> PolarsResult<()> {
@@ -122,11 +137,13 @@ where
     }
 
     fn take(&self, indices: &IdxCa) -> PolarsResult<Series> {
-        Ok(self.0.take(indices)?.into_series())
+        let ca = self.rechunk_object();
+        Ok(ca.take(indices)?.into_series())
     }
 
     unsafe fn take_unchecked(&self, indices: &IdxCa) -> Series {
-        self.0.take_unchecked(indices).into_series()
+        let ca = self.rechunk_object();
+        ca.take_unchecked(indices).into_series()
     }
 
     fn take_slice(&self, indices: &[IdxSize]) -> PolarsResult<Series> {
@@ -150,8 +167,8 @@ where
         ChunkExpandAtIndex::new_from_index(&self.0, index, length).into_series()
     }
 
-    fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
-        if matches!(data_type, DataType::Object(_, None)) {
+    fn cast(&self, dtype: &DataType, _cast_options: CastOptions) -> PolarsResult<Series> {
+        if matches!(dtype, DataType::Object(_, None)) {
             Ok(self.0.clone().into_series())
         } else {
             Err(PolarsError::ComputeError(
@@ -170,8 +187,8 @@ where
         ObjectChunked::null_count(&self.0)
     }
 
-    fn has_validity(&self) -> bool {
-        ObjectChunked::has_validity(&self.0)
+    fn has_nulls(&self) -> bool {
+        ObjectChunked::has_nulls(&self.0)
     }
 
     fn unique(&self) -> PolarsResult<Series> {
@@ -221,6 +238,14 @@ where
     fn as_any(&self) -> &dyn Any {
         &self.0
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.0
+    }
+
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self as _
+    }
 }
 
 #[cfg(test)]
@@ -236,7 +261,7 @@ mod test {
             }
         }
 
-        let ca = ObjectChunked::new_from_vec("a", vec![0i32, 1, 2]);
+        let ca = ObjectChunked::new_from_vec("a".into(), vec![0i32, 1, 2]);
         let s = ca.into_series();
 
         let ca = s.as_any().downcast_ref::<ObjectChunked<i32>>().unwrap();

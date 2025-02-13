@@ -64,6 +64,7 @@ fn test_groups_update_binary_shift_log() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "cum_agg")]
 fn test_expand_list() -> PolarsResult<()> {
     let out = df![
         "a" => [1, 2],
@@ -89,6 +90,15 @@ fn test_apply_groups_empty() -> PolarsResult<()> {
         "id" => [1, 1],
         "hi" => ["here", "here"]
     ]?;
+    let out = df
+        .clone()
+        .lazy()
+        .filter(col("id").eq(lit(2)))
+        .group_by([col("id")])
+        .agg([col("hi").drop_nulls().unique()])
+        .explain(true)
+        .unwrap();
+    println!("{}", out);
 
     let out = df
         .lazy()

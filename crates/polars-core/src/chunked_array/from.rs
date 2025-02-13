@@ -1,4 +1,4 @@
-use polars_error::constants::LENGTH_LIMIT_MSG;
+use arrow::compute::concatenate::concatenate_unchecked;
 
 use super::*;
 
@@ -6,7 +6,7 @@ use super::*;
 fn from_chunks_list_dtype(chunks: &mut Vec<ArrayRef>, dtype: DataType) -> DataType {
     // ensure we don't get List<null>
     let dtype = if let Some(arr) = chunks.get(0) {
-        arr.data_type().into()
+        DataType::from_arrow_dtype(arr.dtype())
     } else {
         dtype
     };
@@ -22,14 +22,14 @@ fn from_chunks_list_dtype(chunks: &mut Vec<ArrayRef>, dtype: DataType) -> DataTy
                 DataType::Categorical(None, _) | DataType::Enum(None, _)
             ) =>
         {
-            let array = concatenate_owned_unchecked(chunks).unwrap();
+            let array = concatenate_unchecked(chunks).unwrap();
             let list_arr = array.as_any().downcast_ref::<ListArray<i64>>().unwrap();
             let values_arr = list_arr.values();
             let cat = unsafe {
                 Series::_try_from_arrow_unchecked(
-                    "",
+                    PlSmallStr::EMPTY,
                     vec![values_arr.clone()],
-                    values_arr.data_type(),
+                    values_arr.dtype(),
                 )
                 .unwrap()
             };
@@ -54,14 +54,14 @@ fn from_chunks_list_dtype(chunks: &mut Vec<ArrayRef>, dtype: DataType) -> DataTy
                 DataType::Categorical(None, _) | DataType::Enum(None, _)
             ) =>
         {
-            let array = concatenate_owned_unchecked(chunks).unwrap();
+            let array = concatenate_unchecked(chunks).unwrap();
             let list_arr = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             let values_arr = list_arr.values();
             let cat = unsafe {
                 Series::_try_from_arrow_unchecked(
-                    "",
+                    PlSmallStr::EMPTY,
                     vec![values_arr.clone()],
-                    values_arr.data_type(),
+                    values_arr.dtype(),
                 )
                 .unwrap()
             };
@@ -71,6 +71,7 @@ fn from_chunks_list_dtype(chunks: &mut Vec<ArrayRef>, dtype: DataType) -> DataTy
             let arrow_dtype = FixedSizeListArray::default_datatype(ArrowDataType::UInt32, width);
             let new_array = FixedSizeListArray::new(
                 arrow_dtype,
+                values_arr.len(),
                 cat.array_ref(0).clone(),
                 list_arr.validity().cloned(),
             );
@@ -88,7 +89,7 @@ where
     A: Array,
 {
     fn from(arr: A) -> Self {
-        Self::with_chunk("", arr)
+        Self::with_chunk(PlSmallStr::EMPTY, arr)
     }
 }
 
@@ -96,7 +97,7 @@ impl<T> ChunkedArray<T>
 where
     T: PolarsDataType,
 {
-    pub fn with_chunk<A>(name: &str, arr: A) -> Self
+    pub fn with_chunk<A>(name: PlSmallStr, arr: A) -> Self
     where
         A: Array,
         T: PolarsDataType<Array = A>,
@@ -104,7 +105,15 @@ where
         unsafe { Self::from_chunks(name, vec![Box::new(arr)]) }
     }
 
-    pub fn from_chunk_iter<I>(name: &str, iter: I) -> Self
+    pub fn with_chunk_like<A>(ca: &Self, arr: A) -> Self
+    where
+        A: Array,
+        T: PolarsDataType<Array = A>,
+    {
+        Self::from_chunk_iter_like(ca, std::iter::once(arr))
+    }
+
+    pub fn from_chunk_iter<I>(name: PlSmallStr, iter: I) -> Self
     where
         I: IntoIterator,
         T: PolarsDataType<Array = <I as IntoIterator>::Item>,
@@ -127,10 +136,12 @@ where
             .into_iter()
             .map(|x| Box::new(x) as Box<dyn Array>)
             .collect();
-        unsafe { Self::from_chunks_and_dtype_unchecked(ca.name(), chunks, ca.dtype().clone()) }
+        unsafe {
+            Self::from_chunks_and_dtype_unchecked(ca.name().clone(), chunks, ca.dtype().clone())
+        }
     }
 
-    pub fn try_from_chunk_iter<I, A, E>(name: &str, iter: I) -> Result<Self, E>
+    pub fn try_from_chunk_iter<I, A, E>(name: PlSmallStr, iter: I) -> Result<Self, E>
     where
         I: IntoIterator<Item = Result<A, E>>,
         T: PolarsDataType<Array = A>,
@@ -165,25 +176,20 @@ where
             })
             .collect();
 
-        ChunkedArray {
-            field,
-            chunks,
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: length.try_into().expect(LENGTH_LIMIT_MSG),
-            null_count: null_count as IdxSize,
-        }
+        unsafe { ChunkedArray::new_with_dims(field, chunks, length, null_count) }
     }
 
     /// Create a new [`ChunkedArray`] from existing chunks.
     ///
     /// # Safety
     /// The Arrow datatype of all chunks must match the [`PolarsDataType`] `T`.
-    pub unsafe fn from_chunks(name: &str, mut chunks: Vec<ArrayRef>) -> Self {
+    pub unsafe fn from_chunks(name: PlSmallStr, mut chunks: Vec<ArrayRef>) -> Self {
         let dtype = match T::get_dtype() {
             dtype @ DataType::List(_) => from_chunks_list_dtype(&mut chunks, dtype),
             #[cfg(feature = "dtype-array")]
             dtype @ DataType::Array(_, _) => from_chunks_list_dtype(&mut chunks, dtype),
+            #[cfg(feature = "dtype-struct")]
+            dtype @ DataType::Struct(_) => from_chunks_list_dtype(&mut chunks, dtype),
             dt => dt,
         };
         Self::from_chunks_and_dtype(name, chunks, dtype)
@@ -192,25 +198,16 @@ where
     /// # Safety
     /// The Arrow datatype of all chunks must match the [`PolarsDataType`] `T`.
     pub unsafe fn with_chunks(&self, chunks: Vec<ArrayRef>) -> Self {
-        let field = self.field.clone();
-        let mut out = ChunkedArray {
-            field,
-            chunks,
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: 0,
-            null_count: 0,
-        };
-        out.compute_len();
-        out
+        ChunkedArray::new_with_compute_len(self.field.clone(), chunks)
     }
 
     /// Create a new [`ChunkedArray`] from existing chunks.
     ///
     /// # Safety
+    ///
     /// The Arrow datatype of all chunks must match the [`PolarsDataType`] `T`.
     pub unsafe fn from_chunks_and_dtype(
-        name: &str,
+        name: PlSmallStr,
         chunks: Vec<ArrayRef>,
         dtype: DataType,
     ) -> Self {
@@ -218,72 +215,33 @@ where
         // that check if the data types in the arrays are as expected
         #[cfg(debug_assertions)]
         {
-            if !chunks.is_empty() && dtype.is_primitive() {
-                assert_eq!(chunks[0].data_type(), &dtype.to_physical().to_arrow(true))
+            if !chunks.is_empty() && !chunks[0].is_empty() && dtype.is_primitive() {
+                assert_eq!(chunks[0].dtype(), &dtype.to_arrow(CompatLevel::newest()))
             }
         }
-        let field = Arc::new(Field::new(name, dtype));
-        let mut out = ChunkedArray {
-            field,
-            chunks,
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: 0,
-            null_count: 0,
-        };
-        out.compute_len();
-        out
+
+        Self::from_chunks_and_dtype_unchecked(name, chunks, dtype)
     }
 
-    /// Create a new ChunkedArray from self, where the chunks are replaced.
+    /// Create a new [`ChunkedArray`] from existing chunks.
     ///
     /// # Safety
-    /// The caller must ensure the dtypes of the chunks are correct
-    pub(crate) unsafe fn from_chunks_and_metadata(
-        chunks: Vec<ArrayRef>,
-        field: Arc<Field>,
-        bit_settings: Settings,
-        keep_sorted: bool,
-        keep_fast_explode: bool,
-    ) -> Self {
-        let mut out = ChunkedArray {
-            field,
-            chunks,
-            phantom: PhantomData,
-            bit_settings,
-            length: 0,
-            null_count: 0,
-        };
-        out.compute_len();
-        if !keep_sorted {
-            out.set_sorted_flag(IsSorted::Not);
-        }
-        if !keep_fast_explode {
-            out.unset_fast_explode_list()
-        }
-        out
-    }
-
+    ///
+    /// The Arrow datatype of all chunks must match the [`PolarsDataType`] `T`.
     pub(crate) unsafe fn from_chunks_and_dtype_unchecked(
-        name: &str,
+        name: PlSmallStr,
         chunks: Vec<ArrayRef>,
         dtype: DataType,
     ) -> Self {
         let field = Arc::new(Field::new(name, dtype));
-        let mut out = ChunkedArray {
-            field,
-            chunks,
-            phantom: PhantomData,
-            bit_settings: Default::default(),
-            length: 0,
-            null_count: 0,
-        };
-        out.compute_len();
-        out
+        ChunkedArray::new_with_compute_len(field, chunks)
     }
 
     pub fn full_null_like(ca: &Self, length: usize) -> Self {
-        let chunks = std::iter::once(T::Array::full_null(length, ca.dtype().to_arrow(true)));
+        let chunks = std::iter::once(T::Array::full_null(
+            length,
+            ca.dtype().to_arrow(CompatLevel::newest()),
+        ));
         Self::from_chunk_iter_like(ca, chunks)
     }
 }
@@ -293,21 +251,18 @@ where
     T: PolarsNumericType,
 {
     /// Create a new ChunkedArray by taking ownership of the Vec. This operation is zero copy.
-    pub fn from_vec(name: &str, v: Vec<T::Native>) -> Self {
+    pub fn from_vec(name: PlSmallStr, v: Vec<T::Native>) -> Self {
         Self::with_chunk(name, to_primitive::<T>(v, None))
     }
 
     /// Create a new ChunkedArray from a Vec and a validity mask.
-    pub fn from_vec_validity(name: &str, values: Vec<T::Native>, buffer: Option<Bitmap>) -> Self {
+    pub fn from_vec_validity(
+        name: PlSmallStr,
+        values: Vec<T::Native>,
+        buffer: Option<Bitmap>,
+    ) -> Self {
         let arr = to_array::<T>(values, buffer);
-        let mut out = ChunkedArray {
-            field: Arc::new(Field::new(name, T::get_dtype())),
-            chunks: vec![arr],
-            phantom: PhantomData,
-            ..Default::default()
-        };
-        out.compute_len();
-        out
+        ChunkedArray::new_with_compute_len(Arc::new(Field::new(name, T::get_dtype())), vec![arr])
     }
 
     /// Create a temporary [`ChunkedArray`] from a slice.
@@ -315,7 +270,7 @@ where
     /// # Safety
     /// The lifetime will be bound to the lifetime of the slice.
     /// This will not be checked by the borrowchecker.
-    pub unsafe fn mmap_slice(name: &str, values: &[T::Native]) -> Self {
+    pub unsafe fn mmap_slice(name: PlSmallStr, values: &[T::Native]) -> Self {
         Self::with_chunk(name, arrow::ffi::mmap::slice(values))
     }
 }
@@ -326,8 +281,43 @@ impl BooleanChunked {
     /// # Safety
     /// The lifetime will be bound to the lifetime of the slice.
     /// This will not be checked by the borrowchecker.
-    pub unsafe fn mmap_slice(name: &str, values: &[u8], offset: usize, len: usize) -> Self {
+    pub unsafe fn mmap_slice(name: PlSmallStr, values: &[u8], offset: usize, len: usize) -> Self {
         let arr = arrow::ffi::mmap::bitmap(values, offset, len).unwrap();
         Self::with_chunk(name, arr)
+    }
+
+    pub fn from_bitmap(name: PlSmallStr, bitmap: Bitmap) -> Self {
+        Self::with_chunk(
+            name,
+            BooleanArray::new(ArrowDataType::Boolean, bitmap, None),
+        )
+    }
+}
+
+impl<'a, T> From<&'a ChunkedArray<T>> for Vec<Option<T::Physical<'a>>>
+where
+    T: PolarsDataType,
+{
+    fn from(ca: &'a ChunkedArray<T>) -> Self {
+        let mut out = Vec::with_capacity(ca.len());
+        for arr in ca.downcast_iter() {
+            out.extend(arr.iter())
+        }
+        out
+    }
+}
+impl From<StringChunked> for Vec<Option<String>> {
+    fn from(ca: StringChunked) -> Self {
+        ca.iter().map(|opt| opt.map(|s| s.to_string())).collect()
+    }
+}
+
+impl From<BooleanChunked> for Vec<Option<bool>> {
+    fn from(ca: BooleanChunked) -> Self {
+        let mut out = Vec::with_capacity(ca.len());
+        for arr in ca.downcast_iter() {
+            out.extend(arr.iter())
+        }
+        out
     }
 }

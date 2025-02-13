@@ -1,13 +1,14 @@
-use polars_parquet::parquet::encoding::hybrid_rle::encode_bool;
+use polars_parquet::parquet::encoding::hybrid_rle::encode;
 use polars_parquet::parquet::encoding::Encoding;
-use polars_parquet::parquet::error::Result;
+use polars_parquet::parquet::error::ParquetResult;
 use polars_parquet::parquet::metadata::Descriptor;
 use polars_parquet::parquet::page::{DataPage, DataPageHeader, DataPageHeaderV1, Page};
-use polars_parquet::parquet::statistics::{serialize_statistics, BinaryStatistics, Statistics};
+use polars_parquet::parquet::statistics::BinaryStatistics;
 use polars_parquet::parquet::types::ord_binary;
 use polars_parquet::parquet::write::WriteOptions;
+use polars_parquet::parquet::CowBuffer;
 
-fn unzip_option(array: &[Option<Vec<u8>>]) -> Result<(Vec<u8>, Vec<u8>)> {
+fn unzip_option(array: &[Option<Vec<u8>>]) -> ParquetResult<(Vec<u8>, Vec<u8>)> {
     // leave the first 4 bytes announcing the length of the def level
     // this will be overwritten at the end, once the length is known.
     // This is unknown at this point because of the uleb128 encoding,
@@ -25,7 +26,7 @@ fn unzip_option(array: &[Option<Vec<u8>>]) -> Result<(Vec<u8>, Vec<u8>)> {
             false
         }
     });
-    encode_bool(&mut validity, iter)?;
+    encode::<bool, _, _>(&mut validity, iter, 1)?;
 
     // write the length, now that it is known
     let mut validity = validity.into_inner();
@@ -44,7 +45,7 @@ pub fn array_to_page_v1(
     array: &[Option<Vec<u8>>],
     options: &WriteOptions,
     descriptor: &Descriptor,
-) -> Result<Page> {
+) -> ParquetResult<Page> {
     let (values, mut buffer) = unzip_option(array)?;
 
     buffer.extend_from_slice(&values);
@@ -64,8 +65,8 @@ pub fn array_to_page_v1(
                 .flatten()
                 .min_by(|x, y| ord_binary(x, y))
                 .cloned(),
-        } as &dyn Statistics;
-        Some(serialize_statistics(statistics))
+        };
+        Some(statistics.serialize())
     } else {
         None
     };
@@ -80,8 +81,8 @@ pub fn array_to_page_v1(
 
     Ok(Page::Data(DataPage::new(
         DataPageHeader::V1(header),
-        buffer,
+        CowBuffer::Owned(buffer),
         descriptor.clone(),
-        Some(array.len()),
+        array.len(),
     )))
 }

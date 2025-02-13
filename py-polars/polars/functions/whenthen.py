@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 import polars._reexport as pl
-from polars._utils.parse_expr_input import parse_when_inputs
+from polars._utils.parse import parse_predicates_constraints_into_expression
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
 
 if TYPE_CHECKING:
-    from polars.type_aliases import IntoExprColumn
+    from collections.abc import Iterable
+
+    from polars._typing import IntoExprColumn
 
 
 def when(
@@ -142,5 +144,5 @@ def when(
     │ 4   ┆ 0   ┆ 99  │
     └─────┴─────┴─────┘
     """
-    condition = parse_when_inputs(*predicates, **constraints)
+    condition = parse_predicates_constraints_into_expression(*predicates, **constraints)
     return pl.When(plr.when(condition))

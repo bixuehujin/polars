@@ -136,7 +136,7 @@ fn test_parquet_statistics() -> PolarsResult<()> {
 
     // issue: 13427
     let out = scan_foods_parquet(par)
-        .filter(col("calories").is_in(lit(Series::new("", [0, 500]))))
+        .filter(col("calories").is_in(lit(Series::new("".into(), [0, 500]))))
         .collect()?;
     assert_eq!(out.shape(), (0, 4));
 
@@ -391,13 +391,15 @@ fn test_scan_parquet_limit_9001() {
         ..Default::default()
     };
     let q = LazyFrame::scan_parquet(path, args).unwrap().limit(3);
-    let (node, lp_arena, _) = q.to_alp_optimized().unwrap();
-    (&lp_arena).iter(node).all(|(_, lp)| match lp {
+    let IRPlan {
+        lp_top, lp_arena, ..
+    } = q.to_alp_optimized().unwrap();
+    (&lp_arena).iter(lp_top).all(|(_, lp)| match lp {
         IR::Union { options, .. } => {
             let sliced = options.slice.unwrap();
             sliced.1 == 3
         },
-        IR::Scan { file_options, .. } => file_options.n_rows == Some(3),
+        IR::Scan { file_options, .. } => file_options.slice == Some((0, 3)),
         _ => true,
     });
 }
@@ -415,8 +417,9 @@ fn test_ipc_globbing() -> PolarsResult<()> {
             cache: true,
             rechunk: false,
             row_index: None,
-            memory_map: true,
             cloud_options: None,
+            hive_options: Default::default(),
+            include_file_paths: None,
         },
     )?
     .collect()?;
@@ -449,13 +452,13 @@ fn test_csv_globbing() -> PolarsResult<()> {
     assert_eq!(cal.get(0)?, AnyValue::Int64(45));
     assert_eq!(cal.get(53)?, AnyValue::Int64(194));
 
-    let glob = "../../examples/datasets/*.csv";
+    let glob = "../../examples/datasets/foods*.csv";
     let lf = LazyCsvReader::new(glob).finish()?.slice(0, 100);
 
     let df = lf.clone().collect()?;
-    assert_eq!(df.shape(), (100, 4));
+    assert_eq!(df, full_df.slice(0, 100));
     let df = LazyCsvReader::new(glob).finish()?.slice(20, 60).collect()?;
-    assert!(full_df.slice(20, 60).equals(&df));
+    assert_eq!(df, full_df.slice(20, 60));
 
     let mut expr_arena = Arena::with_capacity(16);
     let mut lp_arena = Arena::with_capacity(8);
@@ -586,7 +589,7 @@ fn test_row_index_on_files() -> PolarsResult<()> {
     for offset in [0 as IdxSize, 10] {
         let lf = LazyCsvReader::new(FOODS_CSV)
             .with_row_index(Some(RowIndex {
-                name: "index".into(),
+                name: PlSmallStr::from_static("index"),
                 offset,
             }))
             .finish()?;
@@ -646,17 +649,41 @@ fn scan_predicate_on_set_null_values() -> PolarsResult<()> {
 }
 
 #[test]
-fn scan_anonymous_fn() -> PolarsResult<()> {
-    let function = Arc::new(|_scan_opts: AnonymousScanArgs| Ok(fruits_cars()));
+fn scan_anonymous_fn_with_options() -> PolarsResult<()> {
+    struct MyScan {}
+
+    impl AnonymousScan for MyScan {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn allows_projection_pushdown(&self) -> bool {
+            true
+        }
+
+        fn scan(&self, scan_opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
+            assert_eq!(scan_opts.with_columns.clone().unwrap().len(), 2);
+            assert_eq!(scan_opts.n_rows, Some(3));
+            let out = fruits_cars().select(scan_opts.with_columns.unwrap().iter().cloned())?;
+            Ok(out.slice(0, scan_opts.n_rows.unwrap()))
+        }
+    }
+
+    let function = Arc::new(MyScan {});
 
     let args = ScanArgsAnonymous {
-        schema: Some(Arc::new(fruits_cars().schema())),
+        schema: Some(fruits_cars().schema().clone()),
         ..ScanArgsAnonymous::default()
     };
 
-    let df = LazyFrame::anonymous_scan(function, args)?.collect()?;
+    let q = LazyFrame::anonymous_scan(function, args)?
+        .with_column((col("A") * lit(2)).alias("A2"))
+        .select([col("A2"), col("fruits")])
+        .limit(3);
 
-    assert_eq!(df.shape(), (5, 4));
+    let df = q.collect()?;
+
+    assert_eq!(df.shape(), (3, 2));
     Ok(())
 }
 
@@ -671,11 +698,11 @@ fn scan_small_dtypes() -> PolarsResult<()> {
     ];
     for dt in small_dt {
         let df = LazyCsvReader::new(FOODS_CSV)
-            .has_header(true)
-            .with_dtype_overwrite(Some(&Schema::from_iter([Field::new(
-                "sugars_g",
+            .with_has_header(true)
+            .with_dtype_overwrite(Some(Arc::new(Schema::from_iter([Field::new(
+                "sugars_g".into(),
                 dt.clone(),
-            )])))
+            )]))))
             .finish()?
             .select(&[col("sugars_g")])
             .collect()?;

@@ -1,77 +1,72 @@
 use arrow::array::*;
 use arrow::legacy::trusted_len::TrustedLenPush;
 use hashbrown::hash_map::Entry;
-use polars_utils::iter::EnumerateIdxTrait;
+use hashbrown::hash_table::{Entry as HTEntry, HashTable};
+use polars_utils::itertools::Itertools;
 
 use crate::hashing::_HASHMAP_INIT_SIZE;
 use crate::prelude::*;
 use crate::{using_string_cache, StringCache, POOL};
 
-// Wrap u32 key to avoid incorrect usage of hashmap with custom lookup
-#[repr(transparent)]
-struct KeyWrapper(u32);
-
 pub struct CategoricalChunkedBuilder {
     cat_builder: UInt32Vec,
-    name: String,
+    name: PlSmallStr,
     ordering: CategoricalOrdering,
     categories: MutablePlString,
-    // hashmap utilized by the local builder
-    local_mapping: PlHashMap<KeyWrapper, ()>,
+    local_mapping: HashTable<u32>,
+    local_hasher: PlRandomState,
 }
 
 impl CategoricalChunkedBuilder {
-    pub fn new(name: &str, capacity: usize, ordering: CategoricalOrdering) -> Self {
+    pub fn new(name: PlSmallStr, capacity: usize, ordering: CategoricalOrdering) -> Self {
         Self {
             cat_builder: UInt32Vec::with_capacity(capacity),
-            name: name.to_string(),
+            name,
             ordering,
             categories: MutablePlString::with_capacity(_HASHMAP_INIT_SIZE),
-            local_mapping: PlHashMap::with_capacity_and_hasher(
-                capacity / 10,
-                StringCache::get_hash_builder(),
-            ),
+            local_mapping: HashTable::with_capacity(capacity / 10),
+            local_hasher: StringCache::get_hash_builder(),
         }
     }
 
-    fn push_impl(&mut self, s: &str, h: u64) {
+    fn get_cat_idx(&mut self, s: &str, h: u64) -> (u32, bool) {
         let len = self.local_mapping.len() as u32;
 
-        // Custom hashing / equality functions for comparing the &str to the idx
         // SAFETY: index in hashmap are within bounds of categories
-        let r = unsafe {
-            self.local_mapping.raw_table_mut().find_or_find_insert_slot(
+        unsafe {
+            let r = self.local_mapping.entry(
                 h,
-                |(k, _)| self.categories.value_unchecked(k.0 as usize) == s,
-                |(k, _): &(KeyWrapper, ())| {
-                    StringCache::get_hash_builder()
-                        .hash_one(self.categories.value_unchecked(k.0 as usize))
+                |k| self.categories.value_unchecked(*k as usize) == s,
+                |k| {
+                    self.local_hasher
+                        .hash_one(self.categories.value_unchecked(*k as usize))
                 },
-            )
-        };
+            );
 
-        let idx = match r {
-            Ok(v) => {
-                // SAFETY: Bucket is initialized
-                unsafe { v.as_ref().0 .0 }
-            },
-            Err(e) => {
-                self.categories.push(Some(s));
-                // SAFETY: No mutations in hashmap since find_or_find_insert_slot call
-                unsafe {
-                    self.local_mapping
-                        .raw_table_mut()
-                        .insert_in_slot(h, e, (KeyWrapper(len), ()))
-                };
-                len
-            },
-        };
-        self.cat_builder.push(Some(idx));
+            match r {
+                HTEntry::Occupied(v) => (*v.get(), false),
+                HTEntry::Vacant(slot) => {
+                    self.categories.push(Some(s));
+                    slot.insert(len);
+                    (len, true)
+                },
+            }
+        }
+    }
+
+    /// Registers a value to a categorical index without pushing it.
+    /// Returns the index and if the value was new.
+    #[inline]
+    pub fn register_value(&mut self, s: &str) -> (u32, bool) {
+        let h = self.local_hasher.hash_one(s);
+        self.get_cat_idx(s, h)
     }
 
     #[inline]
     pub fn append_value(&mut self, s: &str) {
-        self.push_impl(s, self.local_mapping.hasher().hash_one(s))
+        let h = self.local_hasher.hash_one(s);
+        let idx = self.get_cat_idx(s, h).0;
+        self.cat_builder.push(Some(idx));
     }
 
     #[inline]
@@ -97,27 +92,27 @@ impl CategoricalChunkedBuilder {
     }
 
     /// Fast path for global categorical which preserves hashes and saves an allocation by
-    /// altering the keys in place
+    /// altering the keys in place.
     fn drain_iter_global_and_finish<'a, I>(&mut self, i: I) -> CategoricalChunked
     where
         I: IntoIterator<Item = Option<&'a str>>,
     {
         let iter = i.into_iter();
-        // Save hashes for later when inserting into the global hashmap
+        // Save hashes for later when inserting into the global hashmap.
         let mut hashes = Vec::with_capacity(_HASHMAP_INIT_SIZE);
         for s in self.categories.values_iter() {
-            hashes.push(self.local_mapping.hasher().hash_one(s));
+            hashes.push(self.local_hasher.hash_one(s));
         }
 
         for opt_s in iter {
-            let prev_len = self.local_mapping.len();
             match opt_s {
                 None => self.append_null(),
                 Some(s) => {
-                    let hash = self.local_mapping.hasher().hash_one(s);
-                    self.push_impl(s, hash);
-                    // We appended a value to the map
-                    if prev_len != self.local_mapping.len() {
+                    let hash = self.local_hasher.hash_one(s);
+                    let (cat_idx, new) = self.get_cat_idx(s, hash);
+                    self.cat_builder.push(Some(cat_idx));
+                    if new {
+                        // We appended a value to the map.
                         hashes.push(hash);
                     }
                 },
@@ -126,18 +121,18 @@ impl CategoricalChunkedBuilder {
 
         let categories = std::mem::take(&mut self.categories).freeze();
 
-        // we will create a mapping from our local categoricals to global categoricals
-        // and a mapping from global categoricals to our local categoricals
+        // We will create a mapping from our local categoricals to global categoricals
+        // and a mapping from global categoricals to our local categoricals.
         let mut local_to_global: Vec<u32> = Vec::with_capacity(categories.len());
         let (id, local_to_global) = crate::STRING_CACHE.apply(|cache| {
             for (s, h) in categories.values_iter().zip(hashes) {
-                // SAFETY: we allocated enough
+                // SAFETY: we allocated enough.
                 unsafe { local_to_global.push_unchecked(cache.insert_from_hash(h, s)) }
             }
             local_to_global
         });
 
-        // Change local indices inplace to their global counterparts
+        // Change local indices inplace to their global counterparts.
         let update_cats = || {
             if !local_to_global.is_empty() {
                 // when all categorical are null, `local_to_global` is empty and all cats physical values are 0.
@@ -157,7 +152,7 @@ impl CategoricalChunkedBuilder {
         );
 
         let indices = std::mem::take(&mut self.cat_builder).into();
-        let indices = UInt32Chunked::with_chunk(&self.name, indices);
+        let indices = UInt32Chunked::with_chunk(self.name.clone(), indices);
 
         // SAFETY: indices are in bounds of new rev_map
         unsafe {
@@ -167,8 +162,8 @@ impl CategoricalChunkedBuilder {
                 false,
                 self.ordering,
             )
+            .with_fast_unique(true)
         }
-        .with_fast_unique(true)
     }
 
     pub fn drain_iter_and_finish<'a, I>(mut self, i: I) -> CategoricalChunked
@@ -187,13 +182,13 @@ impl CategoricalChunkedBuilder {
         // SAFETY: keys and values are in bounds
         unsafe {
             CategoricalChunked::from_keys_and_values(
-                &self.name,
+                self.name.clone(),
                 &self.cat_builder.into(),
                 &self.categories.into(),
                 self.ordering,
             )
+            .with_fast_unique(true)
         }
-        .with_fast_unique(true)
     }
 }
 
@@ -202,7 +197,9 @@ fn fill_global_to_local(local_to_global: &[u32], global_to_local: &mut PlHashMap
     #[allow(clippy::explicit_counter_loop)]
     for global_idx in local_to_global {
         // we know the keys are unique so this is much faster
-        global_to_local.insert_unique_unchecked(*global_idx, local_idx);
+        unsafe {
+            global_to_local.insert_unique_unchecked(*global_idx, local_idx);
+        }
         local_idx += 1;
     }
 }
@@ -262,7 +259,7 @@ impl CategoricalChunked {
     }
 
     pub(crate) unsafe fn from_keys_and_values_global(
-        name: &str,
+        name: PlSmallStr,
         keys: impl IntoIterator<Item = Option<u32>> + Send,
         capacity: usize,
         values: &Utf8ViewArray,
@@ -308,7 +305,7 @@ impl CategoricalChunked {
     }
 
     pub(crate) unsafe fn from_keys_and_values_local(
-        name: &str,
+        name: PlSmallStr,
         keys: &PrimitiveArray<u32>,
         values: &Utf8ViewArray,
         ordering: CategoricalOrdering,
@@ -324,7 +321,7 @@ impl CategoricalChunked {
     /// # Safety
     /// The caller must ensure that index values in the `keys` are in within bounds of the `values` length.
     pub(crate) unsafe fn from_keys_and_values(
-        name: &str,
+        name: PlSmallStr,
         keys: &PrimitiveArray<u32>,
         values: &Utf8ViewArray,
         ordering: CategoricalOrdering,
@@ -363,8 +360,8 @@ impl CategoricalChunked {
                 .map(|opt_s: Option<&str>| opt_s.and_then(|s| map.get(s).copied()))
                 .collect_arr()
         });
-        let mut keys: UInt32Chunked = ChunkedArray::from_chunk_iter(values.name(), iter);
-        keys.rename(values.name());
+        let mut keys: UInt32Chunked = ChunkedArray::from_chunk_iter(values.name().clone(), iter);
+        keys.rename(values.name().clone());
         let rev_map = RevMapping::build_local(categories.clone());
         unsafe {
             Ok(CategoricalChunked::from_cats_and_rev_map_unchecked(
@@ -372,7 +369,8 @@ impl CategoricalChunked {
                 Arc::new(rev_map),
                 true,
                 ordering,
-            ))
+            )
+            .with_fast_unique(false))
         }
     }
 }
@@ -394,7 +392,7 @@ mod test {
             Some("foo"),
             Some("bar"),
         ];
-        let ca = StringChunked::new("a", slice);
+        let ca = StringChunked::new(PlSmallStr::from_static("a"), slice);
         let out = ca.cast(&DataType::Categorical(None, Default::default()))?;
         let out = out.categorical().unwrap().clone();
         assert_eq!(out.get_rev_map().len(), 2);
@@ -413,10 +411,10 @@ mod test {
         // Check that we don't panic if we append two categorical arrays
         // build under the same string cache
         // https://github.com/pola-rs/polars/issues/1115
-        let ca1 = StringChunked::new("a", slice)
+        let ca1 = StringChunked::new(PlSmallStr::from_static("a"), slice)
             .cast(&DataType::Categorical(None, Default::default()))?;
         let mut ca1 = ca1.categorical().unwrap().clone();
-        let ca2 = StringChunked::new("a", slice)
+        let ca2 = StringChunked::new(PlSmallStr::from_static("a"), slice)
             .cast(&DataType::Categorical(None, Default::default()))?;
         let ca2 = ca2.categorical().unwrap();
         ca1.append(ca2).unwrap();
@@ -436,8 +434,16 @@ mod test {
 
             // Use 2 builders to check if the global string cache
             // does not interfere with the index mapping
-            let builder1 = CategoricalChunkedBuilder::new("foo", 10, Default::default());
-            let builder2 = CategoricalChunkedBuilder::new("foo", 10, Default::default());
+            let builder1 = CategoricalChunkedBuilder::new(
+                PlSmallStr::from_static("foo"),
+                10,
+                Default::default(),
+            );
+            let builder2 = CategoricalChunkedBuilder::new(
+                PlSmallStr::from_static("foo"),
+                10,
+                Default::default(),
+            );
             let s = builder1
                 .drain_iter_and_finish(vec![None, Some("hello"), Some("vietnam")])
                 .into_series();

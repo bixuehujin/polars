@@ -1,26 +1,26 @@
+use polars_ops::series::SeriesMethods;
+
 use super::*;
 
-pub(super) fn ewm_mean_by(
-    s: &[Series],
-    half_life: Duration,
-    check_sorted: bool,
-) -> PolarsResult<Series> {
+pub(super) fn ewm_mean_by(s: &[Column], half_life: Duration) -> PolarsResult<Column> {
     let time_zone = match s[1].dtype() {
         DataType::Datetime(_, Some(time_zone)) => Some(time_zone.as_str()),
         _ => None,
     };
     polars_ensure!(!half_life.negative(), InvalidOperation: "half_life cannot be negative");
-    polars_ensure!(half_life.is_constant_duration(time_zone),
-        InvalidOperation: "expected `half_life` to be a constant duration \
-        (i.e. one independent of differing month durations or of daylight savings time), got {}.\n\
-        \n\
-        You may want to try:\n\
-        - using `'730h'` instead of `'1mo'`\n\
-        - using `'24h'` instead of `'1d'` if your series is time-zone-aware", half_life);
+    ensure_is_constant_duration(half_life, time_zone, "half_life")?;
     // `half_life` is a constant duration so we can safely use `duration_ns()`.
     let half_life = half_life.duration_ns();
     let values = &s[0];
     let times = &s[1];
-    let assume_sorted = !check_sorted || times.is_sorted_flag() == IsSorted::Ascending;
-    polars_ops::prelude::ewm_mean_by(values, times, half_life, assume_sorted)
+    let times_is_sorted = times
+        .as_materialized_series()
+        .is_sorted(Default::default())?;
+    polars_ops::prelude::ewm_mean_by(
+        values.as_materialized_series(),
+        times.as_materialized_series(),
+        half_life,
+        times_is_sorted,
+    )
+    .map(Column::from)
 }

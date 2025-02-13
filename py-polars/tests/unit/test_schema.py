@@ -1,712 +1,371 @@
-from __future__ import annotations
-
-from collections import OrderedDict
-from datetime import date, timedelta
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+import pickle
+from datetime import datetime
+from typing import Any
 
 import pytest
 
 import polars as pl
-from polars.testing import assert_frame_equal, assert_series_equal
-
-if TYPE_CHECKING:
-    from polars.type_aliases import PolarsDataType
+from polars.testing.asserts.frame import assert_frame_equal
 
 
-class CustomSchema(Mapping[str, Any]):
-    """Dummy schema object for testing compatibility with Mapping."""
+def test_schema() -> None:
+    s = pl.Schema({"foo": pl.Int8(), "bar": pl.String()})
 
-    _entries: dict[str, Any]
-
-    def __init__(self, **named_entries: Any) -> None:
-        self._items = OrderedDict(named_entries.items())
-
-    def __getitem__(self, key: str) -> Any:
-        return self._items[key]
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    def __iter__(self) -> Iterator[str]:
-        yield from self._items
-
-
-def test_custom_schema() -> None:
-    df = pl.DataFrame(schema=CustomSchema(bool=pl.Boolean, misc=pl.UInt8))
-    assert df.schema == OrderedDict([("bool", pl.Boolean), ("misc", pl.UInt8)])
-
-    with pytest.raises(ValueError):
-        pl.DataFrame(schema=CustomSchema(bool="boolean", misc="unsigned int"))
-
-
-def test_schema_on_agg() -> None:
-    df = pl.DataFrame({"a": ["x", "x", "y", "n"], "b": [1, 2, 3, 4]})
-
-    assert (
-        df.lazy()
-        .group_by("a")
-        .agg(
-            [
-                pl.col("b").min().alias("min"),
-                pl.col("b").max().alias("max"),
-                pl.col("b").sum().alias("sum"),
-                pl.col("b").first().alias("first"),
-                pl.col("b").last().alias("last"),
-            ]
-        )
-    ).schema == {
-        "a": pl.String,
-        "min": pl.Int64,
-        "max": pl.Int64,
-        "sum": pl.Int64,
-        "first": pl.Int64,
-        "last": pl.Int64,
-    }
-
-
-def test_fill_null_minimal_upcast_4056() -> None:
-    df = pl.DataFrame({"a": [-1, 2, None]})
-    df = df.with_columns(pl.col("a").cast(pl.Int8))
-    assert df.with_columns(pl.col(pl.Int8).fill_null(-1)).dtypes[0] == pl.Int8
-    assert df.with_columns(pl.col(pl.Int8).fill_null(-1000)).dtypes[0] == pl.Int32
-
-
-def test_fill_enum_upcast() -> None:
-    dtype = pl.Enum(["a", "b"])
-    s = pl.Series(["a", "b", None], dtype=dtype)
-    s_filled = s.fill_null("b")
-    expected = pl.Series(["a", "b", "b"], dtype=dtype)
-    assert s_filled.dtype == dtype
-    assert_series_equal(s_filled, expected)
-
-
-def test_pow_dtype() -> None:
-    df = pl.DataFrame(
-        {
-            "foo": [1, 2, 3, 4, 5],
-            "a": [1, 2, 3, 4, 5],
-            "b": [1, 2, 3, 4, 5],
-            "c": [1, 2, 3, 4, 5],
-            "d": [1, 2, 3, 4, 5],
-            "e": [1, 2, 3, 4, 5],
-            "f": [1, 2, 3, 4, 5],
-            "g": [1, 2, 1, 2, 1],
-            "h": [1, 2, 1, 2, 1],
-        },
-        schema_overrides={
-            "a": pl.Int64,
-            "b": pl.UInt64,
-            "c": pl.Int32,
-            "d": pl.UInt32,
-            "e": pl.Int16,
-            "f": pl.UInt16,
-            "g": pl.Int8,
-            "h": pl.UInt8,
-        },
-    ).lazy()
-
-    df = (
-        df.with_columns([pl.col("foo").cast(pl.UInt32)])
-        .with_columns(
-            [
-                (pl.col("foo") * 2**2).alias("scaled_foo"),
-                (pl.col("foo") * 2**2.1).alias("scaled_foo2"),
-                (pl.col("a") ** pl.col("h")).alias("a_pow_h"),
-                (pl.col("b") ** pl.col("h")).alias("b_pow_h"),
-                (pl.col("c") ** pl.col("h")).alias("c_pow_h"),
-                (pl.col("d") ** pl.col("h")).alias("d_pow_h"),
-                (pl.col("e") ** pl.col("h")).alias("e_pow_h"),
-                (pl.col("f") ** pl.col("h")).alias("f_pow_h"),
-                (pl.col("g") ** pl.col("h")).alias("g_pow_h"),
-                (pl.col("h") ** pl.col("h")).alias("h_pow_h"),
-            ]
-        )
-        .drop(["a", "b", "c", "d", "e", "f", "g", "h"])
-    )
-    expected = [
-        pl.UInt32,
-        pl.UInt32,
-        pl.Float64,
-        pl.Int64,
-        pl.UInt64,
-        pl.Int32,
-        pl.UInt32,
-        pl.Int16,
-        pl.UInt16,
-        pl.Int8,
-        pl.UInt8,
-    ]
-    assert df.collect().dtypes == expected
-    assert df.dtypes == expected
-
-
-def test_bool_numeric_supertype() -> None:
-    df = pl.DataFrame({"v": [1, 2, 3, 4, 5, 6]})
-    for dt in [
-        pl.UInt8,
-        pl.UInt16,
-        pl.UInt32,
-        pl.UInt64,
-        pl.Int8,
-        pl.Int16,
-        pl.Int32,
-        pl.Int64,
-    ]:
-        assert (
-            df.select([(pl.col("v") < 3).sum().cast(dt) / pl.len()]).item() - 0.3333333
-            <= 0.00001
-        )
-
-
-def test_with_context() -> None:
-    df_a = pl.DataFrame({"a": [1, 2, 3], "b": ["a", "c", None]}).lazy()
-    df_b = pl.DataFrame({"c": ["foo", "ham"]})
-
-    assert (
-        df_a.with_context(df_b.lazy()).select([pl.col("b") + pl.col("c").first()])
-    ).collect().to_dict(as_series=False) == {"b": ["afoo", "cfoo", None]}
-
-    with pytest.raises(pl.ComputeError):
-        (df_a.with_context(df_b.lazy()).select(["a", "c"])).collect()
-
-
-def test_from_dicts_nested_nulls() -> None:
-    assert pl.from_dicts([{"a": [None, None]}, {"a": [1, 2]}]).to_dict(
-        as_series=False
-    ) == {"a": [[None, None], [1, 2]]}
-
-
-def test_group_schema_err() -> None:
-    df = pl.DataFrame({"foo": [None, 1, 2], "bar": [1, 2, 3]}).lazy()
-    with pytest.raises(pl.ColumnNotFoundError):
-        df.group_by("not-existent").agg(pl.col("bar").max().alias("max_bar")).schema
-
-
-def test_schema_inference_from_rows() -> None:
-    # these have to upcast to float
-    result = pl.from_records([[1, 2.1, 3], [4, 5, 6.4]])
-    assert result.to_dict(as_series=False) == {
-        "column_0": [1.0, 2.1, 3.0],
-        "column_1": [4.0, 5.0, 6.4],
-    }
-
-    result = pl.from_dicts([{"a": 1, "b": 2}, {"a": 3.1, "b": 4.5}])
-    assert result.to_dict(as_series=False) == {
-        "a": [1.0, 3.1],
-        "b": [2.0, 4.5],
-    }
-
-
-def test_lazy_map_schema() -> None:
-    df = pl.DataFrame({"a": [1, 2, 3], "b": ["a", "b", "c"]})
-
-    # identity
-    assert_frame_equal(df.lazy().map_batches(lambda x: x).collect(), df)
-
-    def custom(df: pl.DataFrame) -> pl.Series:
-        return df["a"]
+    assert s["foo"] == pl.Int8()
+    assert s["bar"] == pl.String()
+    assert s.len() == 2
+    assert s.names() == ["foo", "bar"]
+    assert s.dtypes() == [pl.Int8(), pl.String()]
 
     with pytest.raises(
-        pl.ComputeError,
-        match="Expected 'LazyFrame.map' to return a 'DataFrame', got a",
+        TypeError,
+        match="dtypes must be fully-specified, got: List",
     ):
-        df.lazy().map_batches(custom).collect()  # type: ignore[arg-type]
-
-    def custom2(
-        df: pl.DataFrame,
-    ) -> pl.DataFrame:
-        # changes schema
-        return df.select(pl.all().cast(pl.String))
-
-    with pytest.raises(
-        pl.ComputeError,
-        match="The output schema of 'LazyFrame.map' is incorrect. Expected",
-    ):
-        df.lazy().map_batches(custom2).collect()
-
-    assert df.lazy().map_batches(
-        custom2, validate_output_schema=False
-    ).collect().to_dict(as_series=False) == {"a": ["1", "2", "3"], "b": ["a", "b", "c"]}
-
-
-def test_join_as_of_by_schema() -> None:
-    a = pl.DataFrame({"a": [1], "b": [2], "c": [3]}).lazy()
-    b = pl.DataFrame({"a": [1], "b": [2], "d": [4]}).lazy()
-    q = a.join_asof(b, on=pl.col("a").set_sorted(), by="b")
-    assert q.collect().columns == q.columns
-
-
-def test_unknown_map_elements() -> None:
-    df = pl.DataFrame(
-        {"Amount": [10, 1, 1, 5], "Flour": ["1000g", "100g", "50g", "75g"]}
-    )
-
-    q = df.lazy().select(
-        [
-            pl.col("Amount"),
-            pl.col("Flour").map_elements(lambda x: 100.0) / pl.col("Amount"),
-        ]
-    )
-
-    assert q.collect().to_dict(as_series=False) == {
-        "Amount": [10, 1, 1, 5],
-        "Flour": [10.0, 100.0, 100.0, 20.0],
-    }
-    assert q.dtypes == [pl.Int64, pl.Unknown]
-
-
-def test_remove_redundant_mapping_4668() -> None:
-    df = pl.DataFrame([["a"]] * 2, ["A", "B "]).lazy()
-    clean_name_dict = {x: " ".join(x.split()) for x in df.columns}
-    df = df.rename(clean_name_dict)
-    assert df.columns == ["A", "B"]
-
-
-def test_fold_all_schema() -> None:
-    df = pl.DataFrame(
-        {
-            "A": [1, 2, 3, 4, 5],
-            "fruits": ["banana", "banana", "apple", "apple", "banana"],
-            "B": [5, 4, 3, 2, 1],
-            "cars": ["beetle", "audi", "beetle", "beetle", "beetle"],
-            "optional": [28, 300, None, 2, -30],
-        }
-    )
-    # divide because of overflow
-    result = df.select(pl.sum_horizontal(pl.all().hash(seed=1) // int(1e8)))
-    assert result.dtypes == [pl.UInt64]
-
-
-def test_fill_null_static_schema_4843() -> None:
-    df1 = pl.DataFrame(
-        {
-            "a": [1, 2, None],
-            "b": [1, None, 4],
-        }
-    ).lazy()
-
-    df2 = df1.select([pl.col(pl.Int64).fill_null(0)])
-    df3 = df2.select(pl.col(pl.Int64))
-    assert df3.schema == {"a": pl.Int64, "b": pl.Int64}
-
-
-def test_shrink_dtype() -> None:
-    out = pl.DataFrame(
-        {
-            "a": [1, 2, 3],
-            "b": [1, 2, 2 << 32],
-            "c": [-1, 2, 1 << 30],
-            "d": [-112, 2, 112],
-            "e": [-112, 2, 129],
-            "f": ["a", "b", "c"],
-            "g": [0.1, 1.32, 0.12],
-            "h": [True, None, False],
-            "i": pl.Series([None, None, None], dtype=pl.UInt64),
-            "j": pl.Series([None, None, None], dtype=pl.Int64),
-            "k": pl.Series([None, None, None], dtype=pl.Float64),
-        }
-    ).select(pl.all().shrink_dtype())
-    assert out.dtypes == [
-        pl.Int8,
-        pl.Int64,
-        pl.Int32,
-        pl.Int8,
-        pl.Int16,
-        pl.String,
-        pl.Float32,
-        pl.Boolean,
-        pl.UInt8,
-        pl.Int8,
-        pl.Float32,
-    ]
-
-    assert out.to_dict(as_series=False) == {
-        "a": [1, 2, 3],
-        "b": [1, 2, 8589934592],
-        "c": [-1, 2, 1073741824],
-        "d": [-112, 2, 112],
-        "e": [-112, 2, 129],
-        "f": ["a", "b", "c"],
-        "g": [0.10000000149011612, 1.3200000524520874, 0.11999999731779099],
-        "h": [True, None, False],
-        "i": [None, None, None],
-        "j": [None, None, None],
-        "k": [None, None, None],
-    }
-
-
-def test_diff_duration_dtype() -> None:
-    data = ["2022-01-01", "2022-01-02", "2022-01-03", "2022-01-03"]
-    df = pl.Series("date", data).str.to_date("%Y-%m-%d").to_frame()
-
-    result = df.select(pl.col("date").diff() < pl.duration(days=1))
-
-    expected = pl.Series("date", [None, False, False, True]).to_frame()
-    assert_frame_equal(result, expected)
-
-
-def test_schema_owned_arithmetic_5669() -> None:
-    df = (
-        pl.DataFrame({"A": [1, 2, 3]})
-        .lazy()
-        .filter(pl.col("A") >= 3)
-        .with_columns(-pl.col("A").alias("B"))
-        .collect()
-    )
-    assert df.columns == ["A", "B"]
-    assert df.rows() == [(3, -3)]
-
-
-def test_fill_null_f32_with_lit() -> None:
-    # ensure the literal integer does not upcast the f32 to an f64
-    df = pl.DataFrame({"a": [1.1, 1.2]}, schema=[("a", pl.Float32)])
-    assert df.fill_null(value=0).dtypes == [pl.Float32]
-
-
-def test_lazy_rename() -> None:
-    df = pl.DataFrame({"x": [1], "y": [2]})
-
-    assert (
-        df.lazy().rename({"y": "x", "x": "y"}).select(["x", "y"]).collect()
-    ).to_dict(as_series=False) == {"x": [2], "y": [1]}
-
-
-def test_all_null_cast_5826() -> None:
-    df = pl.DataFrame(data=[pl.Series("a", [None], dtype=pl.String)])
-    out = df.with_columns(pl.col("a").cast(pl.Boolean))
-    assert out.dtypes == [pl.Boolean]
-    assert out.item() is None
-
-
-def test_empty_list_eval_schema_5734() -> None:
-    df = pl.DataFrame({"a": [[{"b": 1, "c": 2}]]})
-    assert df.filter(False).select(
-        pl.col("a").list.eval(pl.element().struct.field("b"))
-    ).schema == {"a": pl.List(pl.Int64)}
-
-
-def test_list_eval_type_cast_11188() -> None:
-    df = pl.DataFrame(
-        [
-            {"a": None},
-        ],
-        schema={"a": pl.List(pl.Int64)},
-    )
-    assert df.select(
-        pl.col("a").list.eval(pl.element().cast(pl.String)).alias("a_str")
-    ).schema == {"a_str": pl.List(pl.String)}
-
-
-def test_schema_true_divide_6643() -> None:
-    df = pl.DataFrame({"a": [1]})
-    a = pl.col("a")
-    assert df.lazy().select(a / 2).select(pl.col(pl.Int64)).collect().shape == (0, 0)
-
-
-def test_rename_schema_order_6660() -> None:
-    df = pl.DataFrame(
-        {
-            "a": [],
-            "b": [],
-            "c": [],
-            "d": [],
-        }
-    )
-
-    mapper = {"a": "1", "b": "2", "c": "3", "d": "4"}
-
-    renamed = df.lazy().rename(mapper)
-
-    computed = renamed.select([pl.all(), pl.col("4").alias("computed")])
-
-    assert renamed.schema == renamed.collect().schema
-    assert computed.schema == computed.collect().schema
-
-
-def test_from_dicts_all_cols_6716() -> None:
-    dicts = [{"a": None} for _ in range(20)] + [{"a": "crash"}]
-
-    with pytest.raises(
-        pl.ComputeError, match="make sure that all rows have the same schema"
-    ):
-        pl.from_dicts(dicts, infer_schema_length=20)
-    assert pl.from_dicts(dicts, infer_schema_length=None).dtypes == [pl.String]
-
-
-def test_from_dicts_empty() -> None:
-    with pytest.raises(pl.NoDataError, match="no data, cannot infer schema"):
-        pl.from_dicts([])
-
-
-def test_duration_division_schema() -> None:
-    df = pl.DataFrame({"a": [1]})
-    q = (
-        df.lazy()
-        .with_columns(pl.col("a").cast(pl.Duration))
-        .select(pl.col("a") / pl.col("a"))
-    )
-
-    assert q.schema == {"a": pl.Float64}
-    assert q.collect().to_dict(as_series=False) == {"a": [1.0]}
-
-
-def test_int_operator_stability() -> None:
-    for dt in pl.datatypes.INTEGER_DTYPES:
-        s = pl.Series(values=[10], dtype=dt)
-        assert pl.select(pl.lit(s) // 2).dtypes == [dt]
-        assert pl.select(pl.lit(s) + 2).dtypes == [dt]
-        assert pl.select(pl.lit(s) - 2).dtypes == [dt]
-        assert pl.select(pl.lit(s) * 2).dtypes == [dt]
-        assert pl.select(pl.lit(s) / 2).dtypes == [pl.Float64]
-
-
-def test_deep_subexpression_f32_schema_7129() -> None:
-    df = pl.DataFrame({"a": [1.1, 2.3, 3.4, 4.5]}, schema={"a": pl.Float32()})
-    assert df.with_columns(pl.col("a") - pl.col("a").median()).dtypes == [pl.Float32]
-    assert df.with_columns(
-        (pl.col("a") - pl.col("a").mean()) / (pl.col("a").std() + 0.001)
-    ).dtypes == [pl.Float32]
-
-
-def test_absence_off_null_prop_8224() -> None:
-    # a reminder to self to not do null propagation
-    # it is inconsistent and makes output dtype
-    # dependent of the data, big no!
-
-    def sub_col_min(column: str, min_column: str) -> pl.Expr:
-        return pl.col(column).sub(pl.col(min_column).min())
-
-    df = pl.DataFrame(
-        {
-            "group": [1, 1, 2, 2],
-            "vals_num": [10.0, 11.0, 12.0, 13.0],
-            "vals_partial": [None, None, 12.0, 13.0],
-            "vals_null": [None, None, None, None],
-        }
-    )
-
-    q = (
-        df.lazy()
-        .group_by("group")
-        .agg(
-            [
-                sub_col_min("vals_num", "vals_num").alias("sub_num"),
-                sub_col_min("vals_num", "vals_partial").alias("sub_partial"),
-                sub_col_min("vals_num", "vals_null").alias("sub_null"),
-            ]
-        )
-    )
-
-    assert q.collect().dtypes == [
-        pl.Int64,
-        pl.List(pl.Float64),
-        pl.List(pl.Float64),
-        pl.List(pl.Float64),
-    ]
+        pl.Schema({"foo": pl.String, "bar": pl.List})
 
 
 @pytest.mark.parametrize(
-    ("data", "expr", "expected_select", "expected_gb"),
+    "schema",
     [
-        (
-            {"x": ["x"], "y": ["y"]},
-            pl.coalesce(pl.col("x"), pl.col("y")),
-            {"x": pl.String},
-            {"x": pl.List(pl.String)},
-        ),
-        (
-            {"x": [True]},
-            pl.col("x").sum(),
-            {"x": pl.UInt32},
-            {"x": pl.UInt32},
+        pl.Schema(),
+        pl.Schema({"foo": pl.Int8()}),
+        pl.Schema({"foo": pl.Datetime("us"), "bar": pl.String()}),
+        pl.Schema(
+            {
+                "foo": pl.UInt32(),
+                "bar": pl.Categorical("physical"),
+                "baz": pl.Struct({"x": pl.Int64(), "y": pl.Float64()}),
+            }
         ),
     ],
 )
-def test_schemas(
-    data: dict[str, list[Any]],
-    expr: pl.Expr,
-    expected_select: dict[str, pl.PolarsDataType],
-    expected_gb: dict[str, pl.PolarsDataType],
-) -> None:
-    df = pl.DataFrame(data)
-
-    # test selection schema
-    schema = df.select(expr).schema
-    for key, dtype in expected_select.items():
-        assert schema[key] == dtype
-
-    # test group_by schema
-    schema = df.group_by(pl.lit(1)).agg(expr).schema
-    for key, dtype in expected_gb.items():
-        assert schema[key] == dtype
-
-
-def test_list_null_constructor_schema() -> None:
-    expected = pl.List(pl.Null)
-    assert pl.Series([[]]).dtype == expected
-    assert pl.Series([[]], dtype=pl.List).dtype == expected
-    assert pl.DataFrame({"a": [[]]}).dtypes[0] == expected
-    assert pl.DataFrame(schema={"a": pl.List}).dtypes[0] == expected
-
-
-def test_schema_ne_missing_9256() -> None:
-    df = pl.DataFrame({"a": [0, 1, None], "b": [True, False, True]})
-
-    assert df.select(pl.col("a").ne_missing(0).or_(pl.col("b")))["a"].all()
-
-
-def test_concat_vertically_relaxed() -> None:
-    a = pl.DataFrame(
-        data={"a": [1, 2, 3], "b": [True, False, None]},
-        schema={"a": pl.Int8, "b": pl.Boolean},
+def test_schema_empty_frame(schema: pl.Schema) -> None:
+    assert_frame_equal(
+        schema.to_frame(),
+        pl.DataFrame(schema=schema),
     )
-    b = pl.DataFrame(
-        data={"a": [43, 2, 3], "b": [32, 1, None]},
-        schema={"a": pl.Int16, "b": pl.Int64},
-    )
-    out = pl.concat([a, b], how="vertical_relaxed")
-    assert out.schema == {"a": pl.Int16, "b": pl.Int64}
-    assert out.to_dict(as_series=False) == {
-        "a": [1, 2, 3, 43, 2, 3],
-        "b": [1, 0, None, 32, 1, None],
-    }
-    out = pl.concat([b, a], how="vertical_relaxed")
-    assert out.schema == {"a": pl.Int16, "b": pl.Int64}
-    assert out.to_dict(as_series=False) == {
-        "a": [43, 2, 3, 1, 2, 3],
-        "b": [32, 1, None, 1, 0, None],
-    }
-
-    c = pl.DataFrame({"a": [1, 2], "b": [2, 1]})
-    d = pl.DataFrame({"a": [1.0, 0.2], "b": [None, 0.1]})
-
-    out = pl.concat([c, d], how="vertical_relaxed")
-    assert out.schema == {"a": pl.Float64, "b": pl.Float64}
-    assert out.to_dict(as_series=False) == {
-        "a": [1.0, 2.0, 1.0, 0.2],
-        "b": [2.0, 1.0, None, 0.1],
-    }
-    out = pl.concat([d, c], how="vertical_relaxed")
-    assert out.schema == {"a": pl.Float64, "b": pl.Float64}
-    assert out.to_dict(as_series=False) == {
-        "a": [1.0, 0.2, 1.0, 2.0],
-        "b": [None, 0.1, 2.0, 1.0],
-    }
 
 
-def test_lit_iter_schema() -> None:
-    df = pl.DataFrame(
+def test_schema_equality() -> None:
+    s1 = pl.Schema({"foo": pl.Int8(), "bar": pl.Float64()})
+    s2 = pl.Schema({"foo": pl.Int8(), "bar": pl.String()})
+    s3 = pl.Schema({"bar": pl.Float64(), "foo": pl.Int8()})
+
+    assert s1 == s1
+    assert s2 == s2
+    assert s3 == s3
+    assert s1 != s2
+    assert s1 != s3
+    assert s2 != s3
+
+    s4 = pl.Schema({"foo": pl.Datetime("us"), "bar": pl.Duration("ns")})
+    s5 = pl.Schema({"foo": pl.Datetime("ns"), "bar": pl.Duration("us")})
+    s6 = {"foo": pl.Datetime, "bar": pl.Duration}
+
+    assert s4 != s5
+    assert s4 != s6
+
+
+def test_schema_parse_python_dtypes() -> None:
+    cardinal_directions = pl.Enum(["north", "south", "east", "west"])
+
+    s = pl.Schema({"foo": pl.List(pl.Int32), "bar": int, "baz": cardinal_directions})  # type: ignore[arg-type]
+    s["ham"] = datetime
+
+    assert s["foo"] == pl.List(pl.Int32)
+    assert s["bar"] == pl.Int64
+    assert s["baz"] == cardinal_directions
+    assert s["ham"] == pl.Datetime("us")
+
+    assert s.len() == 4
+    assert s.names() == ["foo", "bar", "baz", "ham"]
+    assert s.dtypes() == [pl.List, pl.Int64, cardinal_directions, pl.Datetime("us")]
+
+    assert list(s.to_python().values()) == [list, int, str, datetime]
+    assert [tp.to_python() for tp in s.dtypes()] == [list, int, str, datetime]
+
+
+def test_schema_picklable() -> None:
+    s = pl.Schema(
         {
-            "key": ["A", "A", "A", "A"],
-            "dates": [
-                date(1970, 1, 1),
-                date(1970, 1, 1),
-                date(1970, 1, 2),
-                date(1970, 1, 3),
-            ],
+            "foo": pl.Int8(),
+            "bar": pl.String(),
+            "ham": pl.Struct({"x": pl.List(pl.Date)}),
         }
     )
+    pickled = pickle.dumps(s)
+    s2 = pickle.loads(pickled)
+    assert s == s2
 
-    result = df.group_by("key").agg(pl.col("dates").unique() + timedelta(days=1))
+
+def test_schema_python() -> None:
+    input = {
+        "foo": pl.Int8(),
+        "bar": pl.String(),
+        "baz": pl.Categorical("lexical"),
+        "ham": pl.Object(),
+        "spam": pl.Struct({"time": pl.List(pl.Duration), "dist": pl.Float64}),
+    }
     expected = {
-        "key": ["A"],
-        "dates": [[date(1970, 1, 2), date(1970, 1, 3), date(1970, 1, 4)]],
+        "foo": int,
+        "bar": str,
+        "baz": str,
+        "ham": object,
+        "spam": dict,
     }
-    assert result.to_dict(as_series=False) == expected
+    for schema in (input, input.items(), list(input.items())):
+        s = pl.Schema(schema)
+        assert expected == s.to_python()
 
 
-def test_nested_binary_literal_super_type_12227() -> None:
-    # The `.alias` is important here to trigger the bug.
-    assert (
-        pl.select(x=1).select((pl.lit(0) + ((pl.col("x") > 0) * 0.1)).alias("x")).item()
-        == 0.1
+def test_schema_in_map_elements_returns_scalar() -> None:
+    schema = pl.Schema([("portfolio", pl.String()), ("irr", pl.Float64())])
+
+    ldf = pl.LazyFrame(
+        {
+            "portfolio": ["A", "A", "B", "B"],
+            "amounts": [100.0, -110.0] * 2,
+        }
     )
-    assert (
-        pl.select(
-            (pl.lit(0) + (pl.lit(0) == pl.lit(0)) * pl.lit(0.1)) + pl.lit(0)
-        ).item()
-        == 0.1
+    q = ldf.group_by("portfolio").agg(
+        pl.col("amounts")
+        .map_elements(
+            lambda x: float(x.sum()), return_dtype=pl.Float64, returns_scalar=True
+        )
+        .alias("irr")
+    )
+    assert q.collect_schema() == schema
+    assert q.collect().schema == schema
+
+
+def test_ir_cache_unique_18198() -> None:
+    lf = pl.LazyFrame({"a": [1]})
+    lf.collect_schema()
+    assert pl.concat([lf, lf]).collect().to_dict(as_series=False) == {"a": [1, 1]}
+
+
+def test_schema_functions_in_agg_with_literal_arg_19011() -> None:
+    q = (
+        pl.LazyFrame({"a": [1, 2, 3, None, 5]})
+        .rolling(index_column=pl.int_range(pl.len()).alias("idx"), period="3i")
+        .agg(pl.col("a").fill_null(0).alias("a_1"), pl.col("a").pow(2.0).alias("a_2"))
+    )
+    assert q.collect_schema() == pl.Schema(
+        [("idx", pl.Int64), ("a_1", pl.List(pl.Int64)), ("a_2", pl.List(pl.Float64))]
     )
 
 
-def test_literal_subtract_schema_13284() -> None:
-    assert (
-        pl.LazyFrame({"a": [23, 30]}, schema={"a": pl.UInt8})
-        .with_columns(pl.col("a") - pl.lit(1))
-        .group_by("a")
-        .len()
-    ).schema == OrderedDict([("a", pl.UInt8), ("len", pl.UInt32)])
+def test_lazy_explode_in_agg_schema_19562() -> None:
+    def new_df_check_schema(
+        value: dict[str, Any], schema: dict[str, Any]
+    ) -> pl.DataFrame:
+        df = pl.DataFrame(value)
+        assert df.schema == schema
+        return df
+
+    lf = pl.LazyFrame({"a": [1], "b": [[1]]})
+
+    q = lf.group_by("a").agg(pl.col("b"))
+    schema = {"a": pl.Int64, "b": pl.List(pl.List(pl.Int64))}
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(
+        q.collect(), new_df_check_schema({"a": [1], "b": [[[1]]]}, schema)
+    )
+
+    q = lf.group_by("a").agg(pl.col("b").explode())
+    schema = {"a": pl.Int64, "b": pl.List(pl.Int64)}
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), new_df_check_schema({"a": [1], "b": [[1]]}, schema))
+
+    q = lf.group_by("a").agg(pl.col("b").explode().explode())
+    schema = {"a": pl.Int64, "b": pl.List(pl.Int64)}
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), new_df_check_schema({"a": [1], "b": [[1]]}, schema))
+
+    # 2x nested
+    lf = pl.LazyFrame({"a": [1], "b": [[[1]]]})
+
+    q = lf.group_by("a").agg(pl.col("b"))
+    schema = {
+        "a": pl.Int64,
+        "b": pl.List(pl.List(pl.List(pl.Int64))),
+    }
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(
+        q.collect(), new_df_check_schema({"a": [1], "b": [[[[1]]]]}, schema)
+    )
+
+    q = lf.group_by("a").agg(pl.col("b").explode())
+    schema = {"a": pl.Int64, "b": pl.List(pl.List(pl.Int64))}
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(
+        q.collect(), new_df_check_schema({"a": [1], "b": [[[1]]]}, schema)
+    )
+
+    q = lf.group_by("a").agg(pl.col("b").explode().explode())
+    schema = {"a": pl.Int64, "b": pl.List(pl.Int64)}
+
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), new_df_check_schema({"a": [1], "b": [[1]]}, schema))
 
 
-def test_schema_boolean_sum_horizontal() -> None:
-    lf = pl.LazyFrame({"a": [True, False]}).select(pl.sum_horizontal("a"))
-    assert lf.schema == OrderedDict([("a", pl.UInt32)])
+def test_lazy_nested_function_expr_agg_schema() -> None:
+    q = (
+        pl.LazyFrame({"k": [1, 1, 2]})
+        .group_by(pl.first(), maintain_order=True)
+        .agg(o=pl.int_range(pl.len()).reverse() < 1)
+    )
+
+    assert q.collect_schema() == {"k": pl.Int64, "o": pl.List(pl.Boolean)}
+    assert_frame_equal(
+        q.collect(), pl.DataFrame({"k": [1, 2], "o": [[False, True], [True]]})
+    )
+
+
+def test_lazy_agg_scalar_return_schema() -> None:
+    q = pl.LazyFrame({"k": [1]}).group_by("k").agg(pl.col("k").null_count().alias("o"))
+
+    schema = {"k": pl.Int64, "o": pl.UInt32}
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), pl.DataFrame({"k": 1, "o": 0}, schema=schema))
+
+
+def test_lazy_agg_nested_expr_schema() -> None:
+    q = (
+        pl.LazyFrame({"k": [1]})
+        .group_by("k")
+        .agg(
+            (
+                (
+                    (pl.col("k").reverse().shuffle() + 1)
+                    + pl.col("k").shuffle().reverse()
+                )
+                .shuffle()
+                .reverse()
+                .sum()
+                * 0
+            ).alias("o")
+        )
+    )
+
+    schema = {"k": pl.Int64, "o": pl.Int64}
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), pl.DataFrame({"k": 1, "o": 0}, schema=schema))
+
+
+def test_lazy_agg_lit_explode() -> None:
+    q = (
+        pl.LazyFrame({"k": [1]})
+        .group_by("k")
+        .agg(pl.lit(1, dtype=pl.Int64).explode().alias("o"))
+    )
+
+    schema = {"k": pl.Int64, "o": pl.List(pl.Int64)}
+    assert q.collect_schema() == schema
+    assert_frame_equal(q.collect(), pl.DataFrame({"k": 1, "o": [[1]]}, schema=schema))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
-    ("in_dtype", "out_dtype"),
-    [
-        (pl.Boolean, pl.Float64),
-        (pl.UInt8, pl.Float64),
-        (pl.UInt16, pl.Float64),
-        (pl.UInt32, pl.Float64),
-        (pl.UInt64, pl.Float64),
-        (pl.Int8, pl.Float64),
-        (pl.Int16, pl.Float64),
-        (pl.Int32, pl.Float64),
-        (pl.Int64, pl.Float64),
-        (pl.Float32, pl.Float32),
-        (pl.Float64, pl.Float64),
-    ],
+    "expr_op", [
+        "approx_n_unique", "arg_max", "arg_min", "bitwise_and", "bitwise_or",
+        "bitwise_xor", "count", "entropy", "first", "has_nulls", "implode", "kurtosis",
+        "last", "len", "lower_bound", "max", "mean", "median", "min", "n_unique", "nan_max",
+        "nan_min", "null_count", "product", "sample", "skew", "std", "sum", "upper_bound",
+        "var"
+    ]
+)  # fmt: skip
+@pytest.mark.parametrize("lhs", [pl.col("b"), pl.lit(1, dtype=pl.Int64).alias("b")])
+def test_lazy_agg_to_scalar_schema_19752(lhs: pl.Expr, expr_op: str) -> None:
+    op = getattr(pl.Expr, expr_op)
+
+    lf = pl.LazyFrame({"a": 1, "b": 1})
+
+    q = lf.group_by("a").agg(lhs.reverse().pipe(op))
+    assert q.collect_schema() == q.collect().collect_schema()
+
+    q = lf.group_by("a").agg(lhs.shuffle().reverse().pipe(op))
+
+    assert q.collect_schema() == q.collect().collect_schema()
+
+
+def test_lazy_agg_schema_after_elementwise_19984() -> None:
+    lf = pl.LazyFrame({"a": 1, "b": 1})
+
+    q = lf.group_by("a").agg(pl.col("b").first().fill_null(0))
+    assert q.collect_schema() == q.collect().collect_schema()
+
+    q = lf.group_by("a").agg(pl.col("b").first().fill_null(0).fill_null(0))
+    assert q.collect_schema() == q.collect().collect_schema()
+
+    q = lf.group_by("a").agg(pl.col("b").first() + 1)
+    assert q.collect_schema() == q.collect().collect_schema()
+
+    q = lf.group_by("a").agg(1 + pl.col("b").first())
+    assert q.collect_schema() == q.collect().collect_schema()
+
+
+@pytest.mark.parametrize(
+    "expr", [pl.col("b"), pl.col("b").sum(), pl.col("b").reverse()]
 )
-def test_schema_mean_horizontal_single_column(
-    in_dtype: PolarsDataType,
-    out_dtype: PolarsDataType,
-) -> None:
-    lf = pl.LazyFrame({"a": pl.Series([1, 0], dtype=in_dtype)}).select(
-        pl.mean_horizontal(pl.all())
+@pytest.mark.parametrize("mapping_strategy", ["explode", "join", "group_to_rows"])
+def test_lazy_window_schema(expr: pl.Expr, mapping_strategy: str) -> None:
+    q = pl.LazyFrame({"a": 1, "b": 1}).select(
+        expr.over("a", mapping_strategy=mapping_strategy)  # type: ignore[arg-type]
     )
 
-    assert lf.schema == OrderedDict([("a", out_dtype)])
+    assert q.collect_schema() == q.collect().collect_schema()
 
 
-def test_struct_alias_prune_15401() -> None:
-    df = pl.DataFrame({"a": []}, schema={"a": pl.Struct({"b": pl.Int8})})
-    assert df.select(pl.col("a").alias("c").struct.field("b")).columns == ["b"]
+def test_lazy_explode_schema() -> None:
+    lf = pl.LazyFrame({"k": [1], "x": pl.Series([[1]], dtype=pl.Array(pl.Int64, 1))})
+
+    q = lf.select(pl.col("x").explode())
+    assert q.collect_schema() == {"x": pl.Int64}
+
+    q = lf.select(pl.col("x").arr.explode())
+    assert q.collect_schema() == {"x": pl.Int64}
+
+    lf = pl.LazyFrame({"k": [1], "x": pl.Series([[1]], dtype=pl.List(pl.Int64))})
+
+    q = lf.select(pl.col("x").explode())
+    assert q.collect_schema() == {"x": pl.Int64}
+
+    q = lf.select(pl.col("x").list.explode())
+    assert q.collect_schema() == {"x": pl.Int64}
+
+    # `LazyFrame.explode()` goes through a different codepath than `Expr.expode`
+    lf = pl.LazyFrame().with_columns(
+        pl.Series([[1]], dtype=pl.List(pl.Int64)).alias("list"),
+        pl.Series([[1]], dtype=pl.Array(pl.Int64, 1)).alias("array"),
+    )
+
+    q = lf.explode("*")
+    assert q.collect_schema() == {"list": pl.Int64, "array": pl.Int64}
+
+    q = lf.explode("list")
+    assert q.collect_schema() == {"list": pl.Int64, "array": pl.Array(pl.Int64, 1)}
 
 
-def test_alias_prune_in_fold_15438() -> None:
-    df = pl.DataFrame({"x": [1, 2], "expected_result": ["first", "second"]}).select(
-        actual_result=pl.fold(
-            acc=pl.lit("other", dtype=pl.Utf8),
-            function=lambda acc, x: pl.when(x).then(pl.lit(x.name)).otherwise(acc),  # type: ignore[arg-type, return-value]
-            exprs=[
-                (pl.col("x") == 1).alias("first"),
-                (pl.col("x") == 2).alias("second"),
-            ],
+def test_raise_subnodes_18787() -> None:
+    df = pl.DataFrame({"a": [1], "b": [2]})
+
+    with pytest.raises(pl.exceptions.ColumnNotFoundError):
+        (
+            df.select(pl.struct(pl.all())).select(
+                pl.first().struct.field("a", "b").filter(pl.col("foo") == 1)
+            )
         )
-    )
-    expected = pl.DataFrame(
-        {
-            "actual_result": ["first", "second"],
-        }
-    )
-    assert_frame_equal(df, expected)
 
 
-def test_resolved_names_15442() -> None:
-    df = pl.DataFrame(
-        {
-            "x": [206.0],
-            "y": [225.0],
-        }
-    )
-    center = pl.struct(
-        x=pl.col("x"),
-        y=pl.col("y"),
-    )
-
-    left = 0
-    right = 1000
-    in_x = (left < center.struct.field("x")) & (center.struct.field("x") <= right)
-    assert df.lazy().filter(in_x).collect().shape == (1, 2)
+def test_scalar_agg_schema_20044() -> None:
+    assert (
+        pl.DataFrame(None, schema={"a": pl.Int64, "b": pl.String, "c": pl.String})
+        .with_columns(d=pl.col("a").max())
+        .group_by("c")
+        .agg(pl.col("d").mean())
+    ).schema == pl.Schema([("c", pl.String), ("d", pl.Float64)])

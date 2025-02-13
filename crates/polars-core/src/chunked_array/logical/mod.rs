@@ -16,8 +16,8 @@ mod duration;
 pub use duration::*;
 #[cfg(feature = "dtype-categorical")]
 pub mod categorical;
-#[cfg(feature = "dtype-struct")]
-mod struct_;
+#[cfg(feature = "dtype-categorical")]
+pub mod enum_;
 #[cfg(feature = "dtype-time")]
 mod time;
 
@@ -26,11 +26,10 @@ use std::ops::{Deref, DerefMut};
 
 #[cfg(feature = "dtype-categorical")]
 pub use categorical::*;
-#[cfg(feature = "dtype-struct")]
-pub use struct_::*;
 #[cfg(feature = "dtype-time")]
 pub use time::*;
 
+use crate::chunked_array::cast::CastOptions;
 use crate::prelude::*;
 
 /// Maps a logical type to a chunked array implementation of the physical type.
@@ -40,6 +39,12 @@ pub struct Logical<Logical: PolarsDataType, Physical: PolarsDataType>(
     PhantomData<Logical>,
     pub Option<DataType>,
 );
+
+impl<K: PolarsDataType, T: PolarsDataType> Default for Logical<K, T> {
+    fn default() -> Self {
+        Self(Default::default(), Default::default(), Default::default())
+    }
+}
 
 impl<K: PolarsDataType, T: PolarsDataType> Clone for Logical<K, T> {
     fn clone(&self) -> Self {
@@ -64,7 +69,7 @@ impl<K: PolarsDataType, T: PolarsDataType> DerefMut for Logical<K, T> {
 }
 
 impl<K: PolarsDataType, T: PolarsDataType> Logical<K, T> {
-    pub(crate) fn new_logical<J: PolarsDataType>(ca: ChunkedArray<T>) -> Logical<J, T> {
+    pub fn new_logical<J: PolarsDataType>(ca: ChunkedArray<T>) -> Logical<J, T> {
         Logical(ca, PhantomData, None)
     }
 }
@@ -84,15 +89,22 @@ pub trait LogicalType {
         unimplemented!()
     }
 
-    fn cast(&self, dtype: &DataType) -> PolarsResult<Series>;
+    fn cast_with_options(&self, dtype: &DataType, options: CastOptions) -> PolarsResult<Series>;
+
+    fn cast(&self, dtype: &DataType) -> PolarsResult<Series> {
+        self.cast_with_options(dtype, CastOptions::NonStrict)
+    }
 }
 
 impl<K: PolarsDataType, T: PolarsDataType> Logical<K, T>
 where
     Self: LogicalType,
 {
+    pub fn physical(&self) -> &ChunkedArray<T> {
+        &self.0
+    }
     pub fn field(&self) -> Field {
         let name = self.0.ref_field().name();
-        Field::new(name, LogicalType::dtype(self).clone())
+        Field::new(name.clone(), LogicalType::dtype(self).clone())
     }
 }

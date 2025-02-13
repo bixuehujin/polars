@@ -21,7 +21,7 @@ impl DateLikeNameSpace {
             }),
             &[n],
             false,
-            false,
+            None,
         )
     }
 
@@ -113,7 +113,7 @@ impl DateLikeNameSpace {
 
     /// Extract the week from the underlying Date representation.
     /// Can be performed on Date and Datetime
-
+    ///
     /// Returns the ISO week number starting from 1.
     /// The return value ranges from 1 to 53. (The last week of year differs by years.)
     pub fn week(self) -> Expr {
@@ -123,7 +123,7 @@ impl DateLikeNameSpace {
 
     /// Extract the ISO week day from the underlying Date representation.
     /// Can be performed on Date and Datetime.
-
+    ///
     /// Returns the weekday number where monday = 1 and sunday = 7
     pub fn weekday(self) -> Expr {
         self.0
@@ -203,24 +203,24 @@ impl DateLikeNameSpace {
     }
 
     /// Truncate the Datetime/Date range into buckets.
-    pub fn truncate(self, every: Expr, offset: String) -> Expr {
+    pub fn truncate(self, every: Expr) -> Expr {
         self.0.map_many_private(
-            FunctionExpr::TemporalExpr(TemporalFunction::Truncate(offset)),
+            FunctionExpr::TemporalExpr(TemporalFunction::Truncate),
             &[every],
             false,
-            false,
+            None,
         )
     }
 
     /// Roll backward to the first day of the month.
-    #[cfg(feature = "date_offset")]
+    #[cfg(feature = "month_start")]
     pub fn month_start(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::MonthStart))
     }
 
     /// Roll forward to the last day of the month.
-    #[cfg(feature = "date_offset")]
+    #[cfg(feature = "month_end")]
     pub fn month_end(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::MonthEnd))
@@ -241,21 +241,25 @@ impl DateLikeNameSpace {
     }
 
     /// Round the Datetime/Date range into buckets.
-    pub fn round<S: AsRef<str>>(self, every: S, offset: S) -> Expr {
-        let every = every.as_ref().into();
-        let offset = offset.as_ref().into();
-        self.0
-            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Round(
-                every, offset,
-            )))
+    pub fn round(self, every: Expr) -> Expr {
+        self.0.map_many_private(
+            FunctionExpr::TemporalExpr(TemporalFunction::Round),
+            &[every],
+            false,
+            None,
+        )
     }
 
     /// Offset this `Date/Datetime` by a given offset [`Duration`].
     /// This will take leap years/ months into account.
-    #[cfg(feature = "date_offset")]
+    #[cfg(feature = "offset_by")]
     pub fn offset_by(self, by: Expr) -> Expr {
-        self.0
-            .map_many_private(FunctionExpr::DateOffset, &[by], false, false)
+        self.0.map_many_private(
+            FunctionExpr::TemporalExpr(TemporalFunction::OffsetBy),
+            &[by],
+            false,
+            None,
+        )
     }
 
     #[cfg(feature = "timezones")]
@@ -269,7 +273,7 @@ impl DateLikeNameSpace {
             FunctionExpr::TemporalExpr(TemporalFunction::ReplaceTimeZone(time_zone, non_existent)),
             &[ambiguous],
             false,
-            false,
+            None,
         )
     }
 
@@ -279,7 +283,7 @@ impl DateLikeNameSpace {
             FunctionExpr::TemporalExpr(TemporalFunction::Combine(tu)),
             &[time],
             false,
-            false,
+            None,
         )
     }
 
@@ -326,5 +330,35 @@ impl DateLikeNameSpace {
         self.0.map_private(FunctionExpr::TemporalExpr(
             TemporalFunction::TotalNanoseconds,
         ))
+    }
+
+    /// Replace the time units of a value
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace(
+        self,
+        year: Expr,
+        month: Expr,
+        day: Expr,
+        hour: Expr,
+        minute: Expr,
+        second: Expr,
+        microsecond: Expr,
+        ambiguous: Expr,
+    ) -> Expr {
+        self.0.map_many_private(
+            FunctionExpr::TemporalExpr(TemporalFunction::Replace),
+            &[
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                microsecond,
+                ambiguous,
+            ],
+            false,
+            None,
+        )
     }
 }

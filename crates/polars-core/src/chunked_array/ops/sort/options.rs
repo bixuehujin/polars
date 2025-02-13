@@ -12,7 +12,7 @@ use crate::prelude::*;
 ///
 /// ```
 /// # use polars_core::prelude::*;
-/// let s = Series::new("a", [Some(5), Some(2), Some(3), Some(4), None].as_ref());
+/// let s = Series::new("a".into(), [Some(5), Some(2), Some(3), Some(4), None].as_ref());
 /// let sorted = s
 ///     .sort(
 ///         SortOptions::default()
@@ -23,7 +23,7 @@ use crate::prelude::*;
 ///     .unwrap();
 /// assert_eq!(
 ///     sorted,
-///     Series::new("a", [Some(5), Some(4), Some(3), Some(2), None].as_ref())
+///     Series::new("a".into(), [Some(5), Some(4), Some(3), Some(2), None].as_ref())
 /// );
 /// ```
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
@@ -41,6 +41,8 @@ pub struct SortOptions {
     /// If true maintain the order of equal elements.
     /// Default `false`.
     pub maintain_order: bool,
+    /// Limit a sort output, this is for optimization purposes and might be ignored.
+    pub limit: Option<IdxSize>,
 }
 
 /// Sort options for multi-series sorting.
@@ -63,7 +65,7 @@ pub struct SortOptions {
 ///         SortMultipleOptions::default()
 ///             .with_maintain_order(true)
 ///             .with_multithreaded(false)
-///             .with_order_descendings([false, true])
+///             .with_order_descending_multi([false, true])
 ///             .with_nulls_last(true),
 ///     )?;
 ///
@@ -83,19 +85,21 @@ pub struct SortMultipleOptions {
     ///
     /// If only one value is given, it will broadcast to all columns.
     ///
-    /// Use [`SortMultipleOptions::with_order_descendings`]
+    /// Use [`SortMultipleOptions::with_order_descending_multi`]
     /// or [`SortMultipleOptions::with_order_descending`] to modify.
     ///
     /// # Safety
     ///
-    /// Len must matches the number of columns or equal to 1.
+    /// Len must match the number of columns, or equal 1.
     pub descending: Vec<bool>,
     /// Whether place null values last. Default `false`.
-    pub nulls_last: bool,
+    pub nulls_last: Vec<bool>,
     /// Whether sort in multiple threads. Default `true`.
     pub multithreaded: bool,
     /// Whether maintain the order of equal elements. Default `false`.
     pub maintain_order: bool,
+    /// Limit a sort output, this is for optimization purposes and might be ignored.
+    pub limit: Option<IdxSize>,
 }
 
 impl Default for SortOptions {
@@ -105,6 +109,7 @@ impl Default for SortOptions {
             nulls_last: false,
             multithreaded: true,
             maintain_order: false,
+            limit: None,
         }
     }
 }
@@ -113,9 +118,10 @@ impl Default for SortMultipleOptions {
     fn default() -> Self {
         Self {
             descending: vec![false],
-            nulls_last: false,
+            nulls_last: vec![false],
             multithreaded: true,
             maintain_order: false,
+            limit: None,
         }
     }
 }
@@ -126,35 +132,48 @@ impl SortMultipleOptions {
         Self::default()
     }
 
-    /// Specify order for each columns. Default all `false`.
+    /// Specify order for each column. Defaults all `false`.
     ///
     /// # Safety
     ///
-    /// Len must matches the number of columns or equal to 1.
-    pub fn with_order_descendings(mut self, descending: impl IntoIterator<Item = bool>) -> Self {
+    /// Len must match the number of columns, or be equal to 1.
+    pub fn with_order_descending_multi(
+        mut self,
+        descending: impl IntoIterator<Item = bool>,
+    ) -> Self {
         self.descending = descending.into_iter().collect();
         self
     }
 
-    /// Implement order for all columns. Default `false`.
+    /// Sort order for all columns. Default `false` which is ascending.
     pub fn with_order_descending(mut self, descending: bool) -> Self {
         self.descending = vec![descending];
         self
     }
 
-    /// Whether place null values last. Default `false`.
-    pub fn with_nulls_last(mut self, enabled: bool) -> Self {
-        self.nulls_last = enabled;
+    /// Specify whether to place nulls last, per-column. Defaults all `false`.
+    ///
+    /// # Safety
+    ///
+    /// Len must match the number of columns, or be equal to 1.
+    pub fn with_nulls_last_multi(mut self, nulls_last: impl IntoIterator<Item = bool>) -> Self {
+        self.nulls_last = nulls_last.into_iter().collect();
         self
     }
 
-    /// Whether sort in multiple threads. Default `true`.
+    /// Whether to place null values last. Default `false`.
+    pub fn with_nulls_last(mut self, enabled: bool) -> Self {
+        self.nulls_last = vec![enabled];
+        self
+    }
+
+    /// Whether to sort in multiple threads. Default `true`.
     pub fn with_multithreaded(mut self, enabled: bool) -> Self {
         self.multithreaded = enabled;
         self
     }
 
-    /// Whether maintain the order of equal elements. Default `false`.
+    /// Whether to maintain the order of equal elements. Default `false`.
     pub fn with_maintain_order(mut self, enabled: bool) -> Self {
         self.maintain_order = enabled;
         self
@@ -196,15 +215,22 @@ impl SortOptions {
         self.maintain_order = enabled;
         self
     }
+
+    /// Reverse the order of sorting.
+    pub fn with_order_reversed(mut self) -> Self {
+        self.descending = !self.descending;
+        self
+    }
 }
 
 impl From<&SortOptions> for SortMultipleOptions {
     fn from(value: &SortOptions) -> Self {
         SortMultipleOptions {
             descending: vec![value.descending],
-            nulls_last: value.nulls_last,
+            nulls_last: vec![value.nulls_last],
             multithreaded: value.multithreaded,
             maintain_order: value.maintain_order,
+            limit: value.limit,
         }
     }
 }
@@ -213,9 +239,10 @@ impl From<&SortMultipleOptions> for SortOptions {
     fn from(value: &SortMultipleOptions) -> Self {
         SortOptions {
             descending: value.descending.first().copied().unwrap_or(false),
-            nulls_last: value.nulls_last,
+            nulls_last: value.nulls_last.first().copied().unwrap_or(false),
             multithreaded: value.multithreaded,
             maintain_order: value.maintain_order,
+            limit: value.limit,
         }
     }
 }

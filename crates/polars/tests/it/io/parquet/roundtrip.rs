@@ -1,12 +1,17 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Utf8ViewArray};
 use arrow::datatypes::{ArrowSchema, Field};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::RecordBatchT;
 use polars_error::PolarsResult;
 use polars_parquet::arrow::write::{FileWriter, WriteOptions};
 use polars_parquet::read::read_metadata;
-use polars_parquet::write::{CompressionOptions, Encoding, RowGroupIterator, Version};
+use polars_parquet::write::{
+    CompressionOptions, Encoding, RowGroupIterator, StatisticsOptions, Version,
+};
+
+use crate::io::parquet::read::file::FileReader;
 
 fn round_trip(
     array: &ArrayRef,
@@ -14,17 +19,21 @@ fn round_trip(
     compression: CompressionOptions,
     encodings: Vec<Encoding>,
 ) -> PolarsResult<()> {
-    let field = Field::new("a1", array.data_type().clone(), true);
-    let schema = ArrowSchema::from(vec![field]);
+    let field = Field::new("a1".into(), array.dtype().clone(), true);
+    let schema = ArrowSchema::from_iter([field]);
 
     let options = WriteOptions {
-        write_statistics: true,
+        statistics: StatisticsOptions::full(),
         compression,
         version,
-        data_pagesize_limit: None,
+        data_page_size: None,
     };
 
-    let iter = vec![RecordBatch::try_new(vec![array.clone()])];
+    let iter = vec![RecordBatchT::try_new(
+        array.len(),
+        Arc::new(schema.clone()),
+        vec![array.clone()],
+    )];
 
     let row_groups =
         RowGroupIterator::try_new(iter.into_iter(), &schema, options, vec![encodings])?;
@@ -51,14 +60,7 @@ fn round_trip(
         .collect();
 
     // we can then read the row groups into chunks
-    let chunks = polars_parquet::read::FileReader::new(
-        reader,
-        row_groups,
-        schema,
-        Some(1024 * 8 * 8),
-        None,
-        None,
-    );
+    let chunks = FileReader::new(reader, row_groups, schema, None);
 
     let mut arrays = vec![];
     for chunk in chunks {

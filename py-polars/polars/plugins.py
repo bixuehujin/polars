@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import contextlib
+from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
-from polars._utils.parse_expr_input import parse_as_list_of_expressions
+from polars._utils.parse import parse_into_list_of_expressions
 from polars._utils.wrap import wrap_expr
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from polars import Expr
-    from polars.type_aliases import IntoExpr
+    from polars._typing import IntoExpr
 
 __all__ = ["register_plugin_function"]
 
@@ -33,7 +36,7 @@ def register_plugin_function(
     """
     Register a plugin function.
 
-    See the `user guide <https://docs.pola.rs/user-guide/expressions/plugins/>`_
+    See the `user guide <https://docs.pola.rs/user-guide/plugins/expr_plugins>`_
     for more information about plugins.
 
     Parameters
@@ -79,7 +82,7 @@ def register_plugin_function(
     The parameters you set dictate how Polars will handle the function.
     Make sure they are correct!
     """
-    pyexprs = parse_as_list_of_expressions(args)
+    pyexprs = parse_into_list_of_expressions(args)
     serialized_kwargs = _serialize_kwargs(kwargs)
     plugin_path = _resolve_plugin_path(plugin_path)
 
@@ -111,6 +114,7 @@ def _serialize_kwargs(kwargs: dict[str, Any] | None) -> bytes:
     return pickle.dumps(kwargs, protocol=5)
 
 
+@lru_cache(maxsize=16)
 def _resolve_plugin_path(path: Path | str) -> Path:
     """Get the file path of the dynamic library file."""
     if not isinstance(path, Path):

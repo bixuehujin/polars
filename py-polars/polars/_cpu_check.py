@@ -44,11 +44,28 @@ _POLARS_ARCH = "unknown"
 _POLARS_FEATURE_FLAGS = ""
 
 # Set to True during the build process if we are building a LTS CPU version.
-# The risk of the CPU check failing is then higher than a CPU not being supported.
 _POLARS_LTS_CPU = False
 
 _IS_WINDOWS = os.name == "nt"
 _IS_64BIT = ctypes.sizeof(ctypes.c_void_p) == 8
+
+
+def get_lts_cpu() -> bool:
+    return _POLARS_LTS_CPU
+
+
+def _open_posix_libc() -> ctypes.CDLL:
+    # Avoid importing ctypes.util if possible.
+    try:
+        if os.uname().sysname == "Darwin":
+            return ctypes.CDLL("libc.dylib", use_errno=True)
+        else:
+            return ctypes.CDLL("libc.so.6", use_errno=True)
+    except Exception:
+        from ctypes import util as ctutil
+
+        return ctypes.CDLL(ctutil.find_library("c"), use_errno=True)
+
 
 # Posix x86_64:
 # Three first call registers : RDI, RSI, RDX
@@ -159,14 +176,25 @@ class CPUID:
         else:
             import mmap  # Only import if necessary.
 
+            # On some platforms PROT_WRITE + PROT_EXEC is forbidden, so we first
+            # only write and then mprotect into PROT_EXEC.
+            libc = _open_posix_libc()
+            mprotect = libc.mprotect
+            mprotect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+            mprotect.restype = ctypes.c_int
+
             self.mmap = mmap.mmap(
                 -1,
                 size,
                 mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+                mmap.PROT_READ | mmap.PROT_WRITE,
             )
             self.addr = ctypes.addressof(ctypes.c_void_p.from_buffer(self.mmap))
             self.mmap.write(code)
+
+            if mprotect(self.addr, size, mmap.PROT_READ | mmap.PROT_EXEC) != 0:
+                msg = "could not execute mprotect for CPUID check"
+                raise RuntimeError(msg)
 
         func_type = CFUNCTYPE(None, POINTER(CPUID_struct), c_uint32, c_uint32)
         self.func_ptr = func_type(self.addr)
@@ -194,8 +222,10 @@ def _read_cpu_flags() -> dict[str, bool]:
         "sse3": bool(cpuid1.ecx & (1 << 0)),
         "ssse3": bool(cpuid1.ecx & (1 << 9)),
         "fma": bool(cpuid1.ecx & (1 << 12)),
+        "cmpxchg16b": bool(cpuid1.ecx & (1 << 13)),
         "sse4.1": bool(cpuid1.ecx & (1 << 19)),
         "sse4.2": bool(cpuid1.ecx & (1 << 20)),
+        "movbe": bool(cpuid1.ecx & (1 << 22)),
         "popcnt": bool(cpuid1.ecx & (1 << 23)),
         "pclmulqdq": bool(cpuid1.ecx & (1 << 1)),
         "avx": bool(cpuid1.ecx & (1 << 28)),
@@ -207,11 +237,7 @@ def _read_cpu_flags() -> dict[str, bool]:
 
 
 def check_cpu_flags() -> None:
-    if (
-        not _POLARS_FEATURE_FLAGS
-        or _POLARS_LTS_CPU
-        or os.environ.get("POLARS_SKIP_CPU_CHECK")
-    ):
+    if not _POLARS_FEATURE_FLAGS or os.environ.get("POLARS_SKIP_CPU_CHECK"):
         return
 
     expected_cpu_flags = [f.lstrip("+") for f in _POLARS_FEATURE_FLAGS.split(",")]

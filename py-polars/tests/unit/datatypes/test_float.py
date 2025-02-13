@@ -1,3 +1,4 @@
+import pyarrow as pa
 import pytest
 
 import polars as pl
@@ -142,7 +143,7 @@ def test_hash() -> None:
     assert s.item(2) == s.item(3)  # hash(float('-nan')) == hash(float('nan'))
 
 
-def test_group_by() -> None:
+def test_group_by_float() -> None:
     # Test num_groups_proxy
     # * -0.0 and 0.0 in same groups
     # * -nan and nan in same groups
@@ -232,7 +233,7 @@ def test_joins() -> None:
         )
         assert_series_equal(expect, out)
 
-        how = "outer"
+        how = "full"
         expect = pl.Series("rhs", [True, True, True, True, None, None, True])
         out = (
             df.join(rhs, on=join_on, how=how)  # type: ignore[arg-type]
@@ -296,3 +297,12 @@ def test_first_last_distinct() -> None:
     assert_series_equal(
         pl.Series("x", [False, True, False, True, True, True]), s.is_last_distinct()
     )
+
+
+def test_arrow_float16_read_empty_20946() -> None:
+    schema = pa.schema([("float_column", pa.float16())])
+    table = pa.table([[]], schema=schema)
+
+    df = pl.from_arrow(table)
+    assert df.shape == (0, 1)
+    assert df.schema == pl.Schema([("float_column", pl.Float32)])  # type: ignore[union-attr]

@@ -5,16 +5,30 @@ import os
 import re
 import sys
 import warnings
-from collections.abc import MappingView, Sized
+from collections import Counter
+from collections.abc import (
+    Collection,
+    Generator,
+    Iterable,
+    MappingView,
+    Sequence,
+    Sized,
+)
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generator, Iterable, Literal, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    TypeVar,
+    overload,
+)
 
 import polars as pl
 from polars import functions as F
 from polars.datatypes import (
-    FLOAT_DTYPES,
-    INTEGER_DTYPES,
     Boolean,
     Date,
     Datetime,
@@ -24,14 +38,20 @@ from polars.datatypes import (
     String,
     Time,
 )
-from polars.dependencies import _check_for_numpy
+from polars.datatypes.group import FLOAT_DTYPES, INTEGER_DTYPES
+from polars.dependencies import _check_for_numpy, import_optional, subprocess
 from polars.dependencies import numpy as np
 
 if TYPE_CHECKING:
-    from collections.abc import Reversible
+    from collections.abc import Iterator, MutableMapping, Reversible
 
-    from polars import DataFrame
-    from polars.type_aliases import PolarsDataType, SizeUnit
+    from polars import DataFrame, Expr
+    from polars._typing import PolarsDataType, SizeUnit
+
+    if sys.version_info >= (3, 13):
+        from typing import TypeIs
+    else:
+        from typing_extensions import TypeIs
 
     if sys.version_info >= (3, 10):
         from typing import ParamSpec, TypeGuard
@@ -56,7 +76,7 @@ def _process_null_values(
         return null_values
 
 
-def _is_generator(val: object) -> bool:
+def _is_generator(val: object | Iterator[T]) -> TypeIs[Iterator[T]]:
     return (
         (isinstance(val, (Generator, Iterable)) and not isinstance(val, Sized))
         or isinstance(val, MappingView)
@@ -67,6 +87,28 @@ def _is_generator(val: object) -> bool:
 def _is_iterable_of(val: Iterable[object], eltype: type | tuple[type, ...]) -> bool:
     """Check whether the given iterable is of the given type(s)."""
     return all(isinstance(x, eltype) for x in val)
+
+
+def is_path_or_str_sequence(
+    val: object, *, allow_str: bool = False, include_series: bool = False
+) -> TypeGuard[Sequence[str | Path]]:
+    """
+    Check that `val` is a sequence of strings or paths.
+
+    Note that a single string is a sequence of strings by definition, use
+    `allow_str=False` to return False on a single string.
+    """
+    if allow_str is False and isinstance(val, str):
+        return False
+    elif _check_for_numpy(val) and isinstance(val, np.ndarray):
+        return np.issubdtype(val.dtype, np.str_)
+    elif include_series and isinstance(val, pl.Series):
+        return val.dtype == pl.String
+    return (
+        not isinstance(val, bytes)
+        and isinstance(val, Sequence)
+        and _is_iterable_of(val, (Path, str))
+    )
 
 
 def is_bool_sequence(
@@ -95,9 +137,8 @@ def is_sequence(
     val: object, *, include_series: bool = False
 ) -> TypeGuard[Sequence[Any]]:
     """Check whether the given input is a numpy array or python sequence."""
-    return (
-        (_check_for_numpy(val) and isinstance(val, np.ndarray))
-        or isinstance(val, (pl.Series, Sequence) if include_series else Sequence)
+    return (_check_for_numpy(val) and isinstance(val, np.ndarray)) or (
+        isinstance(val, (pl.Series, Sequence) if include_series else Sequence)
         and not isinstance(val, str)
     )
 
@@ -207,7 +248,25 @@ def ordered_unique(values: Sequence[Any]) -> list[Any]:
     return [v for v in values if not (v in seen or add_(v))]
 
 
-def scale_bytes(sz: int, unit: SizeUnit) -> int | float:
+def deduplicate_names(names: Iterable[str]) -> list[str]:
+    """Ensure name uniqueness by appending a counter to subsequent duplicates."""
+    seen: MutableMapping[str, int] = Counter()
+    deduped = []
+    for nm in names:
+        deduped.append(f"{nm}{seen[nm] - 1}" if nm in seen else nm)
+        seen[nm] += 1
+    return deduped
+
+
+@overload
+def scale_bytes(sz: int, unit: SizeUnit) -> int | float: ...
+
+
+@overload
+def scale_bytes(sz: Expr, unit: SizeUnit) -> Expr: ...
+
+
+def scale_bytes(sz: int | Expr, unit: SizeUnit) -> int | float | Expr:
     """Scale size in bytes to other size units (eg: "kb", "mb", "gb", "tb")."""
     if unit in {"b", "bytes"}:
         return sz
@@ -248,6 +307,8 @@ def _cast_repr_strings_with_schema(
             if tp != String:
                 msg = f"DataFrame should contain only String repr data; found {tp!r}"
                 raise TypeError(msg)
+
+    special_floats = {"-inf", "+inf", "inf", "nan"}
 
     # duration string scaling
     ns_sec = 1_000_000_000
@@ -302,15 +363,12 @@ def _cast_repr_strings_with_schema(
             elif tp == Duration:
                 cast_cols[c] = (
                     F.col(c)
-                    .apply(str_duration_, return_dtype=Int64)
+                    .map_elements(str_duration_, return_dtype=Int64)
                     .cast(Duration("ns"))
                     .cast(tp)
                 )
             elif tp == Boolean:
-                cast_cols[c] = F.col(c).replace(
-                    {"true": True, "false": False},
-                    default=None,
-                )
+                cast_cols[c] = F.col(c).replace_strict({"true": True, "false": False})
             elif tp in INTEGER_DTYPES:
                 int_string = F.col(c).str.replace_all(r"[^\d+-]", "")
                 cast_cols[c] = (
@@ -321,8 +379,11 @@ def _cast_repr_strings_with_schema(
                 integer_part = F.col(c).str.replace(r"^(.*)\D(\d*)$", "$1")
                 fractional_part = F.col(c).str.replace(r"^(.*)\D(\d*)$", "$2")
                 cast_cols[c] = (
-                    # check for empty string and/or integer format
-                    pl.when(F.col(c).str.contains(r"^[+-]?\d*$"))
+                    # check for empty string, special floats, or integer format
+                    pl.when(
+                        F.col(c).str.contains(r"^[+-]?\d*$")
+                        | F.col(c).str.to_lowercase().is_in(special_floats)
+                    )
                     .then(pl.when(F.col(c).str.len_bytes() > 0).then(F.col(c)))
                     # check for scientific notation
                     .when(F.col(c).str.contains("[eE]"))
@@ -385,7 +446,7 @@ NoDefault = Literal[_NoDefault.no_default]
 
 def find_stacklevel() -> int:
     """
-    Find the first place in the stack that is not inside polars.
+    Find the first place in the stack that is not inside Polars.
 
     Taken from:
     https://github.com/pandas-dev/pandas/blob/ab89c53f48df67709a533b6a95ce3d911871a0a8/pandas/util/_exceptions.py#L30-L51
@@ -416,11 +477,31 @@ def find_stacklevel() -> int:
     return n
 
 
+def issue_warning(message: str, category: type[Warning], **kwargs: Any) -> None:
+    """
+    Issue a warning.
+
+    Parameters
+    ----------
+    message
+        The message associated with the warning.
+    category
+        The warning category.
+    **kwargs
+        Additional arguments for `warnings.warn`. Note that the `stacklevel` is
+        determined automatically.
+    """
+    warnings.warn(
+        message=message, category=category, stacklevel=find_stacklevel(), **kwargs
+    )
+
+
 def _get_stack_locals(
-    of_type: type | tuple[type, ...] | None = None,
+    of_type: type | Collection[type] | Callable[[Any], bool] | None = None,
+    *,
+    named: str | Collection[str] | None = None,
     n_objects: int | None = None,
     n_frames: int | None = None,
-    named: str | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """
     Retrieve f_locals from all (or the last 'n') stack frames from the calling location.
@@ -428,7 +509,9 @@ def _get_stack_locals(
     Parameters
     ----------
     of_type
-        Only return objects of this type.
+        Only return objects of this type; can be a single class, tuple of
+        classes, or a callable that returns True/False if the object being
+        tested is considered a match.
     n_objects
         If specified, return only the most recent `n` matching objects.
     n_frames
@@ -436,24 +519,39 @@ def _get_stack_locals(
     named
         If specified, only return objects matching the given name(s).
     """
-    if isinstance(named, str):
-        named = (named,)
-
     objects = {}
     examined_frames = 0
+
+    if isinstance(named, str):
+        named = (named,)
     if n_frames is None:
         n_frames = sys.maxsize
+
+    if inspect.isfunction(of_type):
+        matches_type = of_type
+    else:
+        if isinstance(of_type, Collection):
+            of_type = tuple(of_type)
+
+        def matches_type(obj: Any) -> bool:  # type: ignore[misc]
+            return isinstance(obj, of_type)  # type: ignore[arg-type]
+
+    if named is not None:
+        if isinstance(named, str):
+            named = (named,)
+        elif not isinstance(named, set):
+            named = set(named)
+
     stack_frame = inspect.currentframe()
     stack_frame = getattr(stack_frame, "f_back", None)
-
     try:
         while stack_frame and examined_frames < n_frames:
             local_items = list(stack_frame.f_locals.items())
             for nm, obj in reversed(local_items):
                 if (
                     nm not in objects
-                    and (named is None or (nm in named))
-                    and (of_type is None or isinstance(obj, of_type))
+                    and (named is None or nm in named)
+                    and (of_type is None or matches_type(obj))
                 ):
                     objects[nm] = obj
                     if n_objects is not None and len(objects) >= n_objects:
@@ -478,6 +576,23 @@ def _polars_warn(msg: str, category: type[Warning] = UserWarning) -> None:
         category=category,
         stacklevel=find_stacklevel(),
     )
+
+
+def extend_bool(
+    value: bool | Sequence[bool],
+    n_match: int,
+    value_name: str,
+    match_name: str,
+) -> Sequence[bool]:
+    """Ensure the given bool or sequence of bools is the correct length."""
+    values = [value] * n_match if isinstance(value, bool) else value
+    if n_match != len(values):
+        msg = (
+            f"the length of `{value_name}` ({len(values)}) "
+            f"does not match the length of `{match_name}` ({n_match})"
+        )
+        raise ValueError(msg)
+    return values
 
 
 def in_terminal_that_supports_colour() -> bool:
@@ -535,3 +650,55 @@ def re_escape(s: str) -> str:
     # escapes _only_ those metachars with meaning to the rust regex crate
     re_rust_metachars = r"\\?()|\[\]{}^$#&~.+*-"
     return re.sub(f"([{re_rust_metachars}])", r"\\\1", s)
+
+
+# Don't rename or move. This is used by polars cloud
+def display_dot_graph(
+    *,
+    dot: str,
+    show: bool = True,
+    output_path: str | Path | None = None,
+    raw_output: bool = False,
+    figsize: tuple[float, float] = (16.0, 12.0),
+) -> str | None:
+    if raw_output:
+        # we do not show a graph, nor save a graph to disk
+        return dot
+
+    output_type = "svg" if _in_notebook() else "png"
+
+    try:
+        graph = subprocess.check_output(
+            ["dot", "-Nshape=box", "-T" + output_type], input=f"{dot}".encode()
+        )
+    except (ImportError, FileNotFoundError):
+        msg = (
+            "The graphviz `dot` binary should be on your PATH."
+            "(If not installed you can download here: https://graphviz.org/download/)"
+        )
+        raise ImportError(msg) from None
+
+    if output_path:
+        Path(output_path).write_bytes(graph)
+
+    if not show:
+        return None
+
+    if _in_notebook():
+        from IPython.display import SVG, display
+
+        return display(SVG(graph))
+    else:
+        import_optional(
+            "matplotlib",
+            err_prefix="",
+            err_suffix="should be installed to show graphs",
+        )
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=figsize)
+        img = mpimg.imread(BytesIO(graph))
+        plt.imshow(img)
+        plt.show()
+        return None

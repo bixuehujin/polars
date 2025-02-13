@@ -6,32 +6,28 @@ Manipulation/selection
 .. autosummary::
    :toctree: api/
 
+    DataFrame.__getitem__
     DataFrame.bottom_k
     DataFrame.cast
     DataFrame.clear
     DataFrame.clone
     DataFrame.drop
     DataFrame.drop_in_place
+    DataFrame.drop_nans
     DataFrame.drop_nulls
     DataFrame.explode
     DataFrame.extend
     DataFrame.fill_nan
     DataFrame.fill_null
     DataFrame.filter
-    DataFrame.find_idx_by_name
     DataFrame.gather_every
     DataFrame.get_column
     DataFrame.get_column_index
     DataFrame.get_columns
     DataFrame.group_by
     DataFrame.group_by_dynamic
-    DataFrame.group_by_rolling
-    DataFrame.groupby
-    DataFrame.groupby_dynamic
-    DataFrame.groupby_rolling
     DataFrame.head
     DataFrame.hstack
-    DataFrame.insert_at_idx
     DataFrame.insert_column
     DataFrame.interpolate
     DataFrame.item
@@ -40,6 +36,7 @@ Manipulation/selection
     DataFrame.iter_slices
     DataFrame.join
     DataFrame.join_asof
+    DataFrame.join_where
     DataFrame.limit
     DataFrame.melt
     DataFrame.merge_sorted
@@ -48,8 +45,6 @@ Manipulation/selection
     DataFrame.pivot
     DataFrame.rechunk
     DataFrame.rename
-    DataFrame.replace
-    DataFrame.replace_at_idx
     DataFrame.replace_column
     DataFrame.reverse
     DataFrame.rolling
@@ -61,18 +56,18 @@ Manipulation/selection
     DataFrame.select_seq
     DataFrame.set_sorted
     DataFrame.shift
-    DataFrame.shift_and_fill
     DataFrame.shrink_to_fit
     DataFrame.slice
     DataFrame.sort
+    DataFrame.sql
     DataFrame.tail
-    DataFrame.take_every
     DataFrame.to_dummies
     DataFrame.to_series
     DataFrame.top_k
     DataFrame.transpose
     DataFrame.unique
     DataFrame.unnest
+    DataFrame.unpivot
     DataFrame.unstack
     DataFrame.update
     DataFrame.upsample

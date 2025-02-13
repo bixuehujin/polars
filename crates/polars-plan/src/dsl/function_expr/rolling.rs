@@ -1,26 +1,32 @@
+#[cfg(feature = "cov")]
+use std::ops::BitAnd;
+
+use polars_core::utils::Container;
 use polars_time::chunkedarray::*;
 
 use super::*;
+#[cfg(feature = "cov")]
+use crate::dsl::pow::pow;
 
 #[derive(Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum RollingFunction {
-    Min(RollingOptions),
-    MinBy(RollingOptions),
-    Max(RollingOptions),
-    MaxBy(RollingOptions),
-    Mean(RollingOptions),
-    MeanBy(RollingOptions),
-    Sum(RollingOptions),
-    SumBy(RollingOptions),
-    Quantile(RollingOptions),
-    QuantileBy(RollingOptions),
-    Var(RollingOptions),
-    VarBy(RollingOptions),
-    Std(RollingOptions),
-    StdBy(RollingOptions),
+    Min(RollingOptionsFixedWindow),
+    Max(RollingOptionsFixedWindow),
+    Mean(RollingOptionsFixedWindow),
+    Sum(RollingOptionsFixedWindow),
+    Quantile(RollingOptionsFixedWindow),
+    Var(RollingOptionsFixedWindow),
+    Std(RollingOptionsFixedWindow),
     #[cfg(feature = "moment")]
     Skew(usize, bool),
+    #[cfg(feature = "cov")]
+    CorrCov {
+        rolling_options: RollingOptionsFixedWindow,
+        corr_cov_options: RollingCovOptions,
+        // Whether is Corr or Cov
+        is_corr: bool,
+    },
 }
 
 impl Display for RollingFunction {
@@ -29,21 +35,22 @@ impl Display for RollingFunction {
 
         let name = match self {
             Min(_) => "rolling_min",
-            MinBy(_) => "rolling_min_by",
             Max(_) => "rolling_max",
-            MaxBy(_) => "rolling_max_by",
             Mean(_) => "rolling_mean",
-            MeanBy(_) => "rolling_mean_by",
             Sum(_) => "rolling_sum",
-            SumBy(_) => "rolling_sum_by",
             Quantile(_) => "rolling_quantile",
-            QuantileBy(_) => "rolling_quantile_by",
             Var(_) => "rolling_var",
-            VarBy(_) => "rolling_var_by",
             Std(_) => "rolling_std",
-            StdBy(_) => "rolling_std_by",
             #[cfg(feature = "moment")]
             Skew(..) => "rolling_skew",
+            #[cfg(feature = "cov")]
+            CorrCov { is_corr, .. } => {
+                if *is_corr {
+                    "rolling_corr"
+                } else {
+                    "rolling_cov"
+                }
+            },
         };
 
         write!(f, "{name}")
@@ -61,135 +68,168 @@ impl Hash for RollingFunction {
                 window_size.hash(state);
                 bias.hash(state)
             },
+            #[cfg(feature = "cov")]
+            CorrCov { is_corr, .. } => {
+                is_corr.hash(state);
+            },
             _ => {},
         }
     }
 }
 
-fn convert<'a>(
-    f: impl Fn(RollingOptionsImpl) -> PolarsResult<Series> + 'a,
-    ss: &'a [Series],
-    expr_name: &'static str,
-) -> impl Fn(RollingOptions) -> PolarsResult<Series> + 'a {
-    move |options| {
-        let mut by = ss[1].clone();
-        by = by.rechunk();
-
-        polars_ensure!(
-            options.weights.is_none(),
-            ComputeError: "`weights` is not supported in 'rolling by' expression"
-        );
-        let (by, tz) = match by.dtype() {
-            DataType::Datetime(tu, tz) => (by.cast(&DataType::Datetime(*tu, None))?, tz),
-            DataType::Date => (
-                by.cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?,
-                &None,
-            ),
-            dt => polars_bail!(InvalidOperation:
-                "in `{}` operation, `by` argument of dtype `{}` is not supported (expected `{}`)",
-                expr_name,
-                dt,
-                "date/datetime"),
-        };
-        if by.is_sorted_flag() != IsSorted::Ascending && options.warn_if_unsorted {
-            polars_warn!(format!(
-                "Series is not known to be sorted by `by` column in {} operation.\n\
-                \n\
-                To silence this warning, you may want to try:\n\
-                - sorting your data by your `by` column beforehand;\n\
-                - setting `.set_sorted()` if you already know your data is sorted;\n\
-                - passing `warn_if_unsorted=False` if this warning is a false-positive\n  \
-                    (this is known to happen when combining rolling aggregations with `over`);\n\n\
-                before passing calling the rolling aggregation function.\n",
-                expr_name
-            ));
-        }
-        let by = by.datetime().unwrap();
-        let by_values = by.cont_slice().map_err(|_| {
-            polars_err!(
-                ComputeError:
-                "`by` column should not have null values in 'rolling by' expression"
-            )
-        })?;
-        let tu = by.time_unit();
-
-        let options = RollingOptionsImpl {
-            window_size: options.window_size,
-            min_periods: options.min_periods,
-            weights: None,
-            center: options.center,
-            by: Some(by_values),
-            tu: Some(tu),
-            tz: tz.as_ref(),
-            closed_window: options.closed_window.or(Some(ClosedWindow::Right)),
-            fn_params: options.fn_params.clone(),
-        };
-
-        f(options)
-    }
+pub(super) fn rolling_min(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_min(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_min(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_min(options.clone().try_into()?)
+pub(super) fn rolling_max(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_max(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_min_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_min(options), s, "rolling_min")(options)
+pub(super) fn rolling_mean(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_mean(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_max(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_max(options.clone().try_into()?)
+pub(super) fn rolling_sum(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_sum(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_max_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_max(options), s, "rolling_max")(options)
+pub(super) fn rolling_quantile(
+    s: &Column,
+    options: RollingOptionsFixedWindow,
+) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_quantile(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_mean(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_mean(options.clone().try_into()?)
+pub(super) fn rolling_var(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_var(options)
+        .map(Column::from)
 }
 
-pub(super) fn rolling_mean_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_mean(options), s, "rolling_mean")(options)
-}
-
-pub(super) fn rolling_sum(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_sum(options.clone().try_into()?)
-}
-
-pub(super) fn rolling_sum_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_sum(options), s, "rolling_sum")(options)
-}
-
-pub(super) fn rolling_quantile(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_quantile(options.clone().try_into()?)
-}
-
-pub(super) fn rolling_quantile_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(
-        |options| s[0].rolling_quantile(options),
-        s,
-        "rolling_quantile",
-    )(options)
-}
-
-pub(super) fn rolling_var(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_var(options.clone().try_into()?)
-}
-
-pub(super) fn rolling_var_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_var(options), s, "rolling_var")(options)
-}
-
-pub(super) fn rolling_std(s: &Series, options: RollingOptions) -> PolarsResult<Series> {
-    s.rolling_std(options.clone().try_into()?)
-}
-
-pub(super) fn rolling_std_by(s: &[Series], options: RollingOptions) -> PolarsResult<Series> {
-    convert(|options| s[0].rolling_std(options), s, "rolling_std")(options)
+pub(super) fn rolling_std(s: &Column, options: RollingOptionsFixedWindow) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_std(options)
+        .map(Column::from)
 }
 
 #[cfg(feature = "moment")]
-pub(super) fn rolling_skew(s: &Series, window_size: usize, bias: bool) -> PolarsResult<Series> {
-    s.rolling_skew(window_size, bias)
+pub(super) fn rolling_skew(s: &Column, window_size: usize, bias: bool) -> PolarsResult<Column> {
+    // @scalar-opt
+    s.as_materialized_series()
+        .rolling_skew(window_size, bias)
+        .map(Column::from)
+}
+
+#[cfg(feature = "cov")]
+fn det_count_x_y(window_size: usize, len: usize, dtype: &DataType) -> Series {
+    match dtype {
+        DataType::Float64 => {
+            let values = (0..len)
+                .map(|v| std::cmp::min(window_size, v + 1) as f64)
+                .collect::<Vec<_>>();
+            Series::new(PlSmallStr::EMPTY, values)
+        },
+        DataType::Float32 => {
+            let values = (0..len)
+                .map(|v| std::cmp::min(window_size, v + 1) as f32)
+                .collect::<Vec<_>>();
+            Series::new(PlSmallStr::EMPTY, values)
+        },
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(feature = "cov")]
+pub(super) fn rolling_corr_cov(
+    s: &[Column],
+    rolling_options: RollingOptionsFixedWindow,
+    cov_options: RollingCovOptions,
+    is_corr: bool,
+) -> PolarsResult<Column> {
+    let mut x = s[0].as_materialized_series().rechunk();
+    let mut y = s[1].as_materialized_series().rechunk();
+
+    if !x.dtype().is_float() {
+        x = x.cast(&DataType::Float64)?;
+    }
+    if !y.dtype().is_float() {
+        y = y.cast(&DataType::Float64)?;
+    }
+    let dtype = x.dtype().clone();
+
+    let mean_x_y = (&x * &y)?.rolling_mean(rolling_options.clone())?;
+    let rolling_options_count = RollingOptionsFixedWindow {
+        window_size: rolling_options.window_size,
+        min_periods: 0,
+        ..Default::default()
+    };
+
+    let count_x_y = if (x.null_count() + y.null_count()) > 0 {
+        // mask out nulls on both sides before compute mean/var
+        let valids = x.is_not_null().bitand(y.is_not_null());
+        let valids_arr = valids.downcast_as_array();
+        let valids_bitmap = valids_arr.values();
+
+        unsafe {
+            let xarr = &mut x.chunks_mut()[0];
+            *xarr = xarr.with_validity(Some(valids_bitmap.clone()));
+            let yarr = &mut y.chunks_mut()[0];
+            *yarr = yarr.with_validity(Some(valids_bitmap.clone()));
+            x.compute_len();
+            y.compute_len();
+        }
+        valids
+            .cast(&dtype)
+            .unwrap()
+            .rolling_sum(rolling_options_count)?
+    } else {
+        det_count_x_y(rolling_options.window_size, x.len(), &dtype)
+    };
+
+    let mean_x = x.rolling_mean(rolling_options.clone())?;
+    let mean_y = y.rolling_mean(rolling_options.clone())?;
+    let ddof = Series::new(
+        PlSmallStr::EMPTY,
+        &[AnyValue::from(cov_options.ddof).cast(&dtype)],
+    );
+
+    let numerator = ((mean_x_y - (mean_x * mean_y).unwrap()).unwrap()
+        * (count_x_y.clone() / (count_x_y - ddof).unwrap()).unwrap())
+    .unwrap();
+
+    if is_corr {
+        let var_x = x.rolling_var(rolling_options.clone())?;
+        let var_y = y.rolling_var(rolling_options.clone())?;
+
+        let base = (var_x * var_y).unwrap();
+        let sc = Scalar::new(
+            base.dtype().clone(),
+            AnyValue::Float64(0.5).cast(&dtype).into_static(),
+        );
+        let denominator = pow(&mut [base.into_column(), sc.into_column("".into())])
+            .unwrap()
+            .unwrap()
+            .take_materialized_series();
+
+        Ok((numerator / denominator)?.into_column())
+    } else {
+        Ok(numerator.into_column())
+    }
 }

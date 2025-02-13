@@ -1,6 +1,8 @@
 use std::hash::Hash;
+use std::ops::Deref;
 
 use arrow::bitmap::MutableBitmap;
+use polars_compute::unique::BooleanUniqueKernelState;
 use polars_utils::total_ord::{ToTotalOrd, TotalHash};
 
 use crate::hashing::_HASHMAP_INIT_SIZE;
@@ -24,28 +26,28 @@ fn finish_is_unique_helper(
 }
 
 pub(crate) fn is_unique_helper(
-    groups: GroupsProxy,
+    groups: &GroupPositions,
     len: IdxSize,
     unique_val: bool,
     duplicated_val: bool,
 ) -> BooleanChunked {
     debug_assert_ne!(unique_val, duplicated_val);
 
-    let idx = match groups {
-        GroupsProxy::Idx(groups) => groups
-            .into_iter()
+    let idx = match groups.deref() {
+        GroupsType::Idx(groups) => groups
+            .iter()
             .filter_map(|(first, g)| if g.len() == 1 { Some(first) } else { None })
             .collect::<Vec<_>>(),
-        GroupsProxy::Slice { groups, .. } => groups
-            .into_iter()
-            .filter_map(|[first, len]| if len == 1 { Some(first) } else { None })
+        GroupsType::Slice { groups, .. } => groups
+            .iter()
+            .filter_map(|[first, len]| if *len == 1 { Some(*first) } else { None })
             .collect(),
     };
     finish_is_unique_helper(idx, len, unique_val, duplicated_val)
 }
 
 #[cfg(feature = "object")]
-impl<T: PolarsObject> ChunkUnique<ObjectType<T>> for ObjectChunked<T> {
+impl<T: PolarsObject> ChunkUnique for ObjectChunked<T> {
     fn unique(&self) -> PolarsResult<ChunkedArray<ObjectType<T>>> {
         polars_bail!(opq = unique, self.dtype());
     }
@@ -72,19 +74,20 @@ where
 
 macro_rules! arg_unique_ca {
     ($ca:expr) => {{
-        match $ca.has_validity() {
+        match $ca.has_nulls() {
             false => arg_unique($ca.into_no_null_iter(), $ca.len()),
             _ => arg_unique($ca.iter(), $ca.len()),
         }
     }};
 }
 
-impl<T> ChunkUnique<T> for ChunkedArray<T>
+impl<T> ChunkUnique for ChunkedArray<T>
 where
     T: PolarsNumericType,
     T::Native: TotalHash + TotalEq + ToTotalOrd,
     <T::Native as ToTotalOrd>::TotalOrdItem: Hash + Eq + Ord,
-    ChunkedArray<T>: IntoSeries + for<'a> ChunkCompare<&'a ChunkedArray<T>, Item = BooleanChunked>,
+    ChunkedArray<T>:
+        IntoSeries + for<'a> ChunkCompareEq<&'a ChunkedArray<T>, Item = BooleanChunked>,
 {
     fn unique(&self) -> PolarsResult<Self> {
         // prevent stackoverflow repeated sorted.unique call
@@ -113,7 +116,7 @@ where
                     }
 
                     let arr: PrimitiveArray<T::Native> = arr.into();
-                    Ok(ChunkedArray::with_chunk(self.name(), arr))
+                    Ok(ChunkedArray::with_chunk(self.name().clone(), arr))
                 } else {
                     let mask = self.not_equal_missing(&self.shift(1));
                     self.filter(&mask)
@@ -127,7 +130,7 @@ where
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
-        Ok(IdxCa::from_vec(self.name(), arg_unique_ca!(self)))
+        Ok(IdxCa::from_vec(self.name().clone(), arg_unique_ca!(self)))
     }
 
     fn n_unique(&self) -> PolarsResult<usize> {
@@ -171,10 +174,10 @@ where
     }
 }
 
-impl ChunkUnique<StringType> for StringChunked {
+impl ChunkUnique for StringChunked {
     fn unique(&self) -> PolarsResult<Self> {
         let out = self.as_binary().unique()?;
-        Ok(unsafe { out.to_string() })
+        Ok(unsafe { out.to_string_unchecked() })
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
@@ -186,7 +189,7 @@ impl ChunkUnique<StringType> for StringChunked {
     }
 }
 
-impl ChunkUnique<BinaryType> for BinaryChunked {
+impl ChunkUnique for BinaryChunked {
     fn unique(&self) -> PolarsResult<Self> {
         match self.null_count() {
             0 => {
@@ -196,7 +199,7 @@ impl ChunkUnique<BinaryType> for BinaryChunked {
                     set.extend(arr.values_iter())
                 }
                 Ok(BinaryChunked::from_iter_values(
-                    self.name(),
+                    self.name().clone(),
                     set.iter().copied(),
                 ))
             },
@@ -207,7 +210,7 @@ impl ChunkUnique<BinaryType> for BinaryChunked {
                     set.extend(arr.iter())
                 }
                 Ok(BinaryChunked::from_iter_options(
-                    self.name(),
+                    self.name().clone(),
                     set.iter().copied(),
                 ))
             },
@@ -215,7 +218,7 @@ impl ChunkUnique<BinaryType> for BinaryChunked {
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
-        Ok(IdxCa::from_vec(self.name(), arg_unique_ca!(self)))
+        Ok(IdxCa::from_vec(self.name().clone(), arg_unique_ca!(self)))
     }
 
     fn n_unique(&self) -> PolarsResult<usize> {
@@ -234,23 +237,27 @@ impl ChunkUnique<BinaryType> for BinaryChunked {
     }
 }
 
-impl ChunkUnique<BooleanType> for BooleanChunked {
+impl ChunkUnique for BooleanChunked {
     fn unique(&self) -> PolarsResult<Self> {
-        // can be None, Some(true), Some(false)
-        let mut unique = Vec::with_capacity(3);
-        for v in self {
-            if unique.len() == 3 {
+        use polars_compute::unique::RangedUniqueKernel;
+
+        let mut state = BooleanUniqueKernelState::new();
+
+        for arr in self.downcast_iter() {
+            state.append(arr);
+
+            if state.has_seen_all() {
                 break;
             }
-            if !unique.contains(&v) {
-                unique.push(v)
-            }
         }
-        Ok(ChunkedArray::new(self.name(), &unique))
+
+        let unique = state.finalize_unique();
+
+        Ok(Self::with_chunk(self.name().clone(), unique))
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
-        Ok(IdxCa::from_vec(self.name(), arg_unique_ca!(self)))
+        Ok(IdxCa::from_vec(self.name().clone(), arg_unique_ca!(self)))
     }
 }
 
@@ -260,7 +267,8 @@ mod test {
 
     #[test]
     fn unique() {
-        let ca = ChunkedArray::<Int32Type>::from_slice("a", &[1, 2, 3, 2, 1]);
+        let ca =
+            ChunkedArray::<Int32Type>::from_slice(PlSmallStr::from_static("a"), &[1, 2, 3, 2, 1]);
         assert_eq!(
             ca.unique()
                 .unwrap()
@@ -269,13 +277,16 @@ mod test {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(2), Some(3)]
         );
-        let ca = BooleanChunked::from_slice("a", &[true, false, true]);
+        let ca = BooleanChunked::from_slice(PlSmallStr::from_static("a"), &[true, false, true]);
         assert_eq!(
             ca.unique().unwrap().into_iter().collect::<Vec<_>>(),
-            vec![Some(true), Some(false)]
+            vec![Some(false), Some(true)]
         );
 
-        let ca = StringChunked::new("", &[Some("a"), None, Some("a"), Some("b"), None]);
+        let ca = StringChunked::new(
+            PlSmallStr::EMPTY,
+            &[Some("a"), None, Some("a"), Some("b"), None],
+        );
         assert_eq!(
             Vec::from(&ca.unique().unwrap().sort(false)),
             &[None, Some("a"), Some("b")]
@@ -284,7 +295,8 @@ mod test {
 
     #[test]
     fn arg_unique() {
-        let ca = ChunkedArray::<Int32Type>::from_slice("a", &[1, 2, 1, 1, 3]);
+        let ca =
+            ChunkedArray::<Int32Type>::from_slice(PlSmallStr::from_static("a"), &[1, 2, 1, 1, 3]);
         assert_eq!(
             ca.arg_unique().unwrap().into_iter().collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(4)]

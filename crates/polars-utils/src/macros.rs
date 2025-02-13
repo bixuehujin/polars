@@ -7,12 +7,9 @@ macro_rules! matches_any_order {
 }
 
 #[macro_export]
-macro_rules! unreachable_unchecked_release {
-    ($($arg:tt)*) => {
-        if cfg!(debug_assertions) {
-            unreachable!()
-        } else {
-            unreachable_unchecked()
-        }
-    };
+macro_rules! no_call_const {
+    () => {{
+        const { assert!(false, "should not be called") }
+        unreachable!()
+    }};
 }

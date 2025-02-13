@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Context
 from functools import lru_cache
 from typing import (
@@ -8,29 +8,27 @@ from typing import (
     Any,
     Callable,
     NoReturn,
-    Sequence,
-    no_type_check,
     overload,
 )
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from polars.dependencies import _ZONEINFO_AVAILABLE, zoneinfo
+from polars._utils.constants import (
+    EPOCH,
+    EPOCH_DATE,
+    EPOCH_UTC,
+    MS_PER_SECOND,
+    NS_PER_SECOND,
+    SECONDS_PER_DAY,
+    SECONDS_PER_HOUR,
+    US_PER_SECOND,
+)
 
 if TYPE_CHECKING:
-    from datetime import tzinfo
+    from collections.abc import Sequence
+    from datetime import date, tzinfo
     from decimal import Decimal
 
-    from polars.type_aliases import TimeUnit
-
-
-SECONDS_PER_DAY = 86_400
-SECONDS_PER_HOUR = 3_600
-NS_PER_SECOND = 1_000_000_000
-US_PER_SECOND = 1_000_000
-MS_PER_SECOND = 1_000
-
-EPOCH_DATE = date(1970, 1, 1)
-EPOCH = datetime(1970, 1, 1).replace(tzinfo=None)
-EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    from polars._typing import TimeUnit
 
 
 @overload
@@ -162,36 +160,21 @@ def to_py_datetime(
 
     if time_zone is None:
         return EPOCH + td
-    elif _ZONEINFO_AVAILABLE:
+    else:
         dt = EPOCH_UTC + td
         return _localize_datetime(dt, time_zone)
-    else:
-        msg = "install polars[timezone] to handle datetimes with time zone information"
-        raise ImportError(msg)
 
 
 def _localize_datetime(dt: datetime, time_zone: str) -> datetime:
     # zone info installation should already be checked
+    tz: ZoneInfo | tzinfo
     try:
-        tz = string_to_zoneinfo(time_zone)
-    except zoneinfo.ZoneInfoNotFoundError:
+        tz = ZoneInfo(time_zone)
+    except ZoneInfoNotFoundError:
         # try fixed offset, which is not supported by ZoneInfo
         tz = _parse_fixed_tz_offset(time_zone)
 
     return dt.astimezone(tz)
-
-
-@no_type_check
-@lru_cache(None)
-def string_to_zoneinfo(key: str) -> Any:
-    """
-    Convert a time zone string to a Python ZoneInfo object.
-
-    This is a simple wrapper for the zoneinfo.ZoneInfo constructor.
-    The wrapper is useful because zoneinfo is not available on Python 3.8
-    and the backports module may not be installed.
-    """
-    return zoneinfo.ZoneInfo(key)
 
 
 # cache here as we have a single tz per column
